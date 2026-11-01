@@ -1,0 +1,1 @@
+import{On as e}from"./atoms-B1D0XwB_.js";import{P as t}from"./index-CE4526Oy.js";var n=e();function r(){return(0,n.jsxs)(n.Fragment,{children:[(0,n.jsx)(`h1`,{className:`sr-only-h1`,children:`Actors`}),(0,n.jsx)(t,{})]})}export{r as ActorsPage};

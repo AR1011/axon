@@ -1,0 +1,255 @@
+# scripts/bench.sh record: AMD Ryzen 9 9900X 12-Core Processor, build-1, 6.8.0-146-generic, commit ee6dcd82, 2026-10-09T07:11:34+00:00, before:  06:18:31 up  5:09,  2 users,  load average: 0.99, 1.92, 2.55
+# its scale-nodes-50-paxos and scale-nodes-200-paxos rows, whose harness failed in that run: scripts/bench.sh record nodes-(50|200)-paxos: AMD Ryzen 9 9900X 12-Core Processor, build-1, 6.8.0-146-generic, commit ee6dcd82+scalefix, 2026-10-09T07:59:26+00:00, before:  07:50:27 up  6:41,  1 user,  load average: 0.97, 3.94, 4.84, the scale harness dropping a restarted node before its new boot
+# scripts/bench.sh record perf-route|perf-hosted|quota-check: AMD Ryzen 9 9900X 12-Core Processor, build-1, 6.8.0-146-generic, commit 2b809802, 2026-10-09T11:11:10+00:00, before:  11:02:42 up  9:53,  2 users,  load average: 0.93, 7.51, 7.24
+# scripts/bench.sh record pipeline|remote_calls: AMD Ryzen 9 9900X 12-Core Processor, build-1, 7.0.0-38-generic, commit b0bfa15e, 2026-10-10T16:15:26+00:00, before:  16:11:37 up 1 day,  4:49, 433 users,  load average: 0.93, 1.54, 1.53
+# scripts/bench.sh record disk: AMD Ryzen 9 9900X 12-Core Processor, build-1, 7.0.0-38-generic, commit 265d29a3, 2026-10-10T16:38:28+00:00, before:  16:37:39 up 1 day,  5:15, 439 users,  load average: 0.91, 4.74, 5.83
+job,mode,metric,unit,better,median,runs
+perf-embedded,embedded,embedded,ns/msg,lower,13.2,13.2 13.3 13.2 13.1 13.4
+perf-hosted,hosted,hosted,ns/msg,lower,38.3,37.1 38.3 39.7 38.1 39.8
+perf-traced,traced,traced,ns/msg,lower,105.6,105.6 106.1 105.3 105.5 107.4
+perf-contended,contended,contended,ns/msg,lower,101.1,99.0 100.0 101.4 101.1 103.0
+perf-fanout,fanout,fanout,ns/msg,lower,70.3,73.0 69.8 71.4 69.5 70.3
+perf-ask,ask,ask,ns/msg,lower,296.4,289.1 303.7 296.4 295.7 307.2
+perf-asks,asks,asks,ns/msg,lower,301.6,307.4 301.6 301.1 299.2 310.3
+perf-start,start,start,ns/msg,lower,1629.5,1624.8 1655.5 1629.5 1583.5 1651.2
+perf-route,route,route direct,ns/msg,lower,100,100.0 100.1 100.4 99.4 97.2
+perf-route,route,route round-robin,ns/msg,lower,90.2,90.9 90.4 89.7 90.2 89.1
+perf-route,route,route least-loaded,ns/msg,lower,118.4,118.4 118.8 121.9 117.9 117.5
+perf-route,route,route hash,ns/msg,lower,113.9,114.0 113.9 118.5 113.8 113.1
+perf-topic,topic,topic direct,ns/msg,lower,70.1,71.0 70.1 70.7 69.7 69.3
+perf-topic,topic,topic publish,ns/msg,lower,70.3,71.0 70.3 71.0 69.6 69.4
+pipeline-w64,w64,req/s,req/s,higher,164773,90497 164773 166905 164904 164556
+pipeline-w64,w64,p50,µs,lower,5964.9,10698.4 5964.9 5890.0 5963.1 6019.8
+pipeline-w64,w64,p99,µs,lower,11577.8,22086.1 11529.3 11384.7 11577.8 11624.5
+pipeline-w64,w64,p99.9,µs,lower,22117.4,26022.4 24027.5 19841.4 19679.8 22117.4
+pipeline-w64,w64,max,µs,,38946,30325.8 51413.0 39571.9 37834.7 38946.0
+pipeline-w64,w64,syncs/s,1/s,,1065,581 1065 1078 1065 1063
+pipeline-w64,w64,entries/sync,entries,,155,156.0 154.8 154.9 155.0 155.0
+pipeline-w8,w8,req/s,req/s,higher,19554,12433 19541 19588 19554 19599
+pipeline-w8,w8,p50,µs,lower,6421.5,9872.2 6421.5 6397.3 6417.5 6428.5
+pipeline-w8,w8,p99,µs,lower,12542.9,22608.8 12747.6 12540.4 12542.9 12119.5
+pipeline-w8,w8,p99.9,µs,lower,21683.3,30113.7 21683.3 21477.8 22751.3 15587.0
+pipeline-w8,w8,max,µs,,36482,43498.4 35746.1 53050.9 36482.0 36066.0
+pipeline-w8,w8,syncs/s,1/s,,964,608 964 964 959 964
+pipeline-w8,w8,entries/sync,entries,,20.3,20.5 20.3 20.3 20.4 20.3
+pipeline-w4pin-w64,w4pin-w64,req/s,req/s,higher,211002,213429 211002 210269 210066 212513
+pipeline-w4pin-w64,w4pin-w64,p50,µs,lower,4674.2,4630.2 4674.2 4743.5 4783.1 4652.9
+pipeline-w4pin-w64,w4pin-w64,p99,µs,lower,9132.8,9256.5 9132.8 9109.8 9165.2 8992.2
+pipeline-w4pin-w64,w4pin-w64,p99.9,µs,lower,10976.8,16020.2 19802.4 10976.8 10919.7 10895.0
+pipeline-w4pin-w64,w4pin-w64,max,µs,,13362.6,25736.9 34385.0 13362.6 12665.5 13125.3
+pipeline-w4pin-w64,w4pin-w64,syncs/s,1/s,,1443,1460 1443 1438 1430 1452
+pipeline-w4pin-w64,w4pin-w64,entries/sync,entries,,146.3,146.3 146.3 146.3 146.9 146.4
+loopback,repeated None,one-way,frames/s,higher,5.84079e+06,5840788 5933807 4493327 5954525 5747883
+loopback,repeated None,echo RTT p50,µs,lower,7.6,7.7 7.6 7.9 7.6 7.6
+loopback,repeated None,echo RTT p99,µs,lower,9.3,10.1 8.6 9.3 10.1 8.6
+loopback,repeated Lz4,one-way,frames/s,higher,4.39946e+06,4375337 4432774 4325205 4427509 4399458
+loopback,repeated Lz4,echo RTT p50,µs,lower,7.9,8.0 7.9 7.9 8.0 7.8
+loopback,repeated Lz4,echo RTT p99,µs,lower,10.2,9.8 8.8 10.3 10.4 10.2
+loopback,repeated Zstd,one-way,frames/s,higher,1.19837e+06,1203513 1195339 1200715 1196210 1198370
+loopback,repeated Zstd,echo RTT p50,µs,lower,9.2,9.2 9.3 9.2 9.2 9.2
+loopback,repeated Zstd,echo RTT p99,µs,lower,10.3,10.7 10.4 10.3 10.3 10.2
+loopback,pseudorandom None,one-way,frames/s,higher,5.92045e+06,5770260 5920450 5853426 5945040 5948561
+loopback,pseudorandom None,echo RTT p50,µs,lower,7.7,7.7 7.7 7.8 7.6 7.7
+loopback,pseudorandom None,echo RTT p99,µs,lower,9.3,9.1 10.2 9.3 8.8 10.2
+loopback,pseudorandom Lz4,one-way,frames/s,higher,3.04573e+06,3050424 3045732 3110328 3034117 2964715
+loopback,pseudorandom Lz4,echo RTT p50,µs,lower,8.2,8.1 8.2 8.1 8.2 8.2
+loopback,pseudorandom Lz4,echo RTT p99,µs,lower,9.2,9.3 9.2 9.1 9.2 9.5
+loopback,pseudorandom Zstd,one-way,frames/s,higher,1.40876e+06,1407295 1412517 1404116 1408762 1434954
+loopback,pseudorandom Zstd,echo RTT p50,µs,lower,8.8,8.9 8.8 8.8 8.8 8.9
+loopback,pseudorandom Zstd,echo RTT p99,µs,lower,10.1,10.1 10.3 10.3 10.1 10.1
+remote_calls,sequential request,p50,µs,lower,8.756,8.606 8.767 8.676 8.756 8.757
+remote_calls,sequential request,p99,µs,lower,9.919,9.778 9.799 10.079 9.919 10.4
+remote_calls,sequential request,p99.9,µs,lower,11.642,11.642 11.271 11.592 12.704 12.092
+remote_calls,sequential request_within,p50,µs,lower,8.827,8.746 8.886 8.676 8.827 8.836
+remote_calls,sequential request_within,p99,µs,lower,9.978,9.858 9.978 9.909 10.139 10.48
+remote_calls,sequential request_within,p99.9,µs,lower,11.301,11.301 11.191 11.191 13.015 11.682
+remote_calls,16 in flight,throughput,req/s,higher,440770,444066 440711 444922 440770 434309
+remote_calls,256 in flight,throughput,req/s,higher,1.02901e+06,1043656 1002404 977040 1029013 1079432
+remote_calls,tell,sent,msg/s,higher,3.61139e+06,3611387 3564098 3611527 3604655 3639005
+remote_calls,tell,dropped,msgs,,0,0 14691 0 2417 0
+fanout,fanout 1 subscribers,cost,ns/record/subscriber,lower,15.6,15.6 15.6 15.6 15.7 15.5
+fanout,fanout 10 subscribers,cost,ns/record/subscriber,lower,2.9,2.8 2.9 2.9 2.9 2.8
+fanout,fanout 100 subscribers,cost,ns/record/subscriber,lower,1.6,1.6 1.6 1.6 1.6 1.6
+fanout,fanout 1000 subscribers,cost,ns/record/subscriber,lower,1.5,1.5 1.5 1.5 1.5 1.5
+fanout,fanout 10000 subscribers,cost,ns/record/subscriber,lower,1.6,1.6 1.6 1.6 1.6 1.6
+fanout,publish replay required,cost,ns/record,lower,14.3,14.3 14.3 14.4 14.3 14.3
+fanout,"publish compacted, 1024 keys",cost,ns/record,lower,104.8,105.4 104.3 105.0 104.8 104.6
+fanout,"origin publish, no subscribers",cost,ns/record,lower,27.4,27.2 27.4 27.4 27.4 27.4
+fanout,"replay join, 1M records, 1024-record pages",cost,ns/record,lower,30.4,30.2 30.4 30.6 30.3 30.4
+fanout,"push decode, 64 B records",cost,ns/record,lower,17.9,17.9 17.9 18.1 17.9 18.0
+fanout,"push decode, 4096 B records",cost,ns/record,lower,52.4,52.4 52.2 52.4 52.4 52.5
+disk,memory,published and durable,M records/s,higher,34.51,34.09 34.52 34.51 34.08 34.55
+disk,memory,median wait until durable,µs,lower,0.4,0.4 0.4 0.4 0.4 0.4
+disk,disk,published and durable,M records/s,higher,5.88,5.88 5.69 5.71 6.18 6.00
+disk,disk,median wait until durable,µs,lower,4261.5,4277.8 4229.1 4263.4 4243.6 4261.5
+disk,streams256,published and durable,M records/s,higher,3.61,3.62 3.51 3.64 3.47 3.61
+disk,streams256,median wait until durable,µs,lower,53772.5,55101.0 53148.2 53772.5 55165.0 52968.3
+quota-check,check entries=3000,grants settled after,s,lower,0.2016,0.2015 0.2017 0.2016
+quota-check,check entries=3000,rows,rows,,3000,3000 3000 3000
+quota-check,check Take Uniform keys=1000,1 threads,M calls/s,higher,12.22,12.21 12.22 12.22
+quota-check,check Take Uniform keys=1000,4 threads,M calls/s,higher,41.1,41.10 41.32 41.02
+quota-check,check Take Uniform keys=1000,12 threads,M calls/s,higher,63.39,64.18 62.89 63.39
+quota-check,check Take Uniform keys=1000,24 threads,M calls/s,higher,50.04,50.04 55.37 47.54
+quota-check,check Take Zipf keys=1000,1 threads,M calls/s,higher,12.37,12.34 12.52 12.37
+quota-check,check Take Zipf keys=1000,4 threads,M calls/s,higher,40.98,40.98 41.11 40.95
+quota-check,check Take Zipf keys=1000,12 threads,M calls/s,higher,24.68,17.88 29.26 24.68
+quota-check,check Take Zipf keys=1000,24 threads,M calls/s,higher,11.35,11.41 11.35 11.34
+quota-check,check Take Hot keys=1000,1 threads,M calls/s,higher,13.09,12.99 13.12 13.09
+quota-check,check Take Hot keys=1000,4 threads,M calls/s,higher,8.96,8.81 8.97 8.96
+quota-check,check Take Hot keys=1000,12 threads,M calls/s,higher,2.64,1.94 2.67 2.64
+quota-check,check Take Hot keys=1000,24 threads,M calls/s,higher,1.35,1.35 1.35 1.36
+quota-check,check AcquireDrop Hot keys=1000,1 threads,M calls/s,higher,9.34,9.26 9.44 9.34
+quota-check,check AcquireDrop Hot keys=1000,4 threads,M calls/s,higher,5.36,5.47 5.36 5.36
+quota-check,check AcquireDrop Hot keys=1000,12 threads,M calls/s,higher,1.29,1.07 1.35 1.29
+quota-check,check AcquireDrop Hot keys=1000,24 threads,M calls/s,higher,0.69,0.69 0.69 0.69
+quota-check,check AtLimit Hot keys=1000,1 threads,M calls/s,higher,13.83,13.89 13.83 13.74
+quota-check,check AtLimit Hot keys=1000,4 threads,M calls/s,higher,9.46,9.27 9.46 9.53
+quota-check,check AtLimit Hot keys=1000,12 threads,M calls/s,higher,2.72,3.04 2.70 2.72
+quota-check,check AtLimit Hot keys=1000,24 threads,M calls/s,higher,1.38,1.38 1.38 1.39
+quota-check,check entries=3000,idle,cores,lower,0,0.00 0.00 0.00
+quota-check,check entries=3000000,grants settled after,s,lower,75.3,75.5 75.3 75.3
+quota-check,check entries=3000000,rows,rows,,3e+06,3000000 3000000 3000000
+quota-check,check keys=1000000,"first call, 24 threads",ns/thread,lower,3133,3133 3057 3202
+quota-check,check Take Uniform keys=1000000,1 threads,M calls/s,higher,3.08,3.10 3.08 3.08
+quota-check,check Take Uniform keys=1000000,4 threads,M calls/s,higher,12.14,12.14 11.55 12.17
+quota-check,check Take Uniform keys=1000000,12 threads,M calls/s,higher,31.78,30.70 31.79 31.78
+quota-check,check Take Uniform keys=1000000,24 threads,M calls/s,higher,46.17,46.17 45.84 47.33
+quota-check,check Take Zipf keys=1000000,1 threads,M calls/s,higher,5.62,5.62 5.60 5.63
+quota-check,check Take Zipf keys=1000000,4 threads,M calls/s,higher,21.85,21.85 21.71 21.89
+quota-check,check Take Zipf keys=1000000,12 threads,M calls/s,higher,42.57,42.57 42.67 42.10
+quota-check,check Take Zipf keys=1000000,24 threads,M calls/s,higher,19.77,19.87 19.59 19.77
+quota-check,check TakeTwo Zipf keys=1000000,1 threads,M calls/s,higher,3.71,3.71 3.71 3.72
+quota-check,check TakeTwo Zipf keys=1000000,4 threads,M calls/s,higher,13.66,13.54 13.66 13.66
+quota-check,check TakeTwo Zipf keys=1000000,12 threads,M calls/s,higher,13.76,13.74 13.76 14.21
+quota-check,check TakeTwo Zipf keys=1000000,24 threads,M calls/s,higher,9.59,9.70 9.59 9.58
+quota-check,check AcquireDrop Zipf keys=1000000,1 threads,M calls/s,higher,4.77,4.79 4.76 4.77
+quota-check,check AcquireDrop Zipf keys=1000000,4 threads,M calls/s,higher,16.8,16.70 17.09 16.80
+quota-check,check AcquireDrop Zipf keys=1000000,12 threads,M calls/s,higher,19.63,18.72 19.63 20.30
+quota-check,check AcquireDrop Zipf keys=1000000,24 threads,M calls/s,higher,8.85,8.68 8.85 8.91
+quota-check,check entries=3000000,idle,cores,lower,0.22,0.24 0.22 0.22
+quota-memory,memory 200 k keys,"resident per key, lone",B,lower,817,817 815 817
+quota-memory,memory 200 k keys,"resident per key, one of three",B,lower,1463,1467 1463 1462
+quota-memory,memory 200 k keys,"resident per key, all three",B,lower,3781,3782 3781 3780
+quota-memory,memory 200 k keys,entry,B,lower,492,492 491 495
+quota-memory,memory 200 k keys,key with one row,B,lower,324,325 324 323
+quota-memory,memory 200 k keys,further row,B,lower,222,222 223 221
+quota-bytes,"bytes, 0 takes/s a node",sent a node,B/s,,2973,2964 3000 2973
+quota-bytes,"bytes, 0 takes/s a node",reports a node,1/s,,0,0.0 0.0 0.0
+quota-bytes,"bytes, 0 takes/s a node",fallback units,1/s,,0,0 0 0
+quota-bytes,"bytes, 0 takes/s a node",denied a node,1/s,,0,0 0 0
+quota-bytes,"bytes, 1000 takes/s a node",sent a node,B/s,,197393,197160 197393 198009
+quota-bytes,"bytes, 1000 takes/s a node",reports a node,1/s,,240,240.0 240.0 240.0
+quota-bytes,"bytes, 1000 takes/s a node",fallback units,1/s,,459,459 459 459
+quota-bytes,"bytes, 1000 takes/s a node",denied a node,1/s,,241,241 241 241
+quota-bytes,"bytes, 10000 takes/s a node",sent a node,B/s,,1.59346e+06,1597633 1593461 1579831
+quota-bytes,"bytes, 10000 takes/s a node",reports a node,1/s,,76.3,77.4 76.3 76.1
+quota-bytes,"bytes, 10000 takes/s a node",fallback units,1/s,,334,334 320 346
+quota-bytes,"bytes, 10000 takes/s a node",denied a node,1/s,,5165,5184 5165 5164
+quota-pull,pull 1 M keys,none pulling after d left,s,lower,26.3,26.3 26.3 26.3
+quota-pull,pull 1 M keys,every key held after d left,s,lower,25.8,25.9 25.7 25.8
+quota-pull,pull 1 M keys,d ready after its restart,s,lower,18.8,18.9 18.8 18.8
+overhead,embedded,timings off,ns/msg,lower,12.31,12.25 12.31 12.34
+overhead,embedded,timings 1/128,ns/msg,lower,12.75,12.69 12.75 12.77
+overhead,embedded,timings 1/128 + labels,ns/msg,lower,13,12.99 13.00 13.05
+overhead,embedded,timings 1/16 + labels,ns/msg,lower,17.23,17.15 17.24 17.23
+overhead,embedded,timings 1/1 + labels,ns/msg,lower,92.29,91.92 92.29 92.44
+overhead,hosted,1/128 + labels,ns/msg,lower,26.49,25.45 27.18 26.49
+overhead,hosted,"... + extension, 1000 actors",ns/msg,lower,27.55,27.55 26.44 27.85
+overhead,transport,timings off,ns/frame,lower,168.05,168.07 168.05 167.78
+overhead,transport,timings 1/128,ns/frame,lower,168.75,169.65 168.75 168.40
+overhead,transport,timings 1/16,ns/frame,lower,171.65,171.83 171.65 171.31
+scale-actors,actors 1 M,"spawn, one at a time",/s,higher,1.3361e+06,1354568 1332114 1336097
+scale-actors,actors 1 M,per idle actor,B,lower,1170,1170 1170 1170
+scale-actors,actors 1 M,"spawn, 64 starts in flight",/s,higher,850876,852747 850876 850594
+scale-actors,actors 1 M,one message to each,/s,higher,2.74977e+06,2792548 2749348 2749772
+scale-actors,actors 1 M,per actor once it has handled a message,B,lower,2144,2144 2144 2144
+scale-actors,actors 1 M,"idle, no telemetry",cores,lower,0,0.000 0.000 0.000
+scale-actors,actors 1 M,"idle, telemetry every 1 s, scanning them all",cores,lower,0.096,0.096 0.096 0.096
+scale-actors,actors 1 M,resident at the end,MB,lower,2051,2051 2051 2051
+scale-keyed,keyed,keyed spawns,/s,higher,61176,61176 60874 61256
+scale-keyed-paxos,keyed-paxos,keyed spawns,/s,higher,6605,6650 6536 6605
+scale-keyed-paxos,keyed-paxos,"renew 100 k leases, median of 5",ms,lower,89.8,89.9 88.3 89.8
+scale-nodes-50,nodes-50,start and agree,s,lower,0.00308,0.01341 0.00272 0.00308
+scale-nodes-50,nodes-50,"resident per node, no links",MB,lower,0.3,0.30 0.31 0.30
+scale-nodes-50,nodes-50,"resident per node, 20 links",MB,lower,2.16,2.15 2.18 2.16
+scale-nodes-50,nodes-50,"idle, no links",cores,lower,0.006,0.006 0.006 0.006
+scale-nodes-50,nodes-50,"idle, 20 links",cores,lower,0.114,0.112 0.114 0.118
+scale-nodes-50,nodes-50,links opened in,s,lower,0.06443,0.05662 0.07277 0.06443
+scale-nodes-50,nodes-50,join seen by every node,s,lower,0.85257,0.85286 0.82789 0.85257
+scale-nodes-50,nodes-50,leave seen by every node,s,lower,2,2.00 2.01 2.00
+scale-nodes-50,nodes-50,keyed actors placed,/s,higher,348777,348777 350130 336407
+scale-nodes-50,nodes-50,resident per keyed actor,B,lower,4582,4601 4582 4554
+scale-nodes-50,nodes-50,"idle, keyed actors placed",cores,lower,0.138,0.130 0.138 0.140
+scale-nodes-50,nodes-50,join moving keys settles,s,lower,1.48,1.49 1.48 1.48
+scale-nodes-50,nodes-50,"restart, each",s,lower,2,2.00 2.00 2.00
+scale-nodes-50,nodes-50,leases the other nodes lost,leases,lower,0,0 0 0
+scale-nodes-200,nodes-200,start and agree,s,lower,1.04,1.03 1.04 1.04
+scale-nodes-200,nodes-200,"resident per node, no links",MB,lower,0.45,0.39 0.45 0.51
+scale-nodes-200,nodes-200,"resident per node, 20 links",MB,lower,2.21,2.19 2.26 2.21
+scale-nodes-200,nodes-200,"idle, no links",cores,lower,0.056,0.056 0.060 0.055
+scale-nodes-200,nodes-200,"idle, 20 links",cores,lower,0.5,0.477 0.502 0.500
+scale-nodes-200,nodes-200,links opened in,s,lower,0.1232,0.12320 0.13439 0.11980
+scale-nodes-200,nodes-200,join seen by every node,s,lower,0.62152,0.63125 0.61915 0.62152
+scale-nodes-200,nodes-200,leave seen by every node,s,lower,2.01,2.01 2.01 1.99
+scale-nodes-200,nodes-200,keyed actors placed,/s,higher,290862,298477 290862 289176
+scale-nodes-200,nodes-200,resident per keyed actor,B,lower,3010,2971 3241 3010
+scale-nodes-200,nodes-200,"idle, keyed actors placed",cores,lower,0.54,0.516 0.552 0.540
+scale-nodes-200,nodes-200,join moving keys settles,s,lower,1.42,1.46 1.40 1.42
+scale-nodes-200,nodes-200,"restart, each",s,lower,2,2.00 2.00 2.00
+scale-nodes-200,nodes-200,leases the other nodes lost,leases,lower,0,0 0 0
+scale-nodes-50-paxos,nodes-50-paxos,start and agree,s,lower,1.03,1.04 1.03 1.03
+scale-nodes-50-paxos,nodes-50-paxos,"resident per node, no links",MB,lower,0.43,0.43 0.43 0.43
+scale-nodes-50-paxos,nodes-50-paxos,"resident per node, 20 links",MB,lower,2.18,2.18 2.19 2.18
+scale-nodes-50-paxos,nodes-50-paxos,"idle, no links",cores,lower,0.007,0.007 0.007 0.007
+scale-nodes-50-paxos,nodes-50-paxos,"idle, 20 links",cores,lower,0.113,0.112 0.117 0.113
+scale-nodes-50-paxos,nodes-50-paxos,links opened in,s,lower,0.06155,0.07556 0.06155 0.06058
+scale-nodes-50-paxos,nodes-50-paxos,join seen by every node,s,lower,0.87207,0.85186 0.87459 0.87207
+scale-nodes-50-paxos,nodes-50-paxos,leave seen by every node,s,lower,2,2.00 2.00 2.00
+scale-nodes-50-paxos,nodes-50-paxos,keyed actors placed,/s,higher,6943,6943 6809 7012
+scale-nodes-50-paxos,nodes-50-paxos,resident per keyed actor,B,lower,6854,6947 6853 6854
+scale-nodes-50-paxos,nodes-50-paxos,"idle, keyed actors placed",cores,lower,0.18,0.180 0.184 0.180
+scale-nodes-50-paxos,nodes-50-paxos,join moving keys settles,s,lower,0.67589,0.67520 0.67589 0.69706
+scale-nodes-50-paxos,nodes-50-paxos,"restart, each",s,lower,5.13,5.13 5.13 5.13
+scale-nodes-50-paxos,nodes-50-paxos,leases the other nodes lost,leases,lower,0,0 0 0
+scale-nodes-200-paxos,nodes-200-paxos,start and agree,s,lower,1.04,1.04 1.04 1.04
+scale-nodes-200-paxos,nodes-200-paxos,"resident per node, no links",MB,lower,0.5,0.50 0.50 0.47
+scale-nodes-200-paxos,nodes-200-paxos,"resident per node, 20 links",MB,lower,2.24,2.24 2.26 2.23
+scale-nodes-200-paxos,nodes-200-paxos,"idle, no links",cores,lower,0.059,0.059 0.059 0.059
+scale-nodes-200-paxos,nodes-200-paxos,"idle, 20 links",cores,lower,0.525,0.525 0.533 0.512
+scale-nodes-200-paxos,nodes-200-paxos,links opened in,s,lower,0.11895,0.11895 0.13199 0.11175
+scale-nodes-200-paxos,nodes-200-paxos,join seen by every node,s,lower,0.62972,0.62972 0.60902 0.64200
+scale-nodes-200-paxos,nodes-200-paxos,leave seen by every node,s,lower,1.99,1.99 1.99 1.99
+scale-nodes-200-paxos,nodes-200-paxos,keyed actors placed,/s,higher,8813,8870 8813 8712
+scale-nodes-200-paxos,nodes-200-paxos,resident per keyed actor,B,lower,8643,8643 8024 8888
+scale-nodes-200-paxos,nodes-200-paxos,"idle, keyed actors placed",cores,lower,0.664,0.664 0.682 0.634
+scale-nodes-200-paxos,nodes-200-paxos,join moving keys settles,s,lower,1.3,1.28 1.32 1.30
+scale-nodes-200-paxos,nodes-200-paxos,"restart, each",s,lower,2.79,2.78 2.79 2.79
+scale-nodes-200-paxos,nodes-200-paxos,leases the other nodes lost,leases,lower,0,0 0 0
+scale-nodes-200-seeds,nodes-200-seeds,start and agree,s,lower,5.07,5.07 5.07 5.07
+scale-nodes-200-seeds,nodes-200-seeds,"resident per node, no links",MB,lower,0.93,0.94 0.93 0.93
+scale-nodes-200-seeds,nodes-200-seeds,"resident per node, 20 links",MB,lower,2.71,2.71 2.70 2.71
+scale-nodes-200-seeds,nodes-200-seeds,"idle, no links",cores,lower,0.087,0.087 0.087 0.087
+scale-nodes-200-seeds,nodes-200-seeds,"idle, 20 links",cores,lower,0.544,0.544 0.529 0.544
+scale-nodes-200-seeds,nodes-200-seeds,links opened in,s,lower,0.10526,0.10669 0.10085 0.10526
+scale-nodes-200-seeds,nodes-200-seeds,join seen by every node,s,lower,0.0293,0.02930 0.02815 0.05693
+scale-nodes-200-seeds,nodes-200-seeds,leave seen by every node,s,lower,1.01,1.01 1.01 1.01
+scale-nodes-200-seeds,nodes-200-seeds,keyed actors placed,/s,higher,305758,306562 305009 305758
+scale-nodes-200-seeds,nodes-200-seeds,resident per keyed actor,B,lower,3944,3944 3964 3924
+scale-nodes-200-seeds,nodes-200-seeds,"idle, keyed actors placed",cores,lower,0.594,0.594 0.578 0.598
+scale-nodes-200-seeds,nodes-200-seeds,join moving keys settles,s,lower,0.58472,0.57562 0.58472 0.58854
+scale-nodes-200-seeds,nodes-200-seeds,"restart, each",s,lower,1.06,1.06 1.06 1.06
+scale-nodes-200-seeds,nodes-200-seeds,leases the other nodes lost,leases,lower,0,0 0 0
+scale-streams,streams 50 k,subscriptions up,s,lower,1.36,1.35 1.43 1.36
+scale-streams,streams 50 k,resident after subscriptions,MB,lower,989,989 988 989
+scale-streams,streams 50 k,200 k records/s published,cores,lower,3.74,3.80 3.74 3.73
+scale-streams,streams 50 k,records not delivered,records,lower,0,0 0 0
+scale-streams,streams 50 k,subscription churn,cores,lower,0.37,0.36 0.37 0.37
+scale-streams,streams 50 k,"relay lost, all fed again",s,lower,0.88977,0.86195 0.90468 0.88977
+scale-streams,streams 50 k,resident after relay loss,MB,lower,3214,3214 3213 3214
+scale-subscribers,"subscribers 20 k, 200 batches/s",delivered,M records/s,,2,2.00 2.00 2.00
+scale-subscribers,"subscribers 20 k, 200 batches/s",processor time,ns/record,lower,511,519 502 511
+scale-subscribers,"subscribers 20 k, 200 batches/s",cores,cores,lower,1.02,1.04 1.00 1.02
+scale-subscribers,"subscribers 20 k, 200 batches/s",resets,resets,lower,0,0 0 0
+scale-metrics,metrics 256 MiB,bytes a batch,B,,63176,63176 63176 63176
+scale-metrics,metrics 256 MiB,write,µs/batch,lower,29.1,29.1 29.1 29.1
+scale-metrics,metrics 256 MiB,RSS growth / held bytes,ratio,lower,1.01,1.010 1.010 1.010

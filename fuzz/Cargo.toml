@@ -1,0 +1,55 @@
+[package]
+name = "axon-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+axon = { path = "../crates/axon" }
+axon-net = { path = "../crates/axon-net" }
+axon-stream = { path = "../crates/axon-stream" }
+bytes = "1"
+libfuzzer-sys = "0.4"
+tokio = { version = "1", features = ["rt", "time", "io-util"] }
+
+[[bin]]
+name = "frame_decode"
+path = "fuzz_targets/frame_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "stream_wire"
+path = "fuzz_targets/stream_wire.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "handshake"
+path = "fuzz_targets/handshake.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "log_frame"
+path = "fuzz_targets/log_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "stream_core"
+path = "fuzz_targets/stream_core.rs"
+test = false
+doc = false
+bench = false
+
+[lints]
+workspace = true

@@ -1,0 +1,48 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/axon",
+    "crates/axon-net",
+    "crates/axon-cluster",
+    "crates/axon-obs",
+    "crates/axon-stream",
+    "crates/axon-testkit",
+    "fuzz",
+    "examples/rig",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.99"
+license = "Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+tracing = { version = "0.1.44", default-features = false, features = ["std"] }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(axon_loom)", "cfg(tokio_unstable)"] }
+
+[workspace.lints.clippy]
+disallowed_methods = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+# scripts/check.sh sim: release code without release's link-time work, which took most of a minute after each edit.
+[profile.sim]
+inherits = "release"
+lto = false
+codegen-units = 16
+
+# Dependencies optimised in tests: unoptimised, tokio, rustls and argon2 made world_quota.rs take 407 s instead of
+# 108 s. The workspace's own crates keep the test profile's opt-level and every debug assertion.
+[profile.test.package."*"]
+opt-level = 2
+
+# The simulations in axon-cluster's tests (the quota sim runs 50 nodes for a minute of virtual time) take minutes a seed
+# unoptimised; optimised, its whole suite runs faster than it did without the quota sim.
+[profile.test.package.axon-cluster]
+opt-level = 2

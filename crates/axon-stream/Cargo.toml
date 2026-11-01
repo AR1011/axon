@@ -1,0 +1,74 @@
+[package]
+name = "axon-stream"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+readme = "../axon/README.md"
+description = "Sequenced streams for axon: fanout hub, replay-to-live recovery, and clustered relays with failover"
+
+[features]
+cluster = ["axon/system", "dep:axon-cluster", "dep:axon-net", "dep:parking_lot", "dep:tokio"]
+serde = ["dep:serde", "axon/serde"]
+
+[dependencies]
+axon = { path = "../axon", default-features = false }
+axon-cluster = { path = "../axon-cluster", optional = true }
+axon-net = { path = "../axon-net", optional = true }
+bytes = "1"
+parking_lot = { version = "0.12", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"], optional = true }
+
+[dev-dependencies]
+axon = { path = "../axon" }
+axon-testkit = { path = "../axon-testkit" }
+tokio = { version = "1", features = ["rt-multi-thread", "test-util", "net", "io-util"] }
+
+[[example]]
+name = "disk"
+required-features = ["cluster"]
+
+[[example]]
+name = "relay_wan"
+required-features = ["cluster"]
+
+[[test]]
+name = "gateway"
+required-features = ["cluster"]
+
+[[test]]
+name = "relay"
+required-features = ["cluster"]
+
+[[test]]
+name = "world"
+required-features = ["cluster"]
+
+[[test]]
+name = "world_disk"
+required-features = ["cluster"]
+
+[[test]]
+name = "world_relay"
+required-features = ["cluster"]
+
+[[test]]
+name = "world_lanes"
+required-features = ["cluster"]
+
+[[test]]
+name = "world_limits"
+required-features = ["cluster"]
+
+[[test]]
+name = "world_upgrade"
+required-features = ["cluster"]
+
+[[test]]
+name = "world_wan"
+required-features = ["cluster"]
+
+[lints]
+workspace = true

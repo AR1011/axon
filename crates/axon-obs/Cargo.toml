@@ -1,0 +1,72 @@
+[package]
+name = "axon-obs"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+readme = "../axon/README.md"
+description = "Observability for axon: telemetry, metrics collection and the ClickHouse provider"
+
+[features]
+system-metrics = ["dep:sysinfo"]
+clickhouse = ["dep:reqwest", "dep:zstd"]
+dashboard = [
+  "tokio/macros",
+  "tokio/net",
+  "dep:argon2",
+  "dep:axum",
+  "dep:base64",
+  "dep:hyper-util",
+  "dep:include_dir",
+  "dep:ring",
+  "dep:tokio-rustls",
+  "dep:tower-http",
+]
+
+[dependencies]
+axon = { path = "../axon", features = ["serde"] }
+axon-cluster = { path = "../axon-cluster", features = ["serde"] }
+axon-net = { path = "../axon-net" }
+axon-stream = { path = "../axon-stream", features = ["cluster", "serde"] }
+argon2 = { version = "0.5", optional = true }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query", "json", "form"], optional = true }
+base64 = { version = "0.22", optional = true }
+bytes = "1"
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+# Already under axum; named for the connection cap and the head deadline `axum::serve` does not set.
+hyper-util = { version = "0.1", default-features = false, features = ["http1", "server", "service", "tokio"], optional = true }
+include_dir = { version = "0.7", optional = true }
+parking_lot = "0.12"
+postcard = { version = "1", default-features = false, features = ["use-std"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
+ring = { version = "0.17", optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+sysinfo = { version = "0.37", default-features = false, features = ["system", "network"], optional = true }
+tokio = { version = "1", features = ["rt", "sync", "time"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"], optional = true }
+tower-http = { version = "0.6", features = ["compression-br", "compression-gzip"], optional = true }
+zstd = { version = "0.13", default-features = false, optional = true }
+
+[dev-dependencies]
+axon = { path = "../axon", features = ["tracing"] }
+axon-cluster = { path = "../axon-cluster", features = ["consul"] }
+axon-testkit = { path = "../axon-testkit" }
+rcgen = "0.13"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "test-util"] }
+tracing = { workspace = true }
+
+[[example]]
+name = "overhead"
+
+[[example]]
+name = "scale"
+
+[[example]]
+name = "playground"
+required-features = ["dashboard"]
+
+[lints]
+workspace = true

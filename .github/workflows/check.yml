@@ -1,0 +1,26 @@
+name: check
+on: [push, pull_request]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # scripts/check.sh compares commit times of ui/src and ui/dist
+      # The toolchain rust-toolchain.toml pins, with its components.
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      # 4 seeds per World test instead of up to 64: in debug on these runners the full ranges outlast the timeout.
+      # The full ranges run on a dev box before a merge (`scripts/check.sh` and `scripts/check.sh sim`).
+      - run: scripts/check.sh
+        env:
+          SEEDS: "4"
+          # Full debug info in every test binary filled the runner's disk; file and line in a panic are what a
+          # failure needs.
+          CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: check-logs
+          path: target/check/

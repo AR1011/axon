@@ -1,0 +1,28 @@
+name: flakes
+# The workspace tests again and again on CI's two cores, where timing assumptions that hold on a laptop break.
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: how many times to run the tests
+        default: "5"
+jobs:
+  repeat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      # The toolchain rust-toolchain.toml pins, with its components.
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      # The World tests run on virtual time, so their seeds find no timing flakes: 4 each keeps five runs in time.
+      - run: scripts/check.sh repeat ${{ inputs.runs || '5' }}
+        env:
+          SEEDS: "4"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: repeat-logs
+          path: target/check/

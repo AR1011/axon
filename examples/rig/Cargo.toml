@@ -1,0 +1,25 @@
+[package]
+name = "rig"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Example: keyed accounts on Paxos leases, fenced by a store, and relayed streams, across real machines under real faults"
+
+[dependencies]
+axon = { path = "../../crates/axon" }
+axon-cluster = { path = "../../crates/axon-cluster" }
+axon-net = { path = "../../crates/axon-net" }
+axon-obs = { path = "../../crates/axon-obs", features = ["dashboard"] }
+axon-stream = { path = "../../crates/axon-stream", features = ["cluster"] }
+bytes = "1"
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "signal", "time"] }
+
+[features]
+# The other build of a rolling upgrade: the accounts at schema 2 beside 1, its clients calling 2 (src/account.rs).
+v2 = []
+
+[lints]
+workspace = true

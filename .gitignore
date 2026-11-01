@@ -1,0 +1,12 @@
+target/
+node_modules/
+dist/
+.DS_Store
+fuzz/target/
+fuzz/corpus/
+fuzz/artifacts/
+# The built UI is embedded by include_dir!, so the crate compiles without Node.
+!crates/axon-obs/ui/dist/
+.claude/worktrees/
+.env
+__pycache__/

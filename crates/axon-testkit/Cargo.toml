@@ -1,0 +1,22 @@
+[package]
+name = "axon-testkit"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+readme = "../axon/README.md"
+description = "A seeded network simulator for testing protocols under loss, duplication, partitions and crashes"
+
+[dependencies]
+axon = { path = "../axon" }
+axon-net = { path = "../axon-net" }
+tokio = { version = "1", features = ["rt", "sync", "time", "test-util"] }
+
+[dev-dependencies]
+axon-cluster = { path = "../axon-cluster" }
+bytes = "1"
+tokio = { version = "1", features = ["io-util"] }
+
+[lints]
+workspace = true

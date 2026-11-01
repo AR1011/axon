@@ -1,0 +1,7 @@
+# Applications on real threads and real time: the root file's time and thread rules are not theirs, and this file
+# replaces it, so the channel rules are repeated here.
+allow-unwrap-in-tests = true
+disallowed-methods = [
+  { path = "tokio::sync::mpsc::unbounded_channel", reason = "every queue is bounded: size it and handle Full (crates/axon/README.md rule 11)" },
+  { path = "std::sync::mpsc::channel", reason = "every queue is bounded: use sync_channel or a tokio bounded channel" },
+]

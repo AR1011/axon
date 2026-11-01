@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "playground-consul",
+      "runtimeExecutable": "env",
+      "runtimeArgs": ["AXON_CONSUL=http://127.0.0.1:18500", "cargo", "run", "-p", "axon-obs", "--features", "dashboard,system-metrics", "--example", "playground", "--", "6", "8080"],
+      "port": 8080
+    },
+    {
+      "name": "playground",
+      "runtimeExecutable": "cargo",
+      "runtimeArgs": ["run", "-p", "axon-obs", "--features", "dashboard,system-metrics", "--example", "playground", "--", "6", "8080"],
+      "port": 8080
+    }
+  ]
+}

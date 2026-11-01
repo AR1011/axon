@@ -1,0 +1,305 @@
+@import "tailwindcss";
+@source not "../dist";
+
+@font-face {
+  font-family: "Inter Variable";
+  font-weight: 100 900;
+  font-display: swap;
+  src: url("@fontsource-variable/inter/files/inter-latin-wght-normal.woff2") format("woff2-variations");
+}
+@font-face {
+  font-family: "JetBrains Mono Variable";
+  font-weight: 100 800;
+  font-display: swap;
+  src: url("@fontsource-variable/jetbrains-mono/files/jetbrains-mono-latin-wght-normal.woff2") format("woff2-variations");
+}
+
+@theme {
+  --color-bg: var(--bg);
+  --color-header: var(--header);
+  --color-panel: var(--panel);
+  --color-raised: var(--panel-raised);
+  --color-text: var(--text);
+  --color-muted: var(--muted);
+  --color-border: var(--border);
+  --color-accent: var(--accent);
+  --color-accent-soft: var(--accent-soft);
+  --color-success: var(--success);
+  --color-edge: var(--edge);
+  --color-warning: var(--warning);
+  --color-danger: var(--danger);
+  --font-sans: "Inter Variable", Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono Variable", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  --radius-sm: 3px;
+  --radius-md: 4px;
+  --radius-lg: 5px;
+  --shadow-float: 0 8px 22px #0003;
+  --shadow-tip: 0 6px 20px #0004;
+}
+
+:root {
+  color-scheme: dark;
+  --bg: #111213;
+  --header: #141516;
+  --panel: #171819;
+  --panel-raised: #202224;
+  --text: #e2e3e4;
+  --muted: #96999e;
+  --border: #2b2d30;
+  --accent: #e0b252;
+  --accent-soft: #2f281b;
+  /* Status, not brand: stays green whatever accent is picked. */
+  --success: #65cda0;
+  --edge: #7d858e;
+  --warning: #e8975a;
+  --danger: #e08f96;
+  --sidebar: 176px;
+  font-size: 12px;
+  font-synthesis: none;
+  -webkit-font-smoothing: antialiased;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #fafafa;
+  --header: #f6f6f7;
+  --panel: #ffffff;
+  --panel-raised: #f0f0f1;
+  --text: #26272a;
+  --muted: #686c73;
+  --border: #e1e2e5;
+  --accent: #866b31;
+  --accent-soft: #fbf6ea;
+  --success: #1b7a54;
+  --edge: #8993a1;
+  --warning: #a8561a;
+  --danger: #b14f59;
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+  body {
+    margin: 0;
+    overflow: hidden;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font-sans);
+    font-size: 12px;
+    line-height: 1.45;
+  }
+  h1 {
+    font-size: 19px;
+    font-weight: 600;
+    letter-spacing: -0.45px;
+  }
+  h2 {
+    font-size: 12px;
+    font-weight: 550;
+  }
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: color-mix(in srgb, var(--muted) 35%, transparent) transparent;
+  }
+  button {
+    cursor: pointer;
+  }
+  button:disabled {
+    cursor: default;
+    opacity: 0.45;
+  }
+  :focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+  }
+  a:focus-visible {
+    outline-offset: 2px;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    table-layout: fixed;
+  }
+  th {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    padding: 0;
+    background: var(--header);
+    box-shadow:
+      inset 0 1px var(--border),
+      inset 0 -1px var(--border);
+    font-weight: 400;
+    text-align: left;
+  }
+  td {
+    height: 33px;
+    padding: 0 12px;
+    overflow: hidden;
+    border-bottom: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  tbody tr:hover {
+    background: color-mix(in srgb, var(--panel-raised) 65%, transparent);
+  }
+  tr[aria-selected="true"],
+  tbody tr[aria-selected="true"]:hover {
+    background: var(--accent-soft);
+  }
+  tr[data-href] {
+    cursor: pointer;
+  }
+  .sticky-first :is(th, td):first-child {
+    position: sticky;
+    left: 0;
+    z-index: 1;
+    background: var(--panel);
+    box-shadow: inset -1px 0 var(--border);
+  }
+  .sticky-first th:first-child {
+    z-index: 2;
+    background: var(--header);
+    box-shadow:
+      inset 0 1px var(--border),
+      inset 0 -1px var(--border),
+      inset -1px 0 var(--border);
+  }
+  .sticky-first tbody tr:hover td:first-child {
+    background: color-mix(in srgb, var(--panel-raised) 65%, var(--panel));
+  }
+  .sticky-first tr[aria-selected="true"] td:first-child {
+    background: var(--accent-soft);
+  }
+  tbody tr {
+    scroll-margin-top: 36px;
+  }
+  tbody:focus-visible {
+    outline: none;
+  }
+  tr[data-href]:focus-visible,
+  tbody tr[tabindex]:focus-visible {
+    outline: 2px solid var(--text);
+    outline-offset: -2px;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    * {
+      transition: none !important;
+    }
+  }
+}
+
+@utility mono {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+@utility sr-only-h1 {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+@utility scroll-y {
+  min-height: 0;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+}
+
+.shell {
+  display: grid;
+  grid-template-columns: var(--sidebar) minmax(0, 1fr);
+  height: 100dvh;
+  overflow: hidden;
+}
+.shell[data-collapsed="true"] {
+  grid-template-columns: 48px minmax(0, 1fr);
+}
+@media (max-width: 700px) {
+  .shell {
+    grid-template-columns: 48px minmax(0, 1fr);
+  }
+}
+
+/* Page layouts: spaced cards, or on a full-bleed page flat tiles split by hairlines. */
+.tiles {
+  gap: 10px;
+}
+#content[data-full="true"],
+#content[data-full="true"] .tiles {
+  gap: 1px;
+}
+#content[data-full="true"] > *,
+#content[data-full="true"] .tiles > * {
+  outline: 1px solid var(--border);
+}
+#content[data-full="true"] section {
+  border-width: 0;
+  border-radius: 0;
+}
+/* A detail page's title keeps the panels' inset instead of touching the sidebar. */
+#content[data-full="true"] header:has(> h1) {
+  padding: 6px 12px;
+}
+
+.dotgrid {
+  background-image: radial-gradient(var(--border) 1px, transparent 1px);
+  background-size: 18px 18px;
+}
+.dotgrid[data-full="true"] {
+  background-size: 20px 20px;
+}
+
+.graph path.edge {
+  fill: none;
+  stroke-linecap: round;
+  transition:
+    stroke 0.9s linear,
+    stroke-width 0.9s linear,
+    opacity 0.2s;
+  vector-effect: non-scaling-stroke;
+}
+.graph path.hit {
+  fill: none;
+  stroke: transparent;
+  stroke-width: 16px;
+  vector-effect: non-scaling-stroke;
+  cursor: pointer;
+}
+.graph text.edge-label {
+  paint-order: stroke;
+  stroke: var(--panel);
+  stroke-width: 3px;
+  fill: var(--muted);
+  font: 10px var(--font-mono);
+}
+.graph [role="button"] {
+  cursor: pointer;
+}
+:root[data-theme="light"] .graph [data-node] rect {
+  filter: drop-shadow(0 1px 2px #0000001f);
+  stroke: #c9ccd2;
+}
+.graph [role="button"]:focus-visible rect,
+.graph g.edge-group:focus-visible path.edge {
+  stroke: var(--accent);
+  stroke-width: 2px;
+  outline: none;
+}
+.graph g:focus-visible {
+  outline: none;
+}
+
+/* Sign-in: a soft light from above, nothing else. */
+.login {
+  background: radial-gradient(70% 45% at 50% 0%, color-mix(in srgb, var(--accent) 7%, transparent), transparent), var(--bg);
+}

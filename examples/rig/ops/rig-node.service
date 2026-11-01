@@ -1,0 +1,23 @@
+# A rig node in a cgroup of its own, so fault.sh sets cpu.max, memory.max, memory.high and io.max on it alone and
+# freezes it with the cgroup freezer. Never enabled: run.sh starts and stops it.
+[Unit]
+Description=axon fault rig node
+# Restart=always must survive an oom episode that kills it every second.
+StartLimitIntervalSec=0
+
+[Service]
+User=ubuntu
+EnvironmentFile=-/home/ubuntu/rig/env
+# cfgdrift's settings, over env's while fault.sh keeps the file.
+EnvironmentFile=-/home/ubuntu/rig/env.override
+# A link to rig or rig-v2: run.sh points it at rig, fault.sh upgrade at the other build.
+ExecStart=/home/ubuntu/rig/exe node
+Restart=always
+RestartSec=1
+TimeoutStopSec=30
+LimitNOFILE=1048576
+CPUAccounting=yes
+IOAccounting=yes
+MemoryAccounting=yes
+# No swap on the boxes; this keeps memory.max an OOM kill if one is added.
+MemorySwapMax=0

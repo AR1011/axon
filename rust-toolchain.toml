@@ -1,0 +1,4 @@
+[toolchain]
+# The rust-version of Cargo.toml; check.sh holds them equal. Bump both, then fix what the new lints find.
+channel = "1.99"
+components = ["clippy", "rustfmt"]

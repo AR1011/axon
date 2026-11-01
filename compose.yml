@@ -1,0 +1,28 @@
+# Backing services for the playground. Ports are offset so they never meet a stock ClickHouse or Consul.
+#   docker compose up -d
+#   AXON_CLICKHOUSE=http://127.0.0.1:18123 AXON_CLICKHOUSE_USER=axon AXON_CLICKHOUSE_PASSWORD=axon-playground \
+#   AXON_CONSUL=http://127.0.0.1:18500 \
+#   cargo run -p axon-obs --features dashboard,system-metrics,clickhouse --example playground -- 6 8099
+name: axon-playground
+
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.8
+    environment:
+      CLICKHOUSE_USER: axon
+      CLICKHOUSE_PASSWORD: axon-playground
+    ports:
+      - "127.0.0.1:18123:8123"
+    volumes:
+      - clickhouse:/var/lib/clickhouse
+    ulimits:
+      nofile: 262144
+
+  consul:
+    image: hashicorp/consul:1.21
+    command: agent -dev -client=0.0.0.0
+    ports:
+      - "127.0.0.1:18500:8500"
+
+volumes:
+  clickhouse:
