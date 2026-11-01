@@ -264,8 +264,8 @@ pub struct CoreConfig {
     /// `hub.max_batch_records` records of each stream. The child hands each push to its subscribers at once: the
     /// default `BranchLimits` hold what the default config has in flight of one stream.
     pub max_push_items: usize,
-    /// The most bytes in flight to one child: its window grows from `2 × max_push_bytes` to twice its delivery rate
-    /// times the round trip, up to this. At least `max_push_bytes`.
+    /// The most bytes in flight to one child: its window grows from `2 × max_push_bytes` to three times its delivery
+    /// rate times the round trip, up to this. At least `max_push_bytes`.
     pub max_push_window: usize,
     /// The most bytes in flight to every child together, past each one's first push, shared fairly between the busy
     /// ones. At least `max_push_window`.
@@ -608,8 +608,10 @@ impl Channel {
         self.rates.push_back((now, rate));
     }
 
-    /// Twice the delivery rate times the round trip, from twice the largest push up to `max_push_window`. The rate is
-    /// the largest sample of the last ten round trips, or the last second if that is longer.
+    /// Three times the delivery rate times the round trip, from twice the largest push up to `max_push_window`. The
+    /// rate is the largest sample of the last ten round trips, or the last second if that is longer. A lost packet
+    /// holds a push's answer about one round trip more, so at twice the rate a window under loss never grows
+    /// (spec/push-window.md §2.4).
     fn window(&mut self, cfg: &CoreConfig, now: Instant) -> usize {
         let floor = (2 * cfg.max_push_bytes).min(cfg.max_push_window);
         let Some(rtt) = self.rtt.filter(|rtt| !rtt.is_zero()) else { return floor };
@@ -618,7 +620,7 @@ impl Channel {
             self.rates.pop_front();
         }
         let rate = self.rates.front().map_or(0, |(_, rate)| *rate);
-        let want = 2 * u128::from(rate) * rtt.as_nanos() / 1_000_000_000;
+        let want = 3 * u128::from(rate) * rtt.as_nanos() / 1_000_000_000;
         usize::try_from(want).unwrap_or(usize::MAX).clamp(floor, cfg.max_push_window)
     }
 }

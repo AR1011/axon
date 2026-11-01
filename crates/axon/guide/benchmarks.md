@@ -1084,8 +1084,9 @@ What limits each cell:
   (89 %; at 92 ms 40.1 of 45.6, 88 %). The connection was not the limit: `tcp` read 114 there. The default is 32 MiB
   since; this cell then read 68.8 MB/s, at a higher load (push-window §2.5, **Default**).
 - **After, 64 streams with §8: the link.** 111.7 of `tcp`'s 114.3 at 219 ms. The window was 55 MiB, with 52 MiB in
-  flight. The round trip the window measures went from 219 to 279 ms: the window is 2 × rate × round trip, so at the
-  link's rate up to about a round trip of pushes waits in `netem`'s queue. That queue is deep: its limit is 10⁶ packets.
+  flight. The round trip the window measures went from 219 to 279 ms: the window was 2 × rate × round trip (3 × since,
+  see [Loss](#loss)), so at the link's rate up to about a round trip of pushes waited in `netem`'s queue. That queue is
+  deep: its limit is 10⁶ packets.
 - **After with the defaults: the connection.** A new namespace's 6 MiB receive buffer holds one connection to about
   13 MB/s at 219 ms, and the 64-stream cells read what `tcp` reads at every round trip. This is not the 4 MiB send
   buffer that push-window §12 expected (19 MB/s). The 1-stream cell read above `tcp` at 190 and 219 ms (16.4 against
@@ -1113,11 +1114,54 @@ trip or two, as it did today: 438 ms at the origin in every 219 ms cell with 1 s
 What this establishes: on one box, with `netem`, 1 Gbit/s and no loss, the window meets both targets at 219 ms with
 §8's settings. Over the defaults the connection's receive buffer, not axon, sets the rate. A child follows 1 stream at
 about 88 % of half its branch per round trip. What it does not establish: a real WAN, with loss, reordering and a
-buffer of its own size (the loss cells were not run). It does not cover more than one child, a link above 1 Gbit/s
+buffer of its own size (for loss, see [Loss](#loss)). It does not cover more than one child, a link above 1 Gbit/s
 (where 64 MiB per 219 ms, 306 MB/s, would bind 64 streams), or record sizes other than 4 KiB. The queueing delay above
 is that of a deep FIFO, and a shallower link drops instead. `scripts/relay-wan.sh table <results>` prints a run's
 medians and ranges. These runs are in `target/relay-wan/` of the tree that ran them: no CSV baseline holds them, as
 `bench.sh` does not run them (they need root and namespaces).
+
+#### Loss
+
+The same harness on 2026-11-01, §8's settings, on build-1 at load 0.5 to 5 (others' jobs). A window of 2 × rate × round
+trip stayed at its floor from about 0.5 % loss: a lost packet holds every push behind it about one round trip, so an
+answer took 2 round trips or more and the window could not grow ([push-window
+§2.4](../../../spec/push-window.md#24-the-window)). Pinning the window at 64 MiB read 63.7 MB/s at 1 %, and `tcp` 70.8,
+so the link was not the limit. The window is now 3 × rate × round trip. The child's MB/s, the median with its range, of
+three runs unless noted:
+
+| Cell | `tcp` | Before, 1 stream | Before, 64 | After, 1 stream | After, 64 |
+|---|---|---|---|---|---|
+| 219 ms, no loss | 114.3 | 69.1 | 112.2 | 69.1 | 112.3 |
+| 219 ms, 0.1 % | 94.7 | 33.9 | 58.3 | 36.1 | 78.0 |
+| 219 ms, 1 % | 70.6 (33.5–75.0) | 3.4 | 3.15 (2.95–3.74), 9 runs | 24.4 (18.4–25.4) | **38.1 (2.95–48.4), 18 runs** |
+| 219 ms, 2 % | | | 2.95 | | 17.2 (14.8–28.2) |
+| 92 ms, no loss | | | 113.6 | | 113.8 |
+| 92 ms, 1 % | | | 7.96 | | 102.1 (89.1–110.7) |
+| 0 ms, no loss | | | 119.1 | | 119.1 |
+
+"Before" is v0.1.0, and at 1 % and 2 % with 64 streams, at 92 ms and at 0 ms a build of it with the same defaults. In every cell
+of this table resets and gaps were 0, and both nodes kept the key in all runs after.
+
+Leaving the floor under loss is partly chance. Of the 18 runs at 219 ms and 1 %, 4 read under 20 MB/s, 2 of them near
+the floor (2.95 and 4.74); those 4 ended the cell's 10 s with a window of 2.3 to 7.1 MiB. Before, all 9 read near the
+floor.
+
+The price is on a full, slow path, where up to two round trips of pushes now wait in the queue, not one. 219 ms, no
+loss, 64 streams, with `netem`'s queue of 10⁶ packets, three runs:
+
+| Link | Origin's request p50, before / after | Runs that kept the key, origin and child, before | after |
+|---|---|---|---|
+| 1 Gbit/s | 436 / 444 ms | 3, 3 | 3, 3 |
+| 50 Mbit/s | 383 / 659 ms | 3, 3 | 3, 3, with a failed renewal in most runs |
+| 20 Mbit/s | 823 / 828 ms | 0, 1 | 0, 1 |
+
+A renewal has 1 s of patience and waits in the same queue. At 20 Mbit/s the key is lost before this change too, as the
+floor of 2 MiB alone is 0.8 s of that queue. A gain of 4 read more at 1 % (56.8) but lost the key in every 50 Mbit/s run,
+so 3 is the highest gain that kept it.
+
+What this does not establish: a real WAN, a shallow queue, or BBRv2 and later. The origin also lost its key at its first
+renewal in 6 of 123 earlier runs at 1 % across the builds tried, and not in the 18 here; the cause is not known. A
+cell's `rate` field (`219:0:1:axon1x64:50mbit`) sets the link.
 
 ### History on disk
 

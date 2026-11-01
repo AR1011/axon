@@ -140,7 +140,7 @@ After any go-back the window starts again from the floor and the rate samples ar
 ```text
 floor   = min(2 × max_push_bytes, max_push_window)   (2 MiB at the default)
 rate    = the largest delivery-rate sample over the last max(10 × rtt, 1 s)
-window  = clamp(2 × rate × rtt, floor, max_push_window)
+window  = clamp(3 × rate × rtt, floor, max_push_window)
 ```
 
 - `rtt` is `cluster.round_trip(node)`: the shortest of the last four keepalive round trips
@@ -151,8 +151,15 @@ window  = clamp(2 × rate × rtt, floor, max_push_window)
   there is no `rtt`, and the window is the floor.
 - A sample, on an `Applied` answer for seq `k`: (bytes delivered now − bytes delivered when `k` was sent) / (now − the
   time `k` was sent). The same sample as BBR's delivery rate.
-- With `W` bytes in flight the sample is about `W / rtt`, so the next window is `2W`: the window doubles each round
-  trip while the child keeps up. At 219 ms it goes from 2 MiB to 64 MiB in 5 round trips, about 1.1 s.
+- With `W` bytes in flight the sample is about `W / rtt`, so the next window is `3W`: the window triples each round
+  trip while the child keeps up. At 219 ms it goes from 2 MiB to 64 MiB in 4 round trips, about 0.9 s.
+- The gain is 3, not 2, for loss. One session is one TCP connection, so a lost packet holds each push behind it about
+  one round trip more. An answer then takes `L` of 2 round trips or more, the sample is `W / L`, and the next window
+  is at most `W` at a gain of 2: the window never leaves its floor. At 219 ms and 1 % loss, 3.2 MB/s at a gain of 2
+  and a median of 38 at 3 (3 to 48), where plain TCP reads 71. The cost is a longer queue on a full path: up to two round trips, not one.
+  A gain of 3 moves the limit and does not remove it. A third push needs half a push to fit, so the floor is left only
+  when the next window is at least 1.25 × `W`: `L` of at most 2.4 round trips (1.6 at a gain of 2). A path where no
+  answer in the rate's span comes that soon stays at the floor.
 - A push past a channel's first goes while at least half of `max_push_bytes` fits under `window` and under the node
   cap below, and while fewer than 64 pushes are in flight (a constant); it is cut to what fits. A smaller one would
   cost a call for little. The first push of a channel always goes, so a channel is never slower than stop-and-wait. A
@@ -330,7 +337,7 @@ The stream config gains two fields. Nothing else in the public API of axon-strea
 axon-stream
   StreamNodeConfig .core.max_push_window   bytes in flight to one child on one lane, at most (default 64 MiB) ; at least max_push_bytes
   StreamNodeConfig .core.max_push_inflight bytes in flight to every child together (default 256 MiB), past each one's first push ; at least max_push_window
-    a child gets a push window from min(2 × max_push_bytes, max_push_window) up to max_push_window: twice its delivery rate times the round trip ; a stream's records in flight count against its branch (core.branch) until applied, and it takes a new push while they are under half of it ; a failed push and those after it are sent again, in order
+    a child gets a push window from min(2 × max_push_bytes, max_push_window) up to max_push_window: three times its delivery rate times the round trip ; a stream's records in flight count against its branch (core.branch) until applied, and it takes a new push while they are under half of it ; a failed push and those after it are sent again, in order
   node.stats().relay.downstream[i] .channel .window_bytes .inflight_bytes .inflight_pushes .round_trip_us .delivery_rate .resent
 
 axon-cluster
@@ -619,9 +626,10 @@ dotted edge for more than 1 MiB queued stays as it is. C3 sees it on a `scripts/
   flight however full Bulk is.
 - `round_trip` is read from the Control lane's session, which carries no pushes.
 - The start check uses each lane's `max_frame`.
-- A Live channel shares Live's session, and its outbox, with the application's calls. A window of twice the delivery
-  rate times the round trip keeps about one round trip of pushes queued there while the path is the bottleneck, so a
-  Live call to that child can wait up to one round trip more, and never more than the 8 MiB outbox takes to drain.
+- A Live channel shares Live's session, and its outbox, with the application's calls. A window of three times the
+  delivery rate times the round trip keeps up to two round trips of pushes queued there while the path is the
+  bottleneck, so a Live call to that child can wait up to two round trips more, and never more than the 8 MiB outbox
+  takes to drain.
   Measured on today's one connection (before this design, build-1):
   with 8 MiB pushes the origin's requests to a leaf took two round trips, 438 ms at 219 ms. So a namespace that moves
   much more than its node's calls goes on Bulk, and the guide says so beside `StreamNodeConfig::lane`
@@ -648,7 +656,8 @@ batches), so each takes milliseconds; the figures in their rows are the scaled o
 | `a_late_push_of_a_boot_never_followed_costs_the_live_boot_one_new_channel` | same | a push of a boot the child never followed retires the live one; the parent drops the `Downstream`, the out-of-sync refresh clears the child's channel state, and the next channel delivers every record once | no channel |
 | `a_child_that_answers_below_what_it_applied_makes_the_parent_start_a_new_channel` | same | an answer `Skipped { 0 }` to an unanswered push after seq 1 was acknowledged drops the `Downstream`; the next channel delivers every record once | no answer codec |
 | `a_child_that_forgot_its_channel_makes_the_parent_start_a_new_one` | same | a push with `seq > 1` on an unknown channel is `Retired`; the parent drops the `Downstream` and the next interest starts channel 2 from its position | no channel |
-| `the_window_grows_with_the_rate_and_stops_at_its_ceiling` | same | 32 streams with backlogs, `rtt` 200 ms and every push answered after it: bytes in flight double each round trip from the floor (128 KiB) and stop at `max_push_window` (2 MiB) | one push in flight |
+| `the_window_grows_with_the_rate_and_stops_at_its_ceiling` | same | 32 streams with backlogs, `rtt` 200 ms and every push answered after it: bytes in flight triple each round trip from the floor (128 KiB) and stop at `max_push_window` (2 MiB) | one push in flight |
+| `a_window_grows_though_every_answer_comes_a_lost_packet_late` | same | the same, every answer 2.2 round trips after its push: the window reaches 8 pushes | a gain of 2 |
 | `one_stream_reaches_several_pushes_per_round_trip_up_to_half_its_branch` | same | one stream with a backlog, the same answers: with `branch.max_bytes` 512 KiB its pushes in flight grow past one and stop at its half, less than a push above 256 KiB; with 8 MiB they reach `max_push_window` | one push in flight |
 | `a_slow_reader_is_reset_with_pushes_in_flight` | same | one stream at half its 512 KiB branch in flight whose answers stop: what waits grows to the other half, the branch ends `ResetRequired(SlowConsumer)`, the parent never holds more than `branch.max_bytes` for it, and the reset goes out in the next push | no push window: on main the reset only ever sees what waits |
 | `a_streams_charge_is_released_on_applied_on_its_end_and_on_a_retire_but_not_on_a_go_back` | same | the branch's in-flight charge after each of §2.5's cases: an `Applied`, a `Skipped` below `k` (kept), a failed call (kept), a `Reset` item, an `unwanted`, a `Retired`; a late answer for an old epoch frees nothing of the new branch | no charge in flight |
@@ -778,7 +787,13 @@ same run fails `stream-window`.
    `Skipped`, so nothing is applied twice, but the bytes cross again. The window starts from the floor after it; the
    resend itself is not paced.
 5. **A rate sample on a quiet channel.** A channel that had little to send has a low rate and a small window. When a
-   backlog arrives it doubles per round trip: about 1.1 s at 219 ms to reach 64 MiB.
+   backlog arrives it triples per round trip: about 0.9 s at 219 ms to reach 64 MiB.
+6. **A full, slow path.** Up to two round trips of pushes wait in the path's queue, and a Paxos renewal waits behind
+   them with a patience of 1 s. At 219 ms on 20 Mbit/s with a 10⁶-packet queue the key is lost, at a gain of 2 as at 3;
+   at 50 Mbit/s it is kept at both, with a failed renewal at 3. A higher gain moves this line up: 4 lost the key at
+   50 Mbit/s. Shallower queues were not measured. [benchmarks § Loss](../crates/axon/guide/benchmarks.md#loss).
+7. **Leaving the floor under loss is partly chance.** In 4 of 18 runs at 219 ms and 1 % the window ended a 10 s cell at
+   2.3 to 7.1 MiB (§2.4), and the child read under 20 MB/s.
 
 ## Left out
 

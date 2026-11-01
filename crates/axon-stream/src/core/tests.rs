@@ -88,6 +88,18 @@ fn applied(seq: u64) -> PushAnswer {
 fn run(
     origin: &mut RelayCore,
     children: &[(PeerId, Duration)],
+    now: Instant,
+    until: Instant,
+    each: impl FnMut(&mut RelayCore, Instant),
+) {
+    run_late(origin, children, |rtt| rtt, now, until, each);
+}
+
+/// [`run`], with each answer `late(rtt)` after its push.
+fn run_late(
+    origin: &mut RelayCore,
+    children: &[(PeerId, Duration)],
+    late: impl Fn(Duration) -> Duration,
     mut now: Instant,
     until: Instant,
     mut each: impl FnMut(&mut RelayCore, Instant),
@@ -96,7 +108,7 @@ fn run(
     loop {
         for (i, (c, rtt)) in children.iter().enumerate() {
             while let Some((id, _)) = origin.next_push(&c.node, Lane::Live, now, Some(*rtt)) {
-                flights.insert((now + *rtt, n), (i, id));
+                flights.insert((now + late(*rtt), n), (i, id));
                 n += 1;
             }
         }
@@ -372,8 +384,8 @@ fn the_window_grows_with_the_rate_and_stops_at_its_ceiling() {
     });
     println!("bytes in flight per round trip: {peaks:?}");
     for (round, peak) in peaks.iter().enumerate() {
-        let want = ((2 * cfg.max_push_bytes) << round).min(cfg.max_push_window);
-        assert!(*peak >= want * 7 / 8 && *peak <= want, "round {round}: {peak} bytes in flight, {want} wanted");
+        let want = (2 * cfg.max_push_bytes * 3usize.pow(round as u32)).min(cfg.max_push_window);
+        assert!(*peak >= want * 3 / 4 && *peak <= want, "round {round}: {peak} bytes in flight, {want} wanted");
     }
     let d = &origin.stats().downstream[0];
     assert_eq!((d.window_bytes, d.round_trip_us), (cfg.max_push_window, Some(200_000)));
@@ -405,6 +417,19 @@ fn one_stream_reaches_several_pushes_per_round_trip_up_to_half_its_branch() {
     let (window, pushes) = peak(8 << 20);
     println!("an 8 MiB branch: {window} bytes in {pushes} pushes in flight");
     assert!(window >= (2 << 20) * 7 / 8 && pushes >= 28, "{window} bytes in {pushes} pushes");
+}
+
+/// Under loss an answer comes 2.2 round trips after its push at best: a lost packet holds what follows it on the
+/// connection one round trip more, and the connection paces what follows at its low estimate. A third push needs a
+/// window a quarter above two, so the window leaves its floor at 3 × rate × rtt (1.36 times) and not at 2 (0.91).
+#[test]
+fn a_window_grows_though_every_answer_comes_a_lost_packet_late() {
+    let (cfg, c, now, rtt) = (scaled(), PeerId::new("c", 1), Instant::now(), Duration::from_millis(200));
+    let mut origin = origin(&cfg, 32, 384);
+    follow(&mut origin, &c, 32, now);
+    run_late(&mut origin, &[(c, rtt)], |rtt| rtt * 11 / 5, now, now + rtt * 40, |_, _| {});
+    let window = origin.stats().downstream[0].window_bytes;
+    assert!(window >= 8 * cfg.max_push_bytes, "{window} bytes: the window stayed at its floor");
 }
 
 #[test]

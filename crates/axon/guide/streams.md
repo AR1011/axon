@@ -289,7 +289,7 @@ whose next interest opens a new channel from its position. A failed call or a `S
 after it, in order, as the same bytes. A push goes to the boot of the child that asked for it: once another boot of the
 child is up, it is refused unsent (`CallError::StaleNode`) and the parent gives that boot up at once. The relay core
 keeps a window of pushes unanswered per child and lane, each a channel of its own, from twice `max_push_bytes` up to `core.max_push_window` (64 MiB):
-twice the child's delivery rate times the round trip. A stream's records in flight count against its branch until the
+three times the child's delivery rate times the round trip. A stream's records in flight count against its branch until the
 child applies them, and the stream takes a new push only while they are under half of it, so a child that falls
 behind is still reset `SlowConsumer`. All channels together have at most `core.max_push_inflight` (256 MiB) in flight
 past each one's first push, shared fairly between the busy ones. After a push under half of `max_push_bytes` that

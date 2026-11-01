@@ -2794,9 +2794,9 @@ def stream_window(r):
                 h.append((x["_t"], d["window"], d["rate"] or 0, d["rtt_us"] or 0))
                 while h[0][0] < x["_t"] - WINDOW:
                     h.popleft()
-                # A push works its window out between lines, as twice a rate times a round trip: of either line around
-                # it (scenarios-20261026-2059-s1, a 444 ms round trip and the next line's rate).
-                mix = max((2 * max(a[2], b[2]) * max(a[3], b[3]) // 1_000_000
+                # A push works its window out between lines, as three times a rate times a round trip: of either line
+                # around it (scenarios-20261026-2059-s1, a 444 ms round trip and the next line's rate).
+                mix = max((3 * max(a[2], b[2]) * max(a[3], b[3]) // 1_000_000
                            for a, b in zip(h, itertools.islice(h, 1, None))), default=0)
                 if d["inflight"] > max(max(y[1] for y in h), min(mix, PUSH_WINDOW)) + PUSH_BYTES:
                     bad("in flight past the window", x, d["node"], inflight=d["inflight"], window=d["window"])
