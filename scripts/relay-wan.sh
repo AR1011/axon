@@ -13,7 +13,8 @@
 #                                          qdisc and process it made is gone again
 #   scripts/relay-wan.sh table <results>   medians and ranges of a results file
 #
-# A cell is rtt_ms:loss_pct:tuned:what, what one of tcp (one connection, 1 MiB writes), axon<frame>[s][x<streams>][b]
+# A cell is rtt_ms:loss_pct:tuned:what[:rate], rate netem's (1gbit, or as 50mbit), what one of tcp (one connection,
+# 1 MiB writes), axon<frame>[s][x<streams>][b]
 # or prof<frame>.. (that once, perf on w1 and w2): <frame> the pushes' max_frame and max_push_bytes in MiB (1 shipped),
 # s the child's subscribers at the shipped limits (else each holds at least four pushes), x<streams> the streams (1),
 # b the namespace on Lane::Bulk (Live).
@@ -63,7 +64,7 @@ if [[ ${1:-} != box ]]; then   # the laptop
     runs=${1:-3}
     (( $# > 1 )) && cells=("${@:2}")
     for cell in "${cells[@]}"; do   # they run as root
-        [[ $cell =~ ^[0-9]+:[0-9.]+:[01]:[a-z0-9]+$ ]] || { echo "not a cell: $cell" >&2; exit 2; }
+        [[ $cell =~ ^[0-9]+:[0-9.]+:[01]:[a-z0-9]+(:[0-9]+[mg]bit)?$ ]] || { echo "not a cell: $cell" >&2; exit 2; }
     done
     [[ ${LOCK:-} =~ ^[A-Za-z0-9/._-]*$ ]] || { echo "not a lock path: $LOCK" >&2; exit 2; }
     sudo_box=${SUDO_BOX:?set SUDO_BOX=user@host, a user with sudo on the box} dir=${BOX_DIR:-relay-wan}
@@ -154,12 +155,12 @@ inns() { nsenter --net=/run/netns/"$1" "${@:2}"; }
 
 # Half the round trip and the link's rate on the way into each namespace. netem's default limit of 1000 packets
 # would cap a link.
-netem() {   # <rtt_ms> <loss_pct>
+netem() {   # <rtt_ms> <loss_pct> <rate>
     local i offload=on
     [[ $2 == 0 ]] || offload=off   # a lost segment is one packet on a wire, not a 64 KiB GSO one
     for i in 1 2; do
         inns w$i ethtool -K eth0 tso $offload gso $offload >/dev/null
-        tc qdisc replace dev wan-w$i root netem limit 1000000 delay $(( $1 * 500 ))us rate 1gbit loss "$2"%
+        tc qdisc replace dev wan-w$i root netem limit 1000000 delay $(( $1 * 500 ))us rate "$3" loss "$2"%
     done
 }
 tune() {   # <0|1>
@@ -192,8 +193,8 @@ run_as() {   # <ns> <log> <cmd..>: in the background as the binary's owner, on t
 cat "$out/meta.txt"
 
 for cell in "${cells[@]}"; do
-    IFS=: read -r rtt loss tuned what <<<"$cell"
-    netem "$rtt" "$loss"
+    IFS=: read -r rtt loss tuned what rate <<<"$cell"
+    netem "$rtt" "$loss" "${rate:-1gbit}"
     tune "$tuned"
     echo "$cell: $(inns w1 sysctl -n net.ipv4.tcp_wmem net.ipv4.tcp_rmem net.ipv4.tcp_congestion_control net.ipv4.tcp_slow_start_after_idle | tr '\n\t' '  ')$(inns w1 tc qdisc show dev eth0 | head -1), $(tc qdisc show dev wan-w2 | head -1)" >>"$out/meta.txt"
     n=$runs
