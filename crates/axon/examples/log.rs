@@ -1,7 +1,7 @@
 //! `files::Log` on the file system: records a second and the latency of each write, by records per write, on segments
 //! that grow and on zero-filled ones, with one owner and with several on the same disk.
 //!
-//! cargo run --release -p axon --example log -- [secs=5] [body=128] [keys=1024] [owners=1,4] [per=1,16,256]
+//! cargo run --release -p axon-actors --example log -- [secs=5] [body=128] [keys=1024] [owners=1,4] [per=1,16,256]
 //!     [shapes=growing,zero-filled] [fill=bytes] [dir=/tmp]
 //!
 //! Each round appends `per` records, each to the next of `keys` keys, takes one write and waits for it: a write and a

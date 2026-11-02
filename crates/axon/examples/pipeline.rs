@@ -1,6 +1,6 @@
 //! A durable request pipeline: clients → keyed owner shards → one log writer per shard → ack to the client.
 //!
-//! cargo run --release -p axon --example pipeline -- [shards=4] [clients=16] [window=64] [keys=100000] [items=500]
+//! cargo run --release -p axon-actors --example pipeline -- [shards=4] [clients=16] [window=64] [keys=100000] [items=500]
 //!     [holds=4] [feed=100000] [feed_batch=64] [secs=10] [warmup=2] [turn=1024] [sync=1] [dir=/tmp] [workers=8]
 //!     [pin=0] [hot=0]
 //!

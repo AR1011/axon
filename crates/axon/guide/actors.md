@@ -1,13 +1,13 @@
 # Actors
 
-Crate: `axon`. Every snippet on this page is a complete program and is compiled and run by `cargo test --doc -p axon-obs`.
+Crate: `axon-actors`, imported as `axon`. Every snippet on this page is a complete program and is compiled and run by `cargo test --doc -p axon-obs`.
 
 An actor is a value that owns its state and handles one message at a time. Nothing else touches that state, so there
 are no locks in your code. You talk to an actor through a handle; the handle puts messages in a bounded mailbox.
 
 ```toml
 [dependencies]
-axon = { git = "<this repository's url>" }
+axon-actors = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 

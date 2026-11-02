@@ -115,7 +115,7 @@ The figures use data from the spec and `spec/faults.md`. To draw them again, run
 
 | Crate | |
 |---|---|
-| `axon` | actors, runtime, `ActorSystem`, tracing context, dead letters |
+| `axon-actors` | actors, runtime, `ActorSystem`, tracing context, dead letters; imported as `axon` |
 | `axon-net` | authenticated, framed, compressed sessions over TCP and TLS |
 | `axon-cluster` | discovery, membership, remote calls, remote spawn, keyed actors, leases, quotas; feature `consul` |
 | `axon-stream` | ordered streams with replay, compacted state and history on disk; feature `cluster` to run them over a cluster |
@@ -124,11 +124,12 @@ The figures use data from the spec and `spec/faults.md`. To draw them again, run
 
 Rust 1.99 or newer. `ActorSystem` and everything above it run on tokio.
 
-The crates are not on crates.io. Depend on them by git at a release tag, using the same tag for every axon crate:
+The name `axon` is taken on crates.io, so the main crate is `axon-actors`; its library is still `axon`. Use the same
+version for every axon crate:
 
 ```toml
-axon = { git = "https://github.com/AR1011/axon", tag = "v0.1.0" }
-axon-cluster = { git = "https://github.com/AR1011/axon", tag = "v0.1.0", features = ["consul"] }
+axon-actors = "0.1"
+axon-cluster = { version = "0.1", features = ["consul"] }
 ```
 
 

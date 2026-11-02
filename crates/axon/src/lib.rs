@@ -6,6 +6,9 @@
 //! [dashboard]: guide::dashboard
 //! [tracing]: guide::tracing
 //! [simulating]: guide::cluster#simulating-a-cluster
+//! [quotas]: guide::cluster#quotas
+//! [keyed-disk]: guide::cluster#a-keys-state-on-disk
+//! [gateway]: guide::streams#a-websocket-gateway
 //! [benchmarks]: guide::benchmarks
 #![doc = include_str!("../README.md")]
 #![deny(clippy::unwrap_used, clippy::iter_over_hash_type)]

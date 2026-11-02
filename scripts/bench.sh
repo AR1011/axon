@@ -65,7 +65,7 @@ build() {
     local out=target/bench/bin spec crate features examples e
     mkdir -p "$out"
     # One crate at a time, each with the features `cargo run -p <crate>` gives it; disk needs the cluster feature.
-    for spec in "axon||perf pipeline log" "axon-net||loopback" "axon-cluster||remote_calls quota" "axon-stream||fanout" \
+    for spec in "axon-actors||perf pipeline log" "axon-net||loopback" "axon-cluster||remote_calls quota" "axon-stream||fanout" \
         "axon-stream|cluster|disk" "axon-obs||overhead scale"; do
         IFS='|' read -r crate features examples <<<"$spec"
         # shellcheck disable=SC2046 # one --example per word

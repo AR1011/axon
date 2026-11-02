@@ -565,7 +565,7 @@ impl OwnershipAuthority for ConsulLeases {
     }
 
     /// A late release must not unlock the key taken again since, and a lost one must not leave it locked under the
-    /// renewals: the key is left locked until [`unlock`](Self::unlock) finds the lock gone or unlocks it.
+    /// renewals: the key is left locked until `unlock` finds the lock gone or unlocks it.
     fn release(&self, key: &str, _epoch: u64) -> BoxFuture<'_, Result<(), OwnershipError>> {
         let key = key.to_owned();
         self.held.lock().keys.remove(&key);

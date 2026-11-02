@@ -8,9 +8,9 @@ peer, and call each other's actors by name.
 
 ```toml
 [dependencies]
-axon = { git = "<this repository's url>" }
-axon-cluster = { git = "<this repository's url>" }   # features = ["consul"] for Consul discovery and leases
-axon-net = { git = "<this repository's url>" }
+axon-actors = "0.1"
+axon-cluster = "0.1"   # features = ["consul"] for Consul discovery and leases
+axon-net = "0.1"
 bytes = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
@@ -2134,7 +2134,7 @@ the network ahead of `Live`. A parent keeps up to `core.max_push_window` of push
 `axon-testkit`'s `World` runs real nodes (cluster, keyed actors, leases, seed servers, streams, your actors) in one
 process on one thread, on virtual time, over byte pipes it owns. A seed picks the order the nodes step in, the
 delivery order, jitter and fault timing, so a test that crashes, pauses, partitions or skews nodes finds a race by
-seed and replays it. Add it as a dev-dependency: `axon-testkit = { git = "<this repository's url>" }`.
+seed and replays it. Add it as a dev-dependency: `axon-testkit = "0.1"`.
 
 ```rust,standalone_crate
 use std::time::Duration;

@@ -1,18 +1,23 @@
 [package]
 name = "axon-net"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish.workspace = true
-readme = "../axon/README.md"
+repository.workspace = true
+readme.workspace = true
 description = "Authenticated, bounded, ordered, framed sessions over TCP/TLS"
+keywords = ["network", "tls", "framing", "tcp", "axon"]
+categories = ["network-programming", "asynchronous"]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [features]
 serde = ["dep:serde", "axon/serde"]
 
 [dependencies]
-axon = { path = "../axon", default-features = false }
+axon = { workspace = true }
 bytes = "1"
 lz4_flex = { version = "0.11", default-features = false, features = ["std", "safe-encode", "safe-decode"] }
 ring = "0.17"

@@ -1296,7 +1296,7 @@ impl Cell {
 mod tests;
 
 /// Every interleaving of the idle workers' handshake. A lost wakeup shows as a deadlock.
-/// `RUSTFLAGS="--cfg axon_loom" cargo test -p axon --lib --release --target-dir target/loom runtime::model`
+/// `RUSTFLAGS="--cfg axon_loom" cargo test -p axon-actors --lib --release --target-dir target/loom runtime::model`
 #[cfg(test)] // apart from `axon_loom`, so clippy's allow-unwrap-in-tests sees a test module
 #[cfg(axon_loom)]
 mod model;
