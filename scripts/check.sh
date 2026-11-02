@@ -54,10 +54,10 @@ links() {
 }
 
 no_test_util() {
-    # testkit needs tokio's test-util, and a --workspace build unifies it into every crate; a published crate's own
-    # graph must not pull it in.
+    # testkit needs tokio's test-util, and a --workspace build unifies it into every crate; the graph of every other
+    # published crate must not pull it in.
     local tree
-    tree=$(cargo tree -p axon -p axon-net -p axon-cluster -p axon-stream -p axon-obs --all-features -e normal,features -i tokio)
+    tree=$(cargo tree -p axon-actors -p axon-net -p axon-cluster -p axon-stream -p axon-obs --all-features -e normal,features -i tokio)
     ! grep test-util <<<"$tree"
 }
 
@@ -267,9 +267,9 @@ smoke() {
 loom() {
     step "loom models"
     # axon_loom, not loom: tokio drops tokio::net under --cfg loom, and axon-cluster needs it.
-    RUSTFLAGS="--cfg axon_loom" cargo test -p axon -p axon-cluster -p axon-net --lib --release --target-dir target/loom \
+    RUSTFLAGS="--cfg axon_loom" cargo test -p axon-actors -p axon-cluster -p axon-net --lib --release --target-dir target/loom \
         -- mailbox::model runtime::model engine::model queued::model
-    RUSTFLAGS="--cfg axon_loom" cargo clippy -p axon -p axon-cluster -p axon-net --lib --profile test \
+    RUSTFLAGS="--cfg axon_loom" cargo clippy -p axon-actors -p axon-cluster -p axon-net --lib --profile test \
         --target-dir target/loom -- -D warnings
     printf '\nOK: loom\n'
 }

@@ -9,9 +9,9 @@ publish = false
 cargo-fuzz = true
 
 [dependencies]
-axon = { path = "../crates/axon" }
-axon-net = { path = "../crates/axon-net" }
-axon-stream = { path = "../crates/axon-stream" }
+axon = { workspace = true, features = ["system"] }
+axon-net = { workspace = true }
+axon-stream = { workspace = true }
 bytes = "1"
 libfuzzer-sys = "0.4"
 tokio = { version = "1", features = ["rt", "time", "io-util"] }

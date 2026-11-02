@@ -1,16 +1,20 @@
 [package]
 name = "axon-testkit"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish.workspace = true
-readme = "../axon/README.md"
+repository.workspace = true
+readme.workspace = true
+# Its tests need axon-cluster by path, which crates.io strips, so they cannot build from the package.
+exclude = ["tests/"]
 description = "A seeded network simulator for testing protocols under loss, duplication, partitions and crashes"
+keywords = ["simulation", "testing", "deterministic", "network", "axon"]
+categories = ["development-tools::testing", "simulation"]
 
 [dependencies]
-axon = { path = "../axon" }
-axon-net = { path = "../axon-net" }
+axon = { workspace = true, features = ["system"] }
+axon-net = { workspace = true }
 tokio = { version = "1", features = ["rt", "sync", "time", "test-util"] }
 
 [dev-dependencies]

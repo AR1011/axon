@@ -9,7 +9,7 @@ One node publishes, another subscribes. This program is compiled and run by `car
 
 ```toml
 [dependencies]
-axon-stream = { git = "<this repository's url>", features = ["cluster"] }
+axon-stream = { version = "0.1", features = ["cluster"] }
 ```
 
 ```rust

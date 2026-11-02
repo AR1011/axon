@@ -15,7 +15,7 @@ answers plain HTTP without credentials:
 
 ```toml
 [dependencies]
-axon-obs = { git = "<this repository's url>", features = ["dashboard"] }   # also: "clickhouse", "system-metrics"
+axon-obs = { version = "0.1", features = ["dashboard"] }   # also: "clickhouse", "system-metrics"
 ```
 
 Try it without writing code: `cargo run -p axon-obs --features dashboard,system-metrics --example playground` starts a

@@ -1,10 +1,19 @@
 [package]
-name = "axon"
-version = "0.1.0"
+name = "axon-actors"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish.workspace = true
+repository.workspace = true
+description = "Typed actors on a thread-per-worker runtime, with supervision, routers, topics, timers and a durable log"
+keywords = ["actor", "actors", "concurrency", "async", "distributed"]
+categories = ["concurrency", "asynchronous"]
+
+[lib]
+name = "axon"
+
+[package.metadata.docs.rs]
+all-features = true
 
 [features]
 default = ["system"]

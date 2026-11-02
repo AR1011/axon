@@ -12,12 +12,22 @@ members = [
 ]
 
 [workspace.package]
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.99"
 license = "Apache-2.0"
-publish = false
+repository = "https://github.com/AR1011/axon"
+readme = "crates/axon/README.md"
 
+# A dev-dependency on axon-testkit, or testkit's on axon-cluster, stays a bare path: crates.io strips those, and with a
+# version the two could not be published one before the other.
 [workspace.dependencies]
+# The name axon is taken on crates.io; the package is axon-actors and its library is still axon.
+axon = { package = "axon-actors", path = "crates/axon", version = "0.1.1", default-features = false }
+axon-cluster = { path = "crates/axon-cluster", version = "0.1.1" }
+axon-net = { path = "crates/axon-net", version = "0.1.1" }
+axon-obs = { path = "crates/axon-obs", version = "0.1.1" }
+axon-stream = { path = "crates/axon-stream", version = "0.1.1" }
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 
 [workspace.lints.rust]

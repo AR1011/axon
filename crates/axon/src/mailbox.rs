@@ -1005,7 +1005,7 @@ fn the_length_a_router_reads_without_the_lock_follows_every_change_to_the_queue(
 }
 
 /// Every interleaving of the admission handshake. A lost wakeup shows as a deadlock.
-/// `RUSTFLAGS="--cfg axon_loom" cargo test -p axon --lib --release --target-dir target/loom mailbox::model`
+/// `RUSTFLAGS="--cfg axon_loom" cargo test -p axon-actors --lib --release --target-dir target/loom mailbox::model`
 #[cfg(test)] // apart from `axon_loom`, so clippy's allow-unwrap-in-tests sees a test module
 #[cfg(axon_loom)]
 mod model;

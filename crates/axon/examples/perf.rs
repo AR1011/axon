@@ -1,4 +1,4 @@
-//! cargo run --release -p axon --example perf -- <embedded|hosted|traced|contended|fanout|ask|asks|start|route|topic> [n]
+//! cargo run --release -p axon-actors --example perf -- <embedded|hosted|traced|contended|fanout|ask|asks|start|route|topic> [n]
 //! `traced` is `hosted` with every message starting a trace and recording a span.
 #![expect(clippy::disallowed_methods, reason = "a benchmark measures real time")]
 

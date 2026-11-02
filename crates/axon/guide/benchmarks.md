@@ -2,7 +2,7 @@
 
 Same machine (Apple Silicon laptop, macOS, no thread pinning), release build, 3 runs each,
 best-of-3 shown. Old is `../actor`'s `perf_probe` with `ACTOR_PERF_UNCOUNTED=1`; new is
-`cargo run --release -p axon --example perf`. Hosted workloads have the same shape in both:
+`cargo run --release -p axon-actors --example perf`. Hosted workloads have the same shape in both:
 `try_tell` with yield-on-`Full`, 4096-slot mailbox, 256-message turn budget, wait for delivery.
 
 | Workload | Old ns/msg | axon ns/msg | |
@@ -1291,7 +1291,7 @@ samples; the table gives the median of the three medians. fastact ran once.
 | ask round trip | 2 540 | 1 810 | 6 310 |
 | spawn, per actor | 3 070 | 3 230 | 1 160 |
 
-`cargo run --release -p axon --example perf -- <mode>`, same pinning, median of three interleaved runs: embedded 14.8
+`cargo run --release -p axon-actors --example perf -- <mode>`, same pinning, median of three interleaved runs: embedded 14.8
 → 12.9 ns/msg, hosted 22.0 → 22.5, contended 38.7 → 34.9, fanout 71.6 → 79.3, ask 2 780 → 2 470.
 
 What this establishes: a message between actors on a pool no longer crosses cores when it need not, which is most of
@@ -1593,7 +1593,7 @@ messages, whose clone is the user's; nothing was pinned.
 
 ## Durable pipeline (`axon`)
 
-`cargo run --release -p axon --example pipeline -- key=value ...` runs a whole service shape in one process: clients
+`cargo run --release -p axon-actors --example pipeline -- key=value ...` runs a whole service shape in one process: clients
 keep `window` requests in flight; each request goes to the shard that owns its key, which checks it against the key's
 holdings and passes it on; one log writer per shard appends a turn's entries to a preallocated file, `fdatasync`s it
 and acknowledges each client once per sync; a feed sends 100 000 reference updates a second to every shard, and a
@@ -1646,7 +1646,7 @@ thread and tokio are not pinned and share the 12 cores; one core layout was trie
 
 ## Durable log (`axon`)
 
-`cargo run --release -p axon --example log -- secs=5 owners=1,4` appends records of 128 bytes, each to the next of
+`cargo run --release -p axon-actors --example log -- secs=5 owners=1,4` appends records of 128 bytes, each to the next of
 1 024 keys, then takes one write of them and waits for it: a write and a sync of `files::Log` on `OsFiles`, as one
 owner turn gives it. Latency is per write, from `take_write` to `written`. With 4 owners, each runs its own log in a
 directory of its own on the same disk, on a thread of its own, all at once; records/s and writes/s are the sum of the

@@ -78,7 +78,7 @@ you start. The console's feature map (routes, selectors, what the playground run
 | dashboard host and console UI, health probes | `crates/axon-obs/src/dashboard/`, `crates/axon-obs/src/health.rs`, `crates/axon-obs/ui` | `tests/{dashboard,health,faults,descriptors}.rs`, `ui/tests/{dashboard,login}.spec.ts` (`npm run e2e`), live with `scripts/ctl.sh` | [dashboard](crates/axon/guide/dashboard.md), [observability § Health probes](crates/axon/guide/observability.md#health-probes) |
 | seeded network simulator, the World, its per-node `Disk`, every end of a crash inside a write (`crashes`) | `crates/axon-testkit/src/{lib,world,crash}.rs` | `crates/axon-testkit/tests/{sim,world,world_faults,files}.rs`, five nodes in three regions in `crates/axon-stream/tests/world_wan.rs` | [cluster § Simulating a cluster](crates/axon/guide/cluster.md#simulating-a-cluster), [spec/simulation.md](spec/simulation.md) |
 
-A change to a row updates that row's tests and guide in the same commit. The guides ship in the `axon` crate, render as `axon::guide`,
+A change to a row updates that row's tests and guide in the same commit. The guides ship in the `axon-actors` crate, render as `axon::guide`,
 and are doctests of `axon-obs` (`crates/axon-obs/src/lib.rs`), so a stale guide fails `check`. Fragments that cannot compile are fenced `rust,ignore`.
 
 ### Workflows
