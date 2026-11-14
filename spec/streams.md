@@ -42,7 +42,8 @@ supplies", but no `StreamNodeConfig` field reaches it. Disk history serves only 
   the source calls when the read is in. Nothing in the core does I/O, and the trait stays one trait (ST-6).
 - `DiskStore` is a history source from day one. For a namespace on `disk`, a start behind the ring reads the segments
   that hold it, in the node's writer task, and answers `Pending` until they are in. Retention bounds it: a start older
-  than the oldest segment is `HistoryUnavailable`. Replay beyond the ring is then axon's own, and the World tests it.
+  than the oldest segment is `HistoryUnavailable`. `DiskConfig::max_read_segments` (8) bounds the segments read in
+  that stay in memory and each read; more starts at once take turns, in the order they asked. Replay beyond the ring is then axon's own, and the World tests it.
 - A start behind every relay's ring. A relay refuses it `HistoryUnavailable` (`core.rs:1435-1437`); the child asks its
   other candidates and waits for one that holds it while any is still appearing (`reconcile`, `core.rs:2176-2190`). The
   origin must be among the child's candidates (`upstream_for`): the guide says so, and a test holds it. A relay that
@@ -63,6 +64,9 @@ supplies", but no `StreamNodeConfig` field reaches it. Disk history serves only 
   rings of 4 records, a leaf `After` 1000 records back, the source an in-memory log. Seeded variants: the source
   answers `Pending` for 0 to 500 ms; a relay crashes during the replay. Fails today with `HistoryUnavailable`.
 - `crates/axon-stream/tests/world_disk.rs::a_subscriber_behind_the_ring_replays_from_the_files`
+- `crates/axon-stream/src/node/tests.rs::more_replays_from_the_disk_than_it_keeps_segments_for_take_turns`: five
+  replays share two segments. Before, the starts were read by segment name, and the last key waited for the others'
+  whole replays.
 - `crates/axon-stream/src/core/tests.rs::a_source_replay_larger_than_the_branch_limit_goes_through_the_push_window_without_a_slow_consumer_reset`
 - `crates/axon-stream/src/node/tests.rs::a_history_source_is_not_asked_for_a_key_the_node_relays`
 

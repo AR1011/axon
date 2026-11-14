@@ -709,6 +709,80 @@ fn a_follower_behind_an_open_from_disk_replays_the_rest_from_the_disk() {
     assert!(relay.is_subscribed(follower));
 }
 
+/// More starts behind the ring at once than the disk keeps segments read in for: five replays, two segments. Each
+/// follower gets every record once and in order, and polled after each read they take turns: each gets its first
+/// record before any has all of its own. Before, the starts of the keys first by name were read first, and the others
+/// waited for their whole replays. Read twice before the followers are polled, the second read evicts the segments
+/// of the first unread, and those starts ask again: they still get every record.
+#[test]
+fn more_replays_from_the_disk_than_it_keeps_segments_for_take_turns() {
+    use crate::recovery::RingLimits;
+    let record = |n: u64| Bytes::copy_from_slice(&n.to_be_bytes());
+    let keys: Vec<_> = (0..5).map(|k| StreamKey::new("md", format!("k{k}"))).collect();
+    let retention = Retention { namespace: "md".into(), max_bytes: u64::MAX, max_age: Duration::from_secs(3600) };
+    let rings = vec![RingLimits { namespace: "md".into(), max_records: 4, max_bytes: 1 << 20 }];
+    let rows = [1, 2].map(|reads| {
+        let mut cfg = DiskConfig::new(Arc::new(MemoryFiles::new()), vec![retention.clone()]);
+        // A few records a segment, and two segments read in at a time.
+        (cfg.segment_bytes, cfg.max_read_segments) = (64, 2);
+        let Poll::Ready(disk) = now(DiskStore::open(cfg)) else { panic!("files in memory waited") };
+        let cfg = CoreConfig { rings: rings.clone(), ..CoreConfig::default() };
+        let mut origin = RelayCore::new(&PeerId::new("o", 1), crate::AllowAll, cfg).unwrap();
+        origin.disk = Some(disk.unwrap());
+        for key in &keys {
+            origin.open_stream(key, 1, DeliveryPolicy::ReplayRequired).unwrap();
+            for n in 1..=40 {
+                origin.publish(key, vec![record(n)]).unwrap();
+            }
+        }
+        let (written, ops) = origin.take_disk_writes(0).unwrap();
+        assert!(matches!(now(written.apply(ops)), Poll::Ready(Ok(()))));
+        origin.disk_written(Ok(()));
+        let start = StartPosition::After(Cursor { generation: 1, sequence: 0 });
+        let subscribe = |key| origin.subscribe(key, SubscribeOptions { start, ..Default::default() }).unwrap();
+        let ids: Vec<u64> = keys.iter().map(subscribe).collect();
+        let mut seen = vec![Vec::new(); keys.len()];
+        // The round each follower got its first record in, and its last.
+        let (mut first, mut last) = (vec![0; keys.len()], vec![0; keys.len()]);
+        for round in 1..=1000 {
+            for _ in 0..reads {
+                if let Some((files, asked)) = origin.take_disk_reads() {
+                    let Poll::Ready(read) = now(disk::read_asked(files, asked)) else {
+                        panic!("files in memory waited")
+                    };
+                    origin.disk_read_in(read);
+                }
+            }
+            for (i, id) in ids.iter().enumerate() {
+                while let Some(event) = origin.poll(*id) {
+                    match event {
+                        StreamEvent::Batch(b) => seen[i].extend((b.first()..).zip(b.records().iter().cloned())),
+                        StreamEvent::Ready { .. } | StreamEvent::CaughtUp { .. } => {}
+                        other => panic!("{other:?} after {} records of {}", seen[i].len(), keys[i]),
+                    }
+                }
+                if first[i] == 0 && !seen[i].is_empty() {
+                    first[i] = round;
+                }
+                if last[i] == 0 && seen[i].len() >= 40 {
+                    last[i] = round;
+                }
+            }
+            if last.iter().all(|r| *r > 0) {
+                break;
+            }
+        }
+        let whole = seen.iter().all(|s| *s == (1..=40).map(|n| (n, record(n))).collect::<Vec<_>>());
+        (reads, whole, first.iter().max() < last.iter().min(), first, last)
+    });
+    for (reads, whole, turns, first, last) in rows {
+        assert!(
+            whole && (turns || reads > 1),
+            "{reads} reads a round: first records in rounds {first:?}, last in {last:?}"
+        );
+    }
+}
+
 /// History that must not be asked.
 struct Never;
 

@@ -36,11 +36,14 @@ pub struct DiskConfig {
     pub segment_bytes: u64,
     /// Bytes published and not synced yet past which a publish is refused with `Disk(Behind)`.
     pub max_unwritten_bytes: usize,
+    /// The segments read in for starts behind a ring that stay in memory, and the most one read of the writer task
+    /// brings in: more starts at once take turns. At least 1.
+    pub max_read_segments: usize,
 }
 
 impl DiskConfig {
     pub fn new(files: Arc<dyn Files>, namespaces: Vec<Retention>) -> Self {
-        Self { files, namespaces, segment_bytes: 8 << 20, max_unwritten_bytes: 64 << 20 }
+        Self { files, namespaces, segment_bytes: 8 << 20, max_unwritten_bytes: 64 << 20, max_read_segments: 8 }
     }
 }
 
@@ -360,10 +363,6 @@ impl DiskRead {
     }
 }
 
-/// How many segments read in for starts behind the ring stay, and the most one read brings in: the rest wait for the
-/// next.
-const SHELVED: usize = 8;
-
 /// A segment the shelf asks the writer task to read.
 #[derive(Clone)]
 pub(crate) struct Asked {
@@ -394,7 +393,8 @@ struct Indexed {
 #[derive(Default)]
 struct Shelved {
     index: BTreeMap<StreamKey, Indexed>,
-    asked: BTreeMap<String, Asked>,
+    /// In the order they were asked for, so each start waiting gets its turn.
+    asked: VecDeque<Asked>,
     reading: BTreeSet<String>,
     read: VecDeque<SegmentRead>,
 }
@@ -407,7 +407,7 @@ impl Shelf {
         let Some((generation, segments)) = now else {
             s.index.remove(key);
             s.read.retain(|(asked, _)| asked.key != *key);
-            s.asked.retain(|_, asked| asked.key != *key);
+            s.asked.retain(|asked| asked.key != *key);
             return;
         };
         s.read.retain(|(asked, _)| asked.key != *key || segments.iter().any(|(name, _)| *name == asked.name));
@@ -428,15 +428,17 @@ impl Shelf {
         !lock(&self.0).asked.is_empty()
     }
 
-    fn take_asked(&self) -> Vec<Asked> {
+    /// At most `max` of them; the rest wait for the next read.
+    fn take_asked(&self, max: usize) -> Vec<Asked> {
         let mut s = lock(&self.0);
-        let asked: Vec<Asked> = std::iter::from_fn(|| s.asked.pop_first()).take(SHELVED).map(|(_, a)| a).collect();
+        let n = max.min(s.asked.len());
+        let asked: Vec<Asked> = s.asked.drain(..n).collect();
         s.reading.extend(asked.iter().map(|a| a.name.clone()));
         asked
     }
 
-    /// Keeps what a read brought in, and returns the streams it was for.
-    fn read_in(&self, read: Vec<SegmentRead>) -> BTreeSet<StreamKey> {
+    /// Keeps what a read brought in, the newest `max` segments, and returns the streams it was for.
+    fn read_in(&self, read: Vec<SegmentRead>, max: usize) -> BTreeSet<StreamKey> {
         let mut s = lock(&self.0);
         let mut keys = BTreeSet::new();
         for (asked, batches) in read {
@@ -446,7 +448,7 @@ impl Shelf {
                 s.read.push_back((asked, batches));
             }
         }
-        while s.read.len() > SHELVED {
+        while s.read.len() > max {
             s.read.pop_front();
         }
         keys
@@ -483,10 +485,10 @@ impl RecoverySource for Shelf {
         // A segment read before the start was durable is read again.
         s.read.retain(|(a, _)| a.name != *name || a.upto > after.sequence);
         let Some(at) = s.read.iter().position(|(a, _)| a.name == *name) else {
-            if !s.reading.contains(name) {
+            if !s.reading.contains(name) && !s.asked.iter().any(|a| a.name == *name) {
                 let asked =
                     Asked { name: name.clone(), key: key.clone(), generation: *generation, first: *first, upto: *last };
-                s.asked.insert(name.clone(), asked);
+                s.asked.push_back(asked);
             }
             return Err(RecoveryError::Pending);
         };
@@ -723,13 +725,13 @@ impl DiskStore {
 
     /// The segments starts behind a ring asked for, to read with [`read_asked`] and hand to [`read_in`](Self::read_in).
     pub(crate) fn take_reads(&self) -> Option<(Arc<dyn Files>, Vec<Asked>)> {
-        let asked = self.shelf.take_asked();
+        let asked = self.shelf.take_asked(self.cfg.max_read_segments);
         (!asked.is_empty()).then(|| (self.cfg.files.clone(), asked))
     }
 
     /// Keeps what a read brought in; returns the streams whose starts wait on it.
     pub(crate) fn read_in(&self, read: Vec<SegmentRead>) -> BTreeSet<StreamKey> {
-        self.shelf.read_in(read)
+        self.shelf.read_in(read, self.cfg.max_read_segments)
     }
 
     /// A new generation: what the disk holds of the old one goes.
