@@ -709,11 +709,12 @@ fn a_follower_behind_an_open_from_disk_replays_the_rest_from_the_disk() {
     assert!(relay.is_subscribed(follower));
 }
 
-/// More starts behind the ring at once than the disk keeps segments read in for: five replays, two segments. Each
-/// follower gets every record once and in order, and polled after each read they take turns: each gets its first
-/// record before any has all of its own. Before, the starts of the keys first by name were read first, and the others
-/// waited for their whole replays. Read twice before the followers are polled, the second read evicts the segments
-/// of the first unread, and those starts ask again: they still get every record.
+/// More starts behind the ring at once than the disk keeps segments read in for: five replays, two segments, read
+/// once, twice or three times before the followers are polled. Each follower gets every record once and in order, they
+/// take turns (each gets its first record before any has all of its own), and the shelf never holds more than two
+/// segments. Before, the starts of the keys first by name were read first, and the others waited for their whole
+/// replays; and a read past the limit evicted the segments read in first, unread, so the starts waiting longest asked
+/// again behind the others every time.
 #[test]
 fn more_replays_from_the_disk_than_it_keeps_segments_for_take_turns() {
     use crate::recovery::RingLimits;
@@ -721,7 +722,7 @@ fn more_replays_from_the_disk_than_it_keeps_segments_for_take_turns() {
     let keys: Vec<_> = (0..5).map(|k| StreamKey::new("md", format!("k{k}"))).collect();
     let retention = Retention { namespace: "md".into(), max_bytes: u64::MAX, max_age: Duration::from_secs(3600) };
     let rings = vec![RingLimits { namespace: "md".into(), max_records: 4, max_bytes: 1 << 20 }];
-    let rows = [1, 2].map(|reads| {
+    let rows = [1, 2, 3].map(|reads| {
         let mut cfg = DiskConfig::new(Arc::new(MemoryFiles::new()), vec![retention.clone()]);
         // A few records a segment, and two segments read in at a time.
         (cfg.segment_bytes, cfg.max_read_segments) = (64, 2);
@@ -744,6 +745,7 @@ fn more_replays_from_the_disk_than_it_keeps_segments_for_take_turns() {
         let mut seen = vec![Vec::new(); keys.len()];
         // The round each follower got its first record in, and its last.
         let (mut first, mut last) = (vec![0; keys.len()], vec![0; keys.len()]);
+        let mut held = 0;
         for round in 1..=1000 {
             for _ in 0..reads {
                 if let Some((files, asked)) = origin.take_disk_reads() {
@@ -751,6 +753,7 @@ fn more_replays_from_the_disk_than_it_keeps_segments_for_take_turns() {
                         panic!("files in memory waited")
                     };
                     origin.disk_read_in(read);
+                    held = held.max(origin.disk.as_ref().expect("a disk").read_segments());
                 }
             }
             for (i, id) in ids.iter().enumerate() {
@@ -773,12 +776,12 @@ fn more_replays_from_the_disk_than_it_keeps_segments_for_take_turns() {
             }
         }
         let whole = seen.iter().all(|s| *s == (1..=40).map(|n| (n, record(n))).collect::<Vec<_>>());
-        (reads, whole, first.iter().max() < last.iter().min(), first, last)
+        (reads, whole, first.iter().max() < last.iter().min(), held, first, last)
     });
-    for (reads, whole, turns, first, last) in rows {
+    for (reads, whole, turns, held, first, last) in rows {
         assert!(
-            whole && (turns || reads > 1),
-            "{reads} reads a round: first records in rounds {first:?}, last in {last:?}"
+            whole && turns && held <= 2,
+            "{reads} reads a round, {held} held: first records in rounds {first:?}, last in {last:?}"
         );
     }
 }

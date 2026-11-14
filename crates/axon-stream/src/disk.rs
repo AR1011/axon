@@ -373,6 +373,10 @@ pub(crate) struct Asked {
     /// The last position the read found, at least the last durable one when it was asked for. A start at or past it
     /// reads the file again.
     upto: u64,
+    /// When its start first asked for it, in the shelf's count of asks.
+    turn: u64,
+    /// Whether a start has read from it since it came in.
+    served: bool,
 }
 
 /// A segment read in: its batches, `None` when it could not be read.
@@ -393,10 +397,13 @@ struct Indexed {
 #[derive(Default)]
 struct Shelved {
     index: BTreeMap<StreamKey, Indexed>,
-    /// In the order they were asked for, so each start waiting gets its turn.
+    /// Oldest turn first, so each start waiting gets its turn.
     asked: VecDeque<Asked>,
     reading: BTreeSet<String>,
     read: VecDeque<SegmentRead>,
+    /// Segments evicted before a start read from them: asked again, they keep their turn.
+    waited: Vec<Asked>,
+    turns: u64,
 }
 
 impl Shelf {
@@ -408,9 +415,12 @@ impl Shelf {
             s.index.remove(key);
             s.read.retain(|(asked, _)| asked.key != *key);
             s.asked.retain(|asked| asked.key != *key);
+            s.waited.retain(|asked| asked.key != *key);
             return;
         };
-        s.read.retain(|(asked, _)| asked.key != *key || segments.iter().any(|(name, _)| *name == asked.name));
+        let kept = |asked: &Asked| asked.key != *key || segments.iter().any(|(name, _)| *name == asked.name);
+        s.read.retain(|(asked, _)| kept(asked));
+        s.waited.retain(kept);
         let last = s.index.get(key).filter(|e| e.generation == generation).map_or(0, |e| e.last);
         s.index.insert(key.clone(), Indexed { generation, last, segments });
     }
@@ -437,7 +447,9 @@ impl Shelf {
         asked
     }
 
-    /// Keeps what a read brought in, the newest `max` segments, and returns the streams it was for.
+    /// Keeps what a read brought in, at most `max` segments, and returns the streams it was for. Past `max`, a segment
+    /// a start has read from goes first, oldest first; with none, the one asked for last, so the start that has waited
+    /// longest keeps its segment and goes on.
     fn read_in(&self, read: Vec<SegmentRead>, max: usize) -> BTreeSet<StreamKey> {
         let mut s = lock(&self.0);
         let mut keys = BTreeSet::new();
@@ -449,7 +461,13 @@ impl Shelf {
             }
         }
         while s.read.len() > max {
-            s.read.pop_front();
+            let served = s.read.iter().position(|(a, _)| a.served);
+            let last = || s.read.iter().enumerate().max_by_key(|(_, (a, _))| a.turn).map(|(at, _)| at);
+            let at = served.or_else(last).expect("more than max segments held");
+            let (asked, _) = s.read.remove(at).expect("held");
+            if !asked.served {
+                s.waited.push(asked);
+            }
         }
         keys
     }
@@ -486,9 +504,14 @@ impl RecoverySource for Shelf {
         s.read.retain(|(a, _)| a.name != *name || a.upto > after.sequence);
         let Some(at) = s.read.iter().position(|(a, _)| a.name == *name) else {
             if !s.reading.contains(name) && !s.asked.iter().any(|a| a.name == *name) {
-                let asked =
-                    Asked { name: name.clone(), key: key.clone(), generation: *generation, first: *first, upto: *last };
-                s.asked.push_back(asked);
+                s.turns += 1;
+                let turn = match s.waited.iter().position(|a| a.name == *name) {
+                    Some(at) => s.waited.swap_remove(at).turn,
+                    None => s.turns,
+                };
+                let (name, key, generation, first, upto) = (name.clone(), key.clone(), *generation, *first, *last);
+                let at = s.asked.partition_point(|a| a.turn < turn);
+                s.asked.insert(at, Asked { name, key, generation, first, upto, turn, served: false });
             }
             return Err(RecoveryError::Pending);
         };
@@ -508,7 +531,9 @@ impl RecoverySource for Shelf {
             // The file lost it.
             return Err(RecoveryError::HistoryUnavailable);
         }
-        page(after, through, bounds, held)
+        let page = page(after, through, bounds, held);
+        s.read[at].0.served = true;
+        page
     }
 }
 
@@ -732,6 +757,11 @@ impl DiskStore {
     /// Keeps what a read brought in; returns the streams whose starts wait on it.
     pub(crate) fn read_in(&self, read: Vec<SegmentRead>) -> BTreeSet<StreamKey> {
         self.shelf.read_in(read, self.cfg.max_read_segments)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_segments(&self) -> usize {
+        lock(&self.shelf.0).read.len()
     }
 
     /// A new generation: what the disk holds of the old one goes.
