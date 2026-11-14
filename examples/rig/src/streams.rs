@@ -163,8 +163,7 @@ pub async fn start(cx: &crate::Ctx<'_>) -> Result<Tick, Box<dyn Error>> {
     if !movers.is_empty() {
         // A mover pulls from the other, as the standby the guide's § Standby describes; the rest through b2 first.
         let tiers = movers.iter().filter(|n| *n != me).rev().map(|n| label(n)).collect();
-        cfg = cfg.upstream_for(MOVE_NAMESPACE, tiers);
-        cfg.history.insert(MOVE_NAMESPACE.into(), Arc::new(Due));
+        cfg = cfg.upstream_for(MOVE_NAMESPACE, tiers).history(MOVE_NAMESPACE, Arc::new(Due));
     }
     if crate::wan() {
         // spec/wan.md § 9: a parent lost after one redial across regions, 6.4 s; one back for under 30 s not worth a

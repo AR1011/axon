@@ -595,11 +595,13 @@ impl Sub {
             self.release(&event, total);
         }
         let given = Cursor { generation: cut.generation, sequence: next_after };
-        let phase = if self.one_generation { Phase::Waiting(Some(given)) } else { Phase::Live };
-        (self.tail, self.at, self.phase) = (0, Some(given), phase);
-        if !self.one_generation {
+        let phase = if self.one_generation {
+            Phase::Waiting(Some(given))
+        } else {
             self.queue.push_back(StreamEvent::CaughtUp { through: given });
-        }
+            Phase::Live
+        };
+        (self.tail, self.at, self.phase) = (0, Some(given), phase);
     }
 
     /// Behind the position its stream opened at, which `source` holds from its own on: it is told its own position,

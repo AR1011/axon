@@ -949,8 +949,7 @@ fn a_follower_on_the_standby_behind_the_open_that_may_not_replay_is_reset() {
 fn a_standby_catching_up<A: Authorizer>(authorizer: A) -> (RelayCore<A>, u64) {
     let now = Instant::now();
     let (o, s) = (PeerId::new("o", 1), PeerId::new("s", 1));
-    let mut origin = RelayCore::new(&o, AllowAll, CoreConfig { relay: false, ..scaled() }).expect("a valid config");
-    origin.open_stream(&key(0), 1, DeliveryPolicy::ReplayRequired).expect("opens");
+    let mut origin = origin(&scaled(), 1, 0);
     let cfg = CoreConfig { relay: true, ..scaled() };
     let mut standby = RelayCore::new(&s, authorizer, cfg).expect("a valid config");
     let log = Arc::new(Mutex::new(MemoryStore::new(MemoryLimits::default()).expect("valid limits")));
