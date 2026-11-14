@@ -1024,7 +1024,7 @@ impl<A: Authorizer> RelayCore<A> {
         drop(store);
         // Followers hear of the open last, so a refusal shows them nothing.
         let opened = match &resume {
-            Some(r) => self.hub.resume_stream(&self.local, key, r.through, policy, &r.latest),
+            Some(r) => self.hub.resume_stream(&self.local, key, r.through, policy, &r.latest, self.origin_history(key)),
             None => self.hub.open_stream(&self.local, key, generation, policy),
         };
         if let Err(error) = opened {
@@ -1260,8 +1260,12 @@ impl<A: Authorizer> RelayCore<A> {
     /// What a subscription to the key replays from: its ring, with the namespace's history behind it on a key this
     /// node originates. A relay passes a start behind its ring on as `HistoryUnavailable`.
     fn history(&self, key: &StreamKey) -> Arc<dyn RecoverySource> {
-        let behind = self.history.get(key.namespace()).cloned().or_else(|| self.disk.as_ref()?.history(key));
-        match behind.filter(|_| self.originated.contains(key)) {
+        if self.originated.contains(key) { self.origin_history(key) } else { self.store.clone() }
+    }
+
+    /// What subscriptions to a key this node originates, or opens, replay from.
+    fn origin_history(&self, key: &StreamKey) -> Arc<dyn RecoverySource> {
+        match self.history.get(key.namespace()).cloned().or_else(|| self.disk.as_ref()?.history(key)) {
             Some(behind) => Arc::new(History { ring: self.store.clone(), behind }),
             None => self.store.clone(),
         }

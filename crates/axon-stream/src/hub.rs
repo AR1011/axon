@@ -596,6 +596,14 @@ impl Sub {
         (self.tail, self.at, self.phase) = (0, Some(given), Phase::Waiting(Some(given)));
     }
 
+    /// Behind the position its stream opened at, which `source` holds from its own on: it is told its own position,
+    /// as at an open there, then replays the rest to `cut` and goes on live.
+    fn catch_up(&mut self, at: Cursor, cut: Cursor, source: Arc<dyn RecoverySource>) {
+        let _ = self.ready(Some(at));
+        self.at = Some(cut);
+        self.phase = Phase::Recovering { next_after: at.sequence, cut, source, with_state: false, waiting: false };
+    }
+
     /// Goes live once the stream is at or past a waiting start.
     fn reach(&mut self, at: u64) {
         if let Phase::Waiting(Some(after)) = self.phase
@@ -998,11 +1006,11 @@ impl<A: Authorizer> StreamHub<A> {
         generation: u64,
         policy: DeliveryPolicy,
     ) -> Result<(), StreamError> {
-        self.insert_stream(publisher, key, Some(Cursor { generation, sequence: 0 }), policy)
+        self.insert_stream(publisher, key, Some(Cursor { generation, sequence: 0 }), policy, None)
     }
 
     /// An origin stream that goes on after `cursor`, from history kept elsewhere, with `latest` as a compacted stream's
-    /// state.
+    /// state. A follower waiting for the key behind `cursor` replays the rest from `source`.
     pub(crate) fn resume_stream(
         &mut self,
         publisher: &PeerId,
@@ -1010,8 +1018,9 @@ impl<A: Authorizer> StreamHub<A> {
         cursor: Cursor,
         policy: DeliveryPolicy,
         latest: &[Payload],
+        source: Arc<dyn RecoverySource>,
     ) -> Result<(), StreamError> {
-        self.insert_stream(publisher, key, Some(cursor), policy)?;
+        self.insert_stream(publisher, key, Some(cursor), policy, Some(source))?;
         if let Some(state) = self.streams.get_mut(key).and_then(|s| s.state.as_mut()) {
             // Rebuilt under the same limits, so it fits.
             let _ = state.apply(latest, &mut |_| Ok(()));
@@ -1027,7 +1036,26 @@ impl<A: Authorizer> StreamHub<A> {
         key: &StreamKey,
         policy: DeliveryPolicy,
     ) -> Result<(), StreamError> {
-        self.insert_stream(publisher, key, None, policy)
+        self.insert_stream(publisher, key, None, policy, None)
+    }
+
+    /// The replay of a follower behind its key's open at `cut`, in its generation, that may replay: from its own
+    /// position, when the source holds the records between. A standby opens after the records its log holds, past what
+    /// reached it as a relay.
+    fn behind(
+        &self,
+        sub: &Sub,
+        cut: Option<Cursor>,
+        source: Option<&Arc<dyn RecoverySource>>,
+    ) -> Option<(Cursor, Cursor, Arc<dyn RecoverySource>)> {
+        let (at, cut, source) = (sub.at?, cut?, source?);
+        let held = at.generation == cut.generation
+            && at.sequence < cut.sequence
+            && self.authorizer.authorize(&sub.peer, &sub.key, Access::Replay)
+            && source
+                .available_range(&sub.key)
+                .is_ok_and(|r| r.generation == cut.generation && r.covers(at.sequence, cut.sequence));
+        held.then(|| (at, cut, source.clone()))
     }
 
     fn insert_stream(
@@ -1036,6 +1064,7 @@ impl<A: Authorizer> StreamHub<A> {
         key: &StreamKey,
         cursor: Option<Cursor>,
         policy: DeliveryPolicy,
+        source: Option<Arc<dyn RecoverySource>>,
     ) -> Result<(), StreamError> {
         self.allowed(publisher, key, Access::Publish)?;
         let empty = |l: CompactLimits| l.max_keys == 0 || l.max_bytes == 0;
@@ -1051,9 +1080,13 @@ impl<A: Authorizer> StreamHub<A> {
         let parked = self.parked.remove(key).unwrap_or_default();
         let mut subscribers = Vec::with_capacity(parked.len());
         for id in parked {
+            let replay = self.subs.get(&id).and_then(|sub| self.behind(sub, cursor, source.as_ref()));
             let Some(sub) = self.subs.get_mut(&id) else { continue };
             if sub.policy == SlowConsumerPolicy::CoalesceLatest && policy != DeliveryPolicy::ReplaceableState {
                 self.terminate(id, StreamEvent::End(EndReason::Unsubscribed));
+            } else if let Some((at, cut, source)) = replay {
+                sub.catch_up(at, cut, source);
+                subscribers.push(id);
             } else if let Err(reset) = sub.ready(cursor) {
                 self.terminate(id, reset);
             } else {

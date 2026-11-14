@@ -801,6 +801,42 @@ fn a_relay_its_parent_may_not_replay_to_goes_on_live_after_a_close() {
     }
 }
 
+/// A standby that takes a key up after its origin, from the history it keeps, opens it at the last record the history
+/// holds, past what reached it as a relay. Its own followers behind the open replay the rest from that history and go
+/// on live, each record once, a follower still replaying its start too. Before, both were reset as if the records
+/// were lost.
+#[test]
+fn a_follower_on_the_standby_behind_the_open_replays_the_rest_from_the_history() {
+    let now = Instant::now();
+    let (o, s) = (PeerId::new("o", 1), PeerId::new("s", 1));
+    let cfg = CoreConfig { relay: false, ..scaled() };
+    let mut origin = RelayCore::new(&o, AllowAll, cfg).expect("a valid config");
+    origin.open_stream(&key(0), 1, DeliveryPolicy::ReplayRequired).expect("opens");
+    let mut standby = RelayCore::new(&s, AllowAll, CoreConfig { relay: true, ..scaled() }).expect("a valid config");
+    // The history the standby keeps: every record the origin committed, ahead of what it relayed.
+    let log = Arc::new(Mutex::new(MemoryStore::new(MemoryLimits::default()).expect("valid limits")));
+    lock(&log).open(&key(0), 1).expect("opens");
+    let batch = SequencedBatch::new(1, 1, vec![Bytes::from_static(b"x"); 20]).expect("a batch");
+    lock(&log).append(&key(0), &batch).expect("appends");
+    standby.set_history("md", log);
+    let live = standby.subscribe(&key(0), SubscribeOptions::default()).expect("follows");
+    ask(&mut origin, &o, &mut standby, &s, now);
+    origin.publish(&key(0), vec![Bytes::from_static(b"x"); 10]).expect("publishes");
+    deliver(&mut origin, &o, &mut standby, &s, now);
+    assert_eq!(records(&mut standby, live), (1..=10).collect::<Vec<_>>());
+    // Subscribed from record 1 and not polled: it is still replaying its start from the ring.
+    let start = StartPosition::FollowAfter(Cursor { generation: 1, sequence: 0 });
+    let after = standby.subscribe(&key(0), SubscribeOptions { start, ..Default::default() }).expect("follows after");
+    // Records 11 to 20 never reach the standby as a relay.
+    origin.publish(&key(0), vec![Bytes::from_static(b"x"); 10]).expect("publishes");
+    let through = Cursor { generation: 1, sequence: 20 };
+    standby.open_stream_after(&key(0), through, DeliveryPolicy::ReplayRequired).expect("opens after the history");
+    standby.publish(&key(0), vec![Bytes::from_static(b"x")]).expect("publishes");
+    assert_eq!(records(&mut standby, live), (11..=21).collect::<Vec<_>>());
+    assert_eq!(records(&mut standby, after), (1..=21).collect::<Vec<_>>());
+    assert!(standby.is_subscribed(live) && standby.is_subscribed(after), "neither was reset");
+}
+
 /// A replay from the namespace's history, four branches long, goes to the child a window at a time: the branch is
 /// never asked to hold more than it has room for, so it is not reset as a slow consumer.
 #[test]

@@ -1153,8 +1153,10 @@ fn a_subscriber_behind_every_ring_replays_from_the_origins_history_then_goes_liv
 /// The key's producer moves to the standby, which relays the key from the origin. The origin crashes and never comes
 /// back, pauses and closes the key once it is back, stays paused, or runs on and closes the key (seeded); the standby
 /// opens the key after the last record, which it holds, as every record is committed there before it is published.
-/// Both publish from the application's log, which serves what neither ring holds. Every follower, `Live` or
-/// `FollowAfter`, on the leaf and on the standby, reads every record once, in order, in generation 1.
+/// Both publish from the application's log, which serves what neither ring holds. On odd seeds the standby opens as
+/// soon as the records are published, before they reach it as a relay, with a `FollowAfter` follower that came after
+/// them: its followers behind the open replay the rest from the log. Every follower, `Live` or `FollowAfter`, on the
+/// leaf and on the standby, reads every record once, in order, in generation 1.
 fn origin_moves(seed: u64) {
     let set = |cfg: &mut StreamNodeConfig| {
         cfg.history.insert(key().namespace().into(), Arc::new(Numbered(0)));
@@ -1162,8 +1164,8 @@ fn origin_moves(seed: u64) {
     let names = ["origin", "standby", "relay-a", "relay-b", "leaf"];
     let (mut w, _) = world_with(WorldConfig { seed, ..WorldConfig::default() }, &names, Compression::None, set);
     let from = |sequence| StartPosition::FollowAfter(Cursor { generation: 1, sequence });
-    let leaves = ["leaf", "leaf", "standby"];
-    let reads = [
+    let mut leaves = vec!["leaf", "leaf", "standby"];
+    let mut reads = vec![
         collect(&mut w, "leaf", key(), StartPosition::Live),
         collect(&mut w, "leaf", key(), from(0)),
         collect(&mut w, "standby", key(), StartPosition::Live),
@@ -1173,9 +1175,16 @@ fn origin_moves(seed: u64) {
     });
     publish(&mut w, 1..=200);
     let last = Cursor { generation: 1, sequence: 200 };
-    w.run_until("the standby holds every record", Duration::from_secs(10), |w| {
-        stream(w, "standby").cursor(&key()) == Some(last)
-    });
+    if seed % 2 == 1 {
+        leaves.push("standby");
+        reads.push(collect(&mut w, "standby", key(), from(0)));
+        // Long enough to subscribe, too short for the records to reach the standby.
+        w.run_for(Duration::from_millis(1));
+    } else {
+        w.run_until("the standby holds every record", Duration::from_secs(10), |w| {
+            stream(w, "standby").cursor(&key()) == Some(last)
+        });
+    }
     let fault = w.pick(0..4);
     match fault {
         0 => crash(&mut w, "origin"),

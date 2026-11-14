@@ -98,7 +98,7 @@ open "generation g after position p", but it is `pub(crate)` and only disk resum
   `ResetRequired(GenerationChanged)`. A plain `After` keeps today's end at a close. `FollowAfter` is local to the
   subscriber's node: what goes upstream is the relay's `After(position)`, as now.
 - Built in the hub as a follower that holds one generation (`Sub::one_generation`, checked in `moves_to`), admitted
-  as an `After`. Three cases the sim found:
+  as an `After`. Three cases the sim found, and a fourth a review found:
   - a follower still replaying its start when the key closes loses its replay's source with the stream: it waits
     instead for the last position it was given, and the live batches held behind the replay are given back
     (`Sub::stop_replay`);
@@ -106,7 +106,13 @@ open "generation g after position p", but it is `pub(crate)` and only disk resum
     `After` the relay closed at: a parent that cannot give it is then left for one that can, instead of the relay
     falling back to the live edge past the follower;
   - a follower told `Ready { start: None }` on a relay stream with no position is told its position before the first
-    batch it gets (`Sub::unplaced`).
+    batch it gets (`Sub::unplaced`);
+  - a follower on the standby itself is behind the open whenever the log is ahead of what reached the standby as a
+    relay, which rule 1 allows and a crash of the old origin leaves: the parked follower, `Live` or a `FollowAfter`
+    still replaying its start, replays the rest from the open's source and goes on live (`resume_stream` takes the
+    source, `Sub::catch_up`), where it was reset `HistoryUnavailable`. Only a follower that may replay
+    (`Access::Replay`), and only when the source holds every record between; otherwise the reset stands. The replay
+    runs under the branch and hub limits, as a subscribe `After` it would.
 - Topology the guide recommends: the standby relays the key from the origin (its tiers name the origin's label), so
   taking over is the tested "a relay opens a key it pulls" path (`world_relay.rs:278`), and no `UnknownStream` backoff
   (`core.rs:1859-1868`) delays its children.
@@ -124,7 +130,8 @@ after a close takes the live edge past its followers), `NoSource` (an origin tha
 (a plain `After` at a close) break `NoEnd`; `TrustRelay` (a follower that takes its relay's position as its own, today's
 hub) breaks `NoGap`; `PublishBeforeCommit` and `StaleOpen` (the two application rules) break `SameRecord`;
 `NeverClose` (an old origin that stays open) breaks `CatchesUp`. Abstractions are listed in the model's header: the
-relay's ring holds what it took, a read from the source is one step, and the standby is not itself a relay.
+relay's ring holds what it took, a read from the source is one step, and the standby is not itself a relay, so it
+has no followers of its own behind the open (the fourth case above is tested in the World and the core instead).
 
 **Wire.** None: positions, `Status` and the interest are unchanged.
 
@@ -136,7 +143,9 @@ relay's ring holds what it took, a read from the source is one step, and the sta
   crashes or pauses (seeded), the standby opens after the last record it holds, the old origin closes later or never
   comes back. The oracle of `tests/world.rs:159` (`check`), held to one generation. It failed before: there was no
   `open_stream_after`, and the moved generation had no history behind it (run against stubs that open the next
-  generation: the leaf read "1 after 200").
+  generation: the leaf read "1 after 200"). On odd seeds the standby opens before the records reach it as a relay,
+  with a `FollowAfter(0)` follower that came after them; those seeds failed before the fourth case was fixed.
+- `crates/axon-stream/src/core/tests.rs::a_follower_on_the_standby_behind_the_open_replays_the_rest_from_the_history`
 - `crates/axon-stream/tests/world_wan.rs::an_origin_moved_to_another_region_keeps_every_cursor`: the same across three
   regions at the WAN timings. Every follower recovers within 15 s of the fault (the cluster calls a silent origin gone
   about 11.5 s after it), and within `upstream_timeout` plus one round trip of an old origin's close.
