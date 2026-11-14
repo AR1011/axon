@@ -471,6 +471,22 @@ async fn a_woken_subscription_polls_without_the_node_lock() {
     system.shutdown().await.unwrap();
 }
 
+/// A disk that keeps no segment read in is refused at start: a start behind a ring would wait for a read that brings
+/// nothing in. One is enough. Before, the node started.
+#[tokio::test(flavor = "multi_thread")]
+async fn start_refuses_a_disk_that_keeps_no_segment_read_in() {
+    let (system, cluster) = start_cluster("a", &MemoryDiscovery::new()).await;
+    let mut cfg = on_disk(Arc::new(MemoryFiles::new()), &["md"]);
+    cfg.disk.as_mut().expect("a disk").max_read_segments = 0;
+    let refused = StreamNode::start(&cluster, cfg.clone()).await.err();
+    let zero = "DiskConfig::max_read_segments must be at least 1";
+    assert!(matches!(refused, Some(ClusterError::Config(e)) if e == zero), "{refused:?}");
+    cfg.disk.as_mut().expect("a disk").max_read_segments = 1;
+    let node = StreamNode::start(&cluster, cfg).await.expect("one segment read in");
+    drop((node, cluster));
+    system.shutdown().await.unwrap();
+}
+
 /// The limits across the cluster are refused at start without a `Quotas`; with one, a node takes each from it.
 #[tokio::test(flavor = "multi_thread")]
 async fn namespace_limits_across_the_cluster_need_quotas_and_hold_on_one_node() {

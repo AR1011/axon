@@ -549,6 +549,9 @@ impl StreamNode {
         if cfg.downstream_expiry <= lost_interest {
             return Err(ClusterError::Config("downstream_expiry must outlast one lost interest"));
         }
+        if cfg.disk.as_ref().is_some_and(|d| d.max_read_segments == 0) {
+            return Err(ClusterError::Config("DiskConfig::max_read_segments must be at least 1"));
+        }
         let cluster_wide =
             cfg.core.namespaces.values().any(|l| l.records_per_sec.or(l.bytes_per_sec).or(l.open_streams).is_some());
         if cluster_wide && cfg.quotas.is_none() {

@@ -37,7 +37,7 @@ pub struct DiskConfig {
     /// Bytes published and not synced yet past which a publish is refused with `Disk(Behind)`.
     pub max_unwritten_bytes: usize,
     /// The segments read in for starts behind a ring that stay in memory, and the most one read of the writer task
-    /// brings in: more starts at once take turns. At least 1.
+    /// brings in: more starts at once take turns. `StreamNode::start` refuses 0.
     pub max_read_segments: usize,
 }
 
