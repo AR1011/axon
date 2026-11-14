@@ -48,13 +48,24 @@ impl Placement {
         node.has_labels(&self.required)
     }
 
-    /// Available members advertising `kind` that satisfy the labels. Of those, only the ones that serve the most of
-    /// the schemas the others' own callers use: in a rolling upgrade, the nodes that serve the old schema beside the
-    /// new one, so every caller reaches a key placed there. Every node reads the same view, so all pick the same.
+    /// Available members advertising `kind` that satisfy the labels. Of those, the ones that advertise it leased
+    /// when any member that satisfies the labels and is not leaving does, reachable or not
+    /// ([`NodeRecord::kind_leased`](crate::NodeRecord::kind_leased)), so that a key runs under a lease or by the view,
+    /// never both: a leased node cut from this one still holds its keys' leases. Of those, only the ones that serve
+    /// the most of the schemas the others' own callers use: in a rolling upgrade, the nodes that serve the old schema
+    /// beside the new one, so every caller reaches a key placed there. Every node reads the same view, so all pick the
+    /// same.
     pub fn candidates<'a>(&self, view: &'a View, kind: &str) -> Vec<&'a Member> {
         let preferred =
             |m: &Member| self.preferred.iter().filter(|(k, v)| m.record.label(k) == Some(v.as_str())).count();
-        let eligible: Vec<_> = view.admitted(self).filter_map(|m| Some((m, m.record.kind_schemas(kind)?))).collect();
+        let advertised: Vec<_> = view.admitted(self).filter_map(|m| Some((m, m.record.kind_entry(kind)?))).collect();
+        let leased = (view.members.iter())
+            .filter(|m| !m.record.draining() && self.admits(&m.record))
+            .any(|m| m.record.kind_leased(kind) == Some(true));
+        let eligible: Vec<_> = (advertised.into_iter())
+            .filter(|(_, entry)| entry.leased == leased)
+            .map(|(m, entry)| (m, entry.schemas))
+            .collect();
         let own: BTreeSet<u16> = eligible.iter().filter_map(|(_, schemas)| schemas.first().copied()).collect();
         let spoken = |schemas: &[u16]| own.iter().filter(|s| schemas.contains(s)).count();
         let most = eligible.iter().map(|(_, schemas)| spoken(schemas)).max();
@@ -102,6 +113,11 @@ impl View {
                 placement.candidates(self, kind).into_iter().map(|m| m.record.id.as_str()).filter(left),
             ),
         }
+    }
+
+    /// Whether `node` advertises `kind` leased: a caller walks past it as past a leased owner.
+    pub(crate) fn leases(&self, node: &str, kind: &str) -> bool {
+        self.get(node).and_then(|m| m.record.kind_leased(kind)) == Some(true)
     }
 
     /// The members advertising `kind` that this view finds unavailable and that would rank ahead of `node` for the
@@ -244,6 +260,24 @@ mod tests {
         assert_eq!(ids(["pricer/1+2", "pricer/2+1", "pricer/1+2"], "pricer"), ["a", "b", "c"]);
         // Without `also`, neither build answers the other's callers: both stay candidates.
         assert_eq!(ids(["pricer/1", "pricer/2", "pricer/1"], "pricer"), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn a_leased_node_this_one_cannot_reach_keeps_the_unleased_nodes_out() {
+        let ids = |reachable: bool, placement: &Placement| {
+            let mut mixed = view(&[("a", "eu"), ("b", "eu"), ("c", "us")]);
+            for (member, kinds) in mixed.members.iter_mut().zip(["pricer/1", "pricer/1/u", "pricer/1/u"]) {
+                member.record.metadata.insert(KINDS.into(), kinds.into());
+            }
+            mixed.members[0].reachable = reachable;
+            placement.candidates(&mixed, "pricer").iter().map(|m| m.record.id.clone()).collect::<Vec<_>>()
+        };
+        let any = Placement::default();
+        assert_eq!(ids(true, &any), ["a"]);
+        // a may still run the keys under their leases: b and c would run them twice.
+        assert!(ids(false, &any).is_empty());
+        // A placement a's labels do not satisfy has only unleased nodes.
+        assert_eq!(ids(false, &Placement::default().require("region", "us")), ["c"]);
     }
 
     #[test]

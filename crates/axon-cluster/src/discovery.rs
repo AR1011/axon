@@ -84,16 +84,35 @@ impl NodeRecord {
     }
 
     pub fn has_kind(&self, kind: &str) -> bool {
-        self.kind_schemas(kind).is_some()
+        self.kind_entry(kind).is_some()
     }
 
     /// The `SCHEMA`s the node serves `kind` at, from `kind/2+1` in its [`KINDS`]: first the one its own callers use,
     /// the `P` of its `cluster.kind::<P>`, then each it serves `also`. `None` when it does not advertise the kind.
     pub fn kind_schemas(&self, kind: &str) -> Option<Vec<u16>> {
-        let kinds = self.metadata.get(KINDS)?;
-        let (_, schemas) = kinds.split(',').map(|k| k.split_once('/').unwrap_or((k, ""))).find(|(k, _)| *k == kind)?;
-        Some(schemas.split('+').filter_map(|s| s.parse().ok()).collect())
+        self.kind_entry(kind).map(|entry| entry.schemas)
     }
+
+    /// Whether the node runs `kind`'s keys under its ownership authority's leases: `kind/2+1` in its [`KINDS`], and
+    /// `kind/2+1/u` for a kind registered [`unleased`](crate::KindBuilder::unleased) or on a node without one. `None`
+    /// when it does not advertise the kind.
+    pub fn kind_leased(&self, kind: &str) -> Option<bool> {
+        self.kind_entry(kind).map(|entry| entry.leased)
+    }
+
+    /// `kind`'s entry in [`KINDS`], read once for both.
+    pub(crate) fn kind_entry(&self, kind: &str) -> Option<KindEntry> {
+        let kinds = self.metadata.get(KINDS)?;
+        let (_, entry) = kinds.split(',').map(|k| k.split_once('/').unwrap_or((k, ""))).find(|(k, _)| *k == kind)?;
+        let (schemas, leased) = entry.strip_suffix("/u").map_or((entry, true), |schemas| (schemas, false));
+        Some(KindEntry { schemas: schemas.split('+').filter_map(|s| s.parse().ok()).collect(), leased })
+    }
+}
+
+/// A kind as a node advertises it: [`NodeRecord::kind_schemas`] and [`NodeRecord::kind_leased`].
+pub(crate) struct KindEntry {
+    pub schemas: Vec<u16>,
+    pub leased: bool,
 }
 
 /// What a discovery provider or an ownership authority says about itself, for consoles.
@@ -177,7 +196,8 @@ pub trait Discovery: Send + Sync + 'static {
     }
 
     /// How soon a peer can drop a node that went quiet from this provider's view, where the provider does that
-    /// itself: without an ownership authority, `Cluster::start` refuses heartbeats that would isolate the node later.
+    /// itself: without an ownership authority, `Cluster::start` refuses heartbeats that would isolate the node later,
+    /// and with one, `register` refuses them for an unleased kind.
     fn drops_after(&self) -> Option<Duration> {
         None
     }

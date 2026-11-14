@@ -640,7 +640,7 @@ allocating.
 
 ## 11. Leases per kind (wire v8)
 
-Status: designed, not built.
+Status: built, except the unleased World variants of [faults.md](faults.md)'s keyed rows.
 
 **Problem.** The authority is the node's, not the kind's: `ClusterConfig::ownership` (`cluster.rs:44-45`), and every
 keyed path tests `self.ownership`, never the kind. Acquire (`spawn.rs:670`), the caller's walk past an unreachable
@@ -663,13 +663,19 @@ refusal (`spawn.rs:494,637-639`), the isolation sweep (`spawn.rs:1479`) and the 
   partition). On a node without an authority every kind is unleased, as today.
 - The node advertises the mode in `axon.kinds`: `kind/2+1` gains `/u` for an unleased kind (`kind/2+1/u`), written at
   register (`spawn.rs` `register`) and read by `NodeRecord::kind_schemas`'s neighbour `kind_leased(kind) -> Option<bool>`
-  (`discovery.rs:90-95`). A node that advertises a kind in the other mode is no candidate for it, as a schema it does not
-  serve is not (`placement.rs`), so every node computes the same owner set.
+  (`discovery.rs:90-95`). While any node advertises a kind leased, a node that advertises it unleased is no candidate
+  for it, as a node short of the schemas the others' callers use is not (`placement.rs`), so every node computes the
+  same owner set. (Each node against its own mode would not: a leased and an unleased node would each own the key.)
+  A rolling change of mode keeps the keys on the leased nodes until the last of them changes.
 - Each `self.ownership` test becomes `self.leased(kind)`. On the serving side the kind's own registration decides; on
   the calling side the mode its owner advertises does, so every caller walks one way to one owner.
-- `can_grant` and `Isolated` hold back leased kinds only: an isolated or cut node keeps starting unleased keys. The
-  isolation sweep stops unleased keys at once and leaves leased ones to their fences. `max_leases` counts leased keys
-  only, by construction.
+- `can_grant` and its `Isolated` refusal hold back leased kinds only: a node cut from the acceptors keeps starting
+  unleased keys. A node that discovery isolates refuses keys of every kind, as without an authority, and its sweep
+  stops unleased keys at once and leaves leased ones to their fences. `max_leases` counts leased keys only, by
+  construction.
+- `axon.owns`, the rebalance's question whether a node takes keys moved to it (`takes_keys`), answers a bit per mode:
+  bit 0 for leased kinds (open, a member, and `can_grant`), bit 1 for the others (open and a member). A key moves
+  when the bit for its kind's mode at the new owner is set.
 - `eager` requires a leased kind (`spawn.rs:1694`): `.unleased().eager(..)` is refused at `register`.
 - The `stops_within` check moves to `register` of an unleased kind on a node with an authority, where it now matters:
   `heartbeat_interval + 3/2 heartbeat_grace` under the discovery's `drops_after`, else `ClusterError::Config`.
@@ -678,18 +684,20 @@ refusal (`spawn.rs:494,637-639`), the isolation sweep (`spawn.rs:1479`) and the 
 
 **Wire.** No frame changes. The `axon.kinds` value is a record format, and it changes in v8: a v7 node would read
 `2+1/u` as schemas `2` and nothing, which the clean break to v8 keeps out ([rolling-upgrades.md §6](rolling-upgrades.md#6-wire-v8)).
+So does the `axon.owns` answer, `1` in v7 and `3` for a node that takes every key in v8.
 No `SCHEMA` bump: spawn requests do not carry the mode. No TLA change: `PaxosLeases.tla` and `Handover.tla` cover leased
 kinds, and an unleased kind behaves as a kind on a node without an authority, which the World covers.
 
 **API.** `KindBuilder::unleased`, `NodeRecord::kind_leased`.
 
-**Tests.**
+**Tests.** The first sits with the cluster tests' kinds, the World ones with a boot of their own that mixes a
+caller without an authority in, rather than the shared one of `world_reach.rs` and `world_faults.rs`.
 
-- `crates/axon-cluster/tests/ownership.rs::an_unleased_kind_starts_with_the_acceptors_down_and_a_leased_kind_is_refused_isolated`
-- `crates/axon-cluster/tests/world_reach.rs::a_caller_without_an_authority_walks_past_a_leased_owner_cut_from_the_acceptors`
-  (fails today: the caller's own config decides the walk)
-- `crates/axon-cluster/tests/world_faults.rs::a_region_cut_from_the_acceptors_keeps_starting_its_unleased_keys_while_leased_ones_wait`
-- `crates/axon-cluster/tests/upgrade.rs::nodes_that_advertise_a_kind_in_two_modes_are_not_each_others_candidates`
+- `crates/axon-cluster/tests/cluster/leases.rs::an_unleased_kind_starts_with_the_acceptors_down_and_a_leased_kind_is_refused_isolated`
+- `crates/axon-cluster/tests/world_leases.rs::a_caller_without_an_authority_walks_past_a_leased_owner_cut_from_the_acceptors`
+  (fails with the caller's own config deciding the walk)
+- `crates/axon-cluster/tests/world_leases.rs::a_region_cut_from_the_acceptors_keeps_starting_its_unleased_keys_while_leased_ones_wait`
+- `crates/axon-cluster/tests/upgrade.rs::a_kind_advertised_in_two_modes_is_placed_on_its_leased_nodes_only`
 - `crates/axon-cluster/tests/cluster/keyed.rs::an_unleased_eager_kind_is_refused_at_register`
 - The leased-kind rows of [faults.md](faults.md) (keyed actors) gain the unleased variant of each World test.
 

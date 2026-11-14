@@ -44,7 +44,8 @@ pub struct ClusterConfig {
     /// character, and values of at most 512 bytes.
     pub labels: BTreeMap<String, String>,
     pub authorizer: Option<Arc<dyn Authorizer>>,
-    /// Makes keyed actors strictly owned: a lease is taken before each one starts.
+    /// Makes keyed actors strictly owned: a lease is taken before each one starts, for every kind not registered
+    /// [`unleased`](crate::KindBuilder::unleased).
     pub ownership: Option<Arc<dyn OwnershipAuthority>>,
     pub accept: AcceptLimits,
     /// Redials of a peer. Its `max` (2 s) bounds how long calls wait once a cut to a listed peer heals.
@@ -362,6 +363,8 @@ pub(crate) struct Inner {
     pub gates: Box<[tokio::sync::Mutex<()>]>,
     /// Bumped under `unique` whenever every keyed actor is told to stop, so a start in flight notices.
     pub sweeps: AtomicU64,
+    /// Bumped with `sweeps`, and also when only the keyed actors that hold no lease are told to stop.
+    pub unleased_sweeps: AtomicU64,
     pub rebalance_settle: Duration,
     resync_interval: Duration,
     /// A leave's hand-offs, each under way from its actor's end, and the drain of `eager`, which `finish_leaving`
@@ -396,6 +399,9 @@ pub(crate) struct Inner {
     compress_control: bool,
     heartbeat_error: Mutex<Option<String>>,
     pub heartbeat_grace: Duration,
+    /// Discovery drops this node before `heartbeat_interval + 3/2 heartbeat_grace`, by which an isolated node stops
+    /// the keys it does not hold a lease for: they would run twice in between.
+    pub isolates_late: bool,
     heartbeat_ok: Mutex<Instant>,
     snapshot_ok: Mutex<Instant>,
     /// Held from asking discovery for a snapshot to applying it, so no answer replaces one asked for after it.
@@ -474,8 +480,10 @@ impl Cluster {
             return Err(ClusterError::Config("lease_renew_interval must be above zero"));
         }
         // A node that isolates after its peers dropped it runs its keys twice in between; a lease fences them instead.
+        // With an authority, `register` checks it for each unleased kind.
         let stops_within = cfg.heartbeat_interval.saturating_add(cfg.heartbeat_grace.saturating_mul(3) / 2);
-        if cfg.ownership.is_none() && cfg.discovery.drops_after().is_some_and(|drops| stops_within >= drops) {
+        let isolates_late = cfg.discovery.drops_after().is_some_and(|drops| stops_within >= drops);
+        if cfg.ownership.is_none() && isolates_late {
             return Err(ClusterError::Config(
                 "heartbeat_interval + 3/2 heartbeat_grace must be under the discovery's drops_after without an \
                  ownership authority",
@@ -558,6 +566,7 @@ impl Cluster {
             lease_grace,
             gates: (0..256).map(|_| tokio::sync::Mutex::new(())).collect(),
             sweeps: AtomicU64::new(0),
+            unleased_sweeps: AtomicU64::new(0),
             rebalance_settle: cfg.rebalance_settle,
             resync_interval: cfg.resync_interval,
             handoff: Mutex::default(),
@@ -583,6 +592,7 @@ impl Cluster {
             compress_control: cfg.compress_control,
             heartbeat_error: Mutex::default(),
             heartbeat_grace: cfg.heartbeat_grace,
+            isolates_late,
             heartbeat_ok: Mutex::new(Instant::now()),
             snapshot_ok: Mutex::new(Instant::now()),
             refreshing: tokio::sync::Mutex::default(),

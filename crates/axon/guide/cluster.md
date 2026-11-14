@@ -924,6 +924,18 @@ async fn main() {
   and have that store refuse older epochs, and a write whose epoch it cannot check as well. A restart under the
   kind's policy keeps the epoch: where the store must tell its starts apart, add `SpawnContext::start`. Ids kept
   to recognise a request twice must be kept as long as any sender may still send it again.
+- The authority leases every kind, unless a kind is registered `.unleased()`. Its keys are then placed by the view
+  alone, as on a node without an authority. A start costs no round trip to the authority. A node cut from the
+  acceptors, which refuses leased keys `Isolated`, keeps starting the kind's keys. A partition may run a key on each
+  side until the views agree again, so use it for actors a brief duplicate does not harm, such as a cache or the
+  sessions above: `cluster.kind::<SessionApi>("session").unleased().register(build)`.
+  The node advertises the mode with the kind (`NodeRecord::kind_leased`). While any node advertises a kind leased,
+  only the nodes that do are its candidates, so every node agrees on a key's owner and on how to reach it: a caller
+  walks past an owner refused `Isolated` only for a leased kind, whatever its own authority. An eager kind cannot
+  be unleased. Neither can a kind whose node stops its keys more slowly than discovery drops the node:
+  `heartbeat_interval + 3/2 heartbeat_grace` must be under the discovery's `drops_after`, as it must be without an
+  authority. `register` refuses both with `ClusterError::Config`. An isolated node stops an unleased kind's keys at
+  once, as it stops every key without an authority.
 - A keyed actor that fails (a handler error, a panic, a start that fails) stops and is counted in
   `ClusterStats::keyed_failed`; the next `get_or_spawn` builds it again from the same args. Register the kind with
   `.policy(RestartPolicy)` on `cluster.kind::<P>(kind)` and it is rebuilt in place under that policy, with fresh

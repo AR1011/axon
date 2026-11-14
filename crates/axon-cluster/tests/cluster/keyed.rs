@@ -1010,6 +1010,25 @@ async fn hosted_lists_the_kinds_registered_and_the_keys_run_as_they_start_are_lo
     }
 }
 
+/// An eager key restarts on its next owner because the authority lists what a gone node held, which it does for
+/// leased kinds only.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unleased_eager_kind_is_refused_at_register() {
+    let failing = Default::default();
+    let authority =
+        Unsteady { leases: MemoryLeases::new().authority(), down: Default::default(), when_down: Down::Fails, failing };
+    let a = node_with("a", MemoryDiscovery::new(), move |cfg| cfg.ownership = Some(Arc::new(authority))).await;
+    let build = |_: &SpawnContext, _: Bytes| Ok(Counter { total: 0, tag: String::new() });
+    let anywhere = Placement::default();
+    let refused =
+        a.cluster.kind::<CounterApi>("standing").unleased().eager(seed(0), anywhere.clone()).register(build).await;
+    assert!(matches!(refused, Err(ClusterError::Config(_))), "{refused:?}");
+    assert!(!a.cluster.record().has_kind("standing"));
+    a.cluster.kind::<CounterApi>("standing").eager(seed(0), anywhere).register(build).await.unwrap();
+    assert_eq!(a.cluster.record().kind_leased("standing"), Some(true));
+    a.system.shutdown().await.unwrap();
+}
+
 fn kinds_of(kinds: &[&str]) -> Vec<HostedKind> {
     let kind =
         |kind: &&str| HostedKind { kind: (*kind).into(), eager: false, count: 0, started: [0; 2], ended: [0; 5] };

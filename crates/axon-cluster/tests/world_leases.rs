@@ -1,6 +1,7 @@
 //! Paxos leases in the World: a holder whose clock drifts, one starved of CPU, an acceptor whose wall clock steps back,
 //! owners paused past their leases, an owner that restarts inside its own lease, a grant that arrives after its start
 //! gave up, a holder suspended past its lease, and reads of a restarted acceptor's warm-up from the test's thread.
+//! Then near links, and kinds that are leased beside kinds that are not.
 //! Keyed accounts write to a ledger fenced by the lease epoch, and a client keeps depositing throughout; tickers write
 //! it on their own.
 mod accounts;
@@ -12,8 +13,11 @@ use accounts::{
     NODES, Node, accounts, check, keys, leased, moved, no_stale_write, ops, owned_by, placed_on, start_ticker, stream,
     tickers,
 };
-use axon::ActorSystem;
-use axon_cluster::{Cluster, ClusterConfig, MemoryDiscovery, Near, PaxosConfig, PaxosLeases};
+use axon::{Actor, ActorSystem, Context};
+use axon_cluster::{
+    ActorProtocol, CallError, Cluster, ClusterConfig, ClusterError, MemoryDiscovery, Near, PaxosConfig, PaxosLeases,
+    Placement, Rejection, Reply, SpawnContext, SpawnRefusal, WireProtocol,
+};
 use axon_net::{LinkTimings, SharedSecret};
 use axon_testkit::world::{Crash, Host, Wire, World, WorldConfig};
 use axon_testkit::{check_seeds, seeds};
@@ -338,6 +342,200 @@ fn near_peers_run_the_near_timings_and_far_peers_the_transports() {
         w.run_for(Duration::from_secs(7));
         assert!(!reachable(&w, "a", "d"), "seed {seed}: a far peer cut for 13 s");
         w.heal();
+    })
+    .unwrap();
+}
+
+/// Nothing to call: its keys are only started.
+struct Idle;
+
+impl WireProtocol for Idle {
+    type Message = ();
+    type Reply = ();
+    const ID: u64 = 0xA7;
+    const SCHEMA: u16 = 1;
+
+    fn encode((): ()) -> Result<Bytes, CallError> {
+        Ok(Bytes::new())
+    }
+
+    fn decode_reply(_: Bytes) -> Result<(), CallError> {
+        Ok(())
+    }
+}
+
+impl ActorProtocol for Idle {
+    type Mailbox = ();
+
+    fn encode_reply((): ()) -> Result<Bytes, CallError> {
+        Ok(Bytes::new())
+    }
+
+    fn decode(_: Bytes, _: Option<Reply<()>>) -> Result<(), Rejection> {
+        Ok(())
+    }
+}
+
+struct Still;
+
+impl Actor for Still {
+    type Message = ();
+    type Error = ();
+
+    fn on_message(&mut self, (): (), _: &mut Context<'_, Self>) -> Result<(), ()> {
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct Keyed {
+    cluster: Cluster,
+    _system: ActorSystem,
+}
+
+const KEYED_LEASE: Duration = Duration::from_secs(2);
+
+/// a, b and c, the acceptors, in region one; the rest in region two. Each hosts a leased kind and an unleased one,
+/// except x, which has no authority and hosts nothing: only a caller.
+async fn keyed(host: Host, discovery: MemoryDiscovery) -> Keyed {
+    let transport = host.transport(SharedSecret::new("at-least-16-bytes-long").unwrap());
+    let system = ActorSystem::builder().runtime(host.runtime()).build().unwrap();
+    let mut cfg = ClusterConfig::new(host.addr(), transport, discovery);
+    let (name, acceptors) = (host.name(), ["a", "b", "c"]);
+    let region = if acceptors.contains(&name) { "one" } else { "two" };
+    cfg.labels.insert("region".into(), region.into());
+    if name != "x" {
+        let mut paxos = PaxosConfig::new(acceptors);
+        // A 2 s lease, so a holder cut from the acceptors can grant nothing within a few seconds.
+        paxos.lease = KEYED_LEASE;
+        paxos.store = Some(Arc::new(host.disk().dir("leases")));
+        cfg.ownership = Some(Arc::new(PaxosLeases::new(paxos).unwrap()));
+    }
+    let cluster = Cluster::start(&system, cfg).await.unwrap();
+    if name != "x" {
+        cluster.kind::<Idle>("leased").register(|_: &SpawnContext, _: Bytes| Ok(Still)).await.unwrap();
+        cluster.kind::<Idle>("unleased").unleased().register(|_: &SpawnContext, _: Bytes| Ok(Still)).await.unwrap();
+    }
+    Keyed { cluster, _system: system }
+}
+
+fn keyed_world(seed: u64, names: &[&'static str]) -> World<Keyed> {
+    let (mut w, discovery) = (World::new(WorldConfig { seed, ..WorldConfig::default() }), MemoryDiscovery::new());
+    for name in names {
+        let discovery = discovery.clone();
+        w.add(name, move |host| keyed(host, discovery.clone()));
+    }
+    let hosts = names.iter().filter(|n| **n != "x").count();
+    w.run_until("every node lists every host", Duration::from_secs(30), |w| {
+        let listed = |n: &Keyed| n.cluster.view().members.iter().filter(|m| m.record.has_kind("leased")).count();
+        w.nodes().count() == names.len() && w.nodes().all(|(_, n)| listed(n) == hosts)
+    });
+    // Past the acceptors' warm-up.
+    w.run_for(KEYED_LEASE * 2);
+    w
+}
+
+fn region_two() -> Placement {
+    Placement::default().require("region", "two")
+}
+
+/// The nodes `from` would ask for `key`, in their order.
+fn order(w: &mut World<Keyed>, from: &str, kind: &'static str, key: &str) -> Vec<String> {
+    let key = key.to_owned();
+    let order = w.block_on(from, move |n| async move {
+        let view = n.cluster.view();
+        let mut left = region_two().candidates(&view, kind);
+        let mut order = Vec::new();
+        while let Some(first) = axon_cluster::rendezvous(kind, &key, &left) {
+            let id = first.record.id.clone();
+            left.retain(|m| m.record.id != id);
+            order.push(id);
+        }
+        order
+    });
+    order.unwrap()
+}
+
+/// Where `from` starts `key`, and its epoch.
+fn start(
+    w: &mut World<Keyed>,
+    from: &str,
+    kind: &'static str,
+    key: &str,
+) -> Result<(String, Option<u64>), ClusterError> {
+    let key = key.to_owned();
+    let placed = w.block_on(from, move |n| async move {
+        let placed = n.cluster.get_or_spawn::<Idle>(kind, &key, Bytes::new(), &region_two()).await;
+        placed.map(|r| (r.node().to_owned(), r.epoch()))
+    });
+    placed.unwrap()
+}
+
+/// d, a leased key's owner and holder, is cut from every acceptor: its renewals fail, its fence stops the key, and it
+/// refuses the key `Isolated`. A caller with no authority of its own walks past d as one with an authority does, since
+/// d advertises the kind leased: the next owner, e, takes the lease once it has run out.
+#[test]
+fn a_caller_without_an_authority_walks_past_a_leased_owner_cut_from_the_acceptors() {
+    check_seeds(seeds(0..16), |seed| {
+        let mut w = keyed_world(seed, &["a", "b", "c", "d", "e", "x"]);
+        let key = (0..).map(|k| format!("k{k}")).find(|key| order(&mut w, "x", "leased", key) == ["d", "e"]).unwrap();
+        let first = start(&mut w, "x", "leased", &key);
+        assert!(first.as_ref().is_ok_and(|(on, _)| on == "d"), "seed {seed}: {key}: {first:?}");
+        w.partition(&["d"], &["a", "b", "c"]);
+        // Two leases: d's renewals have failed, and the acceptors let its lease go.
+        w.run_for(KEYED_LEASE * 2);
+        let placed = start(&mut w, "x", "leased", &key);
+        assert!(
+            placed.as_ref().is_ok_and(|(on, epoch)| on == "e" && epoch.is_some()),
+            "seed {seed}: {key}: {placed:?}\n{}",
+            w.trace_tail(40)
+        );
+    })
+    .unwrap();
+}
+
+/// Region two, d and e, is cut from region one, where every acceptor is. Its unleased keys start there all the while,
+/// placed by the view; its leased keys are refused `Isolated` until the cut heals.
+#[test]
+fn a_region_cut_from_the_acceptors_keeps_starting_its_unleased_keys_while_leased_ones_wait() {
+    check_seeds(seeds(0..16), |seed| {
+        let mut w = keyed_world(seed, &["a", "b", "c", "d", "e"]);
+        // Leased keys on d and on e, whose renewals then fail.
+        let (mut on_d, mut on_e) = (false, false);
+        for k in 0.. {
+            let held = start(&mut w, "d", "leased", &format!("held-{k}"));
+            let on = held.unwrap_or_else(|e| panic!("seed {seed}: held-{k}: {e:?}")).0;
+            (on_d, on_e) = (on_d || on == "d", on_e || on == "e");
+            if on_d && on_e {
+                break;
+            }
+        }
+        w.partition(&["d", "e"], &["a", "b", "c"]);
+        // Two leases: neither d nor e can grant.
+        w.run_for(KEYED_LEASE * 2);
+        for i in 0..8 {
+            let key = format!("k{i}");
+            let unleased = start(&mut w, "d", "unleased", &key);
+            assert!(
+                unleased.as_ref().is_ok_and(|(on, epoch)| (on == "d" || on == "e") && epoch.is_none()),
+                "seed {seed}: unleased {key}: {unleased:?}"
+            );
+            let leased = start(&mut w, "d", "leased", &key);
+            assert!(
+                matches!(leased, Err(ClusterError::Spawn(SpawnRefusal::Isolated, _))),
+                "seed {seed}: leased {key}: {leased:?}"
+            );
+        }
+        w.heal();
+        let mut leased = start(&mut w, "d", "leased", "k0");
+        for _ in 0..20 {
+            if leased.is_ok() {
+                break;
+            }
+            w.run_for(Duration::from_millis(500));
+            leased = start(&mut w, "d", "leased", "k0");
+        }
+        assert!(leased.as_ref().is_ok_and(|(_, epoch)| epoch.is_some()), "seed {seed}: once healed: {leased:?}");
     })
     .unwrap();
 }

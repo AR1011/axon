@@ -391,6 +391,40 @@ async fn keyed_actors_move_and_stop_with_their_paxos_leases() {
     assert_eq!(host.cluster.stats().spawned, 0);
 }
 
+/// A kind registered `unleased` is placed by the view alone, as on a node without an authority: a node that reaches no
+/// majority of the acceptors still starts its keys, and refuses those of a leased kind `Isolated`.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unleased_kind_starts_with_the_acceptors_down_and_a_leased_kind_is_refused_isolated() {
+    let discovery = MemoryDiscovery::new();
+    let mut acceptors = Vec::new();
+    for id in ["p-0", "p-1", "p-2"] {
+        acceptors.push(paxos_host(id, &discovery).await);
+    }
+    let host = paxos_host("a", &discovery).await;
+    counter_kind(&host).await;
+    let build = |_: &SpawnContext, _: Bytes| Ok(Counter { total: 0, tag: String::new() });
+    host.cluster.kind::<CounterApi>("cache").unleased().register(build).await.unwrap();
+    let record = host.cluster.record();
+    assert_eq!((record.kind_leased("counter"), record.kind_leased("cache")), (Some(true), Some(false)));
+    let anywhere = Placement::default();
+    let spawn = |kind, key| host.cluster.get_or_spawn::<CounterApi>(kind, key, seed(0), &anywhere);
+    // Granted once the acceptors have warmed up.
+    eventually("a leased key starts", || async { spawn("counter", "k").await.is_ok() }).await;
+
+    for acceptor in acceptors {
+        acceptor.system.shutdown().await.unwrap();
+    }
+    eventually("a leased key is refused Isolated", || async {
+        matches!(spawn("counter", "other").await, Err(ClusterError::Spawn(SpawnRefusal::Isolated, _)))
+    })
+    .await;
+    let cached = spawn("cache", "k").await.unwrap();
+    assert_eq!((cached.node(), cached.epoch()), ("a", None));
+    cached.send(Op::Add(2)).await.unwrap();
+    assert_eq!(number(spawn("cache", "k").await.unwrap().request(Op::Get).await.unwrap()), 2);
+    host.system.shutdown().await.unwrap();
+}
+
 /// The lease timings follow the lease: with a 1 s lease and nothing else set, the renewals keep one actor
 /// through several leases. `keyed_actors_move_and_stop_with_their_paxos_leases` shows the grace ending inside it.
 #[tokio::test(flavor = "multi_thread")]
