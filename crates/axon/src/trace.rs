@@ -200,10 +200,10 @@ impl TraceContext {
         })
     }
 
-    /// The W3C text form, `00-<trace>-<span>-<flags>`. A root's span is 0, which W3C does not allow: inside a
+    /// The W3C text form, `00-<trace>-<span>-<flags>`; `None` at a root, whose span is 0, which W3C forbids. Inside a
     /// handler, [`current`](Self::current) names the span that runs.
-    pub fn traceparent(&self) -> String {
-        format!("00-{}-{:016x}-{:02x}", self.trace, self.span, self.flags)
+    pub fn traceparent(&self) -> Option<String> {
+        (self.span != 0).then(|| format!("00-{}-{:016x}-{:02x}", self.trace, self.span, self.flags))
     }
 
     /// `None` unless `text` is a valid `traceparent`: lowercase hex, neither id 0, version `00` exactly 55

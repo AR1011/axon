@@ -62,7 +62,7 @@ axon
   EventLog::new(clock) .record(kind, subject, detail) .since(after, limit) -> Vec<Event>   the newest EVENTS (256) of this node's timeline, never waits ; a supervised family's restarts are one event at once, then at most one a minute with its count
   system.clock() ; Fence::new(system.clock(), lapses_in) .hold_for(d) .is_open()   (hold_for(Duration::ZERO) lapses it)
   TraceContext::root().scope(future).await | .enter(|| ..) ; TraceContext::current() -> Option<TraceContext>   the trace the running handler or scope is in
-  TraceContext { trace: TraceId, span, flags } ; TraceContext::new(trace, span, flags) ; .traceparent() ; TraceContext::from_traceparent(text) -> Option   W3C's: a 128-bit TraceId (TraceId::new(u128) -> Option, .get(), 32 hex digits), 25 bytes on the wire ; a root's span is 0, which W3C refuses
+  TraceContext { trace: TraceId, span, flags } ; TraceContext::new(trace, span, flags) ; .traceparent() -> Option<String> (None at a root, whose span is 0, which W3C forbids) ; TraceContext::from_traceparent(text) -> Option   W3C's: a 128-bit TraceId (TraceId::new(u128) -> Option, .get(), 32 hex digits), 25 bytes on the wire
   tracer.app(name) -> Option<AppSpan>   None outside a trace ; step.attr(key, u64 | i64 | &'static str | String) .error(kind) .enter(|| ..) (what it sends is the step's child) ; records itself when dropped ; Span.error: Option<&'static str>, Span.attrs
   tracer.since(after, limit) | .trace(id)   read Tracer::PAGE (256) spans a hold of the ring's lock ; tracer.recorded() ; tracer.evicted()   spans the ring let go of
   feature tracing: every recorded span is a `tracing` event (target axon::trace, its ids in hex) ; TraceContext::root() logs its trace in the current `tracing` span

@@ -285,11 +285,14 @@ fn traceparent_text_round_trips_and_a_malformed_one_is_refused() {
     let parsed = TraceContext::from_traceparent(text).unwrap();
     assert_eq!(parsed.trace.get(), 0x4bf9_2f35_77b3_4da6_a3ce_929d_0e0e_4736);
     assert_eq!((parsed.span, parsed.flags), (0x00f0_67aa_0ba9_02b7, 1));
-    assert_eq!(parsed.traceparent(), text);
+    assert_eq!(parsed.traceparent().as_deref(), Some(text));
     assert_eq!(parsed.trace.to_string(), "4bf92f3577b34da6a3ce929d0e0e4736");
     let child = parsed.child();
     assert_eq!((child.trace, child.flags), (parsed.trace, parsed.flags));
-    assert_eq!(TraceContext::from_traceparent(&child.traceparent()), Some(child));
+    assert_eq!(child.traceparent().as_deref().and_then(TraceContext::from_traceparent), Some(child));
+    // A root's span is 0, which W3C forbids: it has no header to write.
+    assert_eq!(TraceContext::root().traceparent(), None);
+    assert_eq!(TraceContext::new(parsed.trace, 0, 1).traceparent(), None);
 
     // A later version may add fields after a dash; the four it shares with 00 are read as 00's.
     let later = "cc-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-what-comes-next";

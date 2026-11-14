@@ -23,7 +23,8 @@ decoded at `:312-319`), with `ITEM_FIXED = 45` exact for a traced batch (`:219`)
 - `TraceContext { trace: TraceId, span: u64, flags: u8 }`, `WIRE_LEN = 25`: trace id 16 bytes, span id 8, flags 1,
   big-endian, in `traceparent` order. `root()` draws 128 bits and sets flags `0x01` (sampled); `child()` keeps the
   trace and the flags; `TraceContext::new(trace, span, flags)` takes one from outside, and `traceparent()` /
-  `from_traceparent(&str)` convert the W3C text form.
+  `from_traceparent(&str)` convert the W3C text form. `traceparent()` is `None` at a root: its span is 0, which W3C
+  forbids, and `from_traceparent` refuses.
 - `TraceId` is `NonZeroU128` by default. The alternative, `[u64; 2]` with its own niche, keeps an
   `Option<TraceContext>` at 8-byte alignment: with `NonZeroU128` it is 16-byte aligned, so the context in each mailbox
   entry goes from 16 to 32 bytes. `perf hosted` and `perf traced` decide

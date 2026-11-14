@@ -34,9 +34,9 @@ The context is a W3C `traceparent`'s: a 128-bit `TraceId`, a 64-bit span id and 
 that order, big-endian. `root()` draws a random trace id and sets the sampled flag (`TraceContext::SAMPLED`); a child
 keeps its parent's trace and flags. A trace id reads as 32 hex digits, a span id as 16. To join a trace started
 outside axon, `TraceContext::from_traceparent(header)` reads the header an HTTP request came with, refusing one that is
-malformed or has a zero id, and `traceparent()` writes it back for the next service. Write it from inside a handler,
-where `TraceContext::current()` names the span that runs: a root's span is 0, which W3C refuses, so a header written
-from `root()` itself starts a new trace at the next service.
+malformed or has a zero id, and `traceparent()` writes it back for the next service. It is `None` at a root, whose
+span is 0, which W3C forbids: write it from inside a handler, where `TraceContext::current()` names the span that runs,
+and send no header when there is none.
 
 ```rust,ignore
 let trace = TraceContext::from_traceparent(header).unwrap_or_else(TraceContext::root);
