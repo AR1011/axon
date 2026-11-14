@@ -165,8 +165,9 @@ async fn main() {
   run up to one way after its caller gave up. Its
   `Timeout` still means it may have been handled: one run near its deadline can answer too late. A `KeyedRef` or
   `NamedRef` has it too, with `d` covering the lookup.
-- A request must fit one frame (`max_frame`, 1 MiB by default), a `request_within` body 8 bytes less, for its
-  deadline, and a `request_parts` or `upload_parts` message 4 bytes less, for its window. A larger request sends its
+- A request must fit one frame (`max_frame`, 1 MiB by default) less 8 bytes for its contract's id
+  (`cluster.max_frame(lane)`), a `request_within` body 8 bytes less again, for its deadline, and a `request_parts`
+  or `upload_parts` message 4 bytes less, for its window. A larger request sends its
   body in parts: [below](#a-request-larger-than-a-frame). A reply must fit one frame too, unless it comes in parts:
   [below](#a-reply-larger-than-a-frame). `Reply::send` returns the
   `encode_reply` error, or `NotSent(Oversized)` for a reply over `Reply::max_payload()`; the caller then gets `NoReply`.
@@ -205,14 +206,16 @@ async fn main() {
   when the cluster shuts down, for an actor to `cx.attach`, as a consumer of a stream per producer does
   ([streams § Many origins](streams.md#many-origins)). A node that turns unreachable or drains leaves the set; one
   that restarts before anyone misses it stays, and its old references fail with `StaleNode`.
-- `SCHEMA` is checked on every call. To change it, serve the old and the new side by side: [§ Rolling upgrades](#rolling-upgrades).
+- `ID` and `SCHEMA` are checked on every call: the call carries both, and the serving node refuses another contract's
+  `Rejected(ProtocolMismatch)` and another schema's `Rejected(SchemaMismatch)`. To change the schema, serve the old and
+  the new side by side: [§ Rolling upgrades](#rolling-upgrades).
 
 | `Retry` | Means | For example | Do |
 |---|---|---|---|
 | `Later` | not delivered; the same reference may work after a pause | `Busy` (this node has `max_pending` calls out, or `max_peers` links for a new peer), `NotSent(Full \| Deadline \| Closed)`, `Rejected(Full)`, `Spawn(Held \| Capacity \| Ownership \| Isolated)`, `Discovery(Unavailable \| Stale)` | wait, then call again; `request_until` does that |
-| `Resolve` | not delivered; the reference or this node's view is out of date | `UnknownActor`, `Stopped`, `StaleNode` (the view names another boot of the node), `NoRoute` (the node left the view), each also when its session closed under the call, `Unreachable`, `NotFound`, `NoCandidate`, `SchemaMismatch` (a node does not serve the caller's schema), `Spawn(NotOwner \| Leaving \| UnknownKind)` | resolve again, then call; a `KeyedRef` or `NamedRef` resolves on its next call, and `request_until` also makes that call |
+| `Resolve` | not delivered; the reference or this node's view is out of date | `UnknownActor`, `Stopped`, `Rejected(ProtocolMismatch)` (the call reached another contract's endpoint), `StaleNode` (the view names another boot of the node), `NoRoute` (the node left the view), each also when its session closed under the call, `Unreachable`, `NotFound`, `NoCandidate`, `SchemaMismatch` (a node does not serve the caller's schema), `Spawn(NotOwner \| Leaving \| UnknownKind)` | resolve again, then call; a `KeyedRef` or `NamedRef` resolves on its next call, and `request_until` also makes that call |
 | `IfIdempotent` | it may have been handled | `Timeout`, `OutcomeUnknown`, `NoReply` | call again only if repeating is safe |
-| `Never` | retrying fails the same way | `Codec`, `Closed`, `Rejected(SchemaMismatch)`, `Forbidden`, `Spawn(Failed \| Forbidden)` | stop and report it |
+| `Never` | retrying fails the same way | `Codec`, `Closed`, `Rejected(SchemaMismatch)`, `Forbidden`, `ProtocolMismatch` (the name is served by another contract), `Spawn(Failed \| Forbidden)` | stop and report it |
 
 `Never` is about this call from this node. Another target may still work, and `Closed` says this node's own cluster
 is shut down or shutting down: work that must still happen, such as a keyed actor's next step, is the next owner's
@@ -583,81 +586,79 @@ async fn main() {
 ### A contract with several calls
 
 One contract can carry every call an actor answers: an enum of calls, an enum of answers, and a typed client with a
-method per call, so callers never match on the answer. You pick the encoding; here it is `serde_json`.
+method per call, so callers never match on the answer. With the `serde` feature, a `Contract` names the two types
+and a `Codec`, and is then both a `WireProtocol` and an `ActorProtocol` whose mailbox is
+`(Message, Option<Reply<Reply>>)`. axon names no codec; here it is `serde_json`. A value the codec cannot encode is the caller's
+`CallError::Codec`, a body the serving node's codec cannot read is refused `Rejected(InvalidMessage)`, and a reply
+the caller's cannot read is `Codec` again. `NAME` labels the protocol in telemetry and the console; without one the
+label is its `ID` in hex. Where both traits are in scope, name a contract's `ID` as `<Tally as Contract>::ID`.
 
 ```rust
 # use axon::{Actor, ActorSystem, Context};
 # use axon_cluster::{Cluster, ClusterConfig, MemoryDiscovery};
-use axon_cluster::{ActorProtocol, CallError, RemoteRef, Rejection, Reply, WireProtocol};
+use axon_cluster::{CallError, Codec, Contract, RemoteRef, Reply};
 # use axon_net::SharedSecret;
 use bytes::Bytes;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-#[derive(Serialize, Deserialize)]
-enum Call { Deposit(u64), Balance }
+struct Json;
 
-#[derive(Serialize, Deserialize)]
-enum Answer { Done, Balance(u64) }
-
-struct AccountApi;
-
-fn json<T: Serialize>(value: &T) -> Result<Bytes, CallError> {
-    serde_json::to_vec(value).map(Bytes::from).map_err(|e| CallError::Codec(e.to_string()))
+impl Codec for Json {
+    fn encode<T: Serialize>(value: &T) -> Result<Bytes, String> {
+        serde_json::to_vec(value).map(Bytes::from).map_err(|e| e.to_string())
+    }
+    fn decode<T: DeserializeOwned>(body: &[u8]) -> Result<T, String> {
+        serde_json::from_slice(body).map_err(|e| e.to_string())
+    }
 }
 
-impl WireProtocol for AccountApi {
+#[derive(Serialize, Deserialize)]
+enum Call { Add(u64), Total }
+
+#[derive(Serialize, Deserialize)]
+enum Answer { Done, Total(u64) }
+
+struct TallyApi;
+
+impl Contract for TallyApi {
     type Message = Call;
     type Reply = Answer;
-    const ID: u64 = 0xAC;
+    type Codec = Json;
+    const ID: u64 = 0x7A;
     const SCHEMA: u16 = 1;
-    fn encode(call: Call) -> Result<Bytes, CallError> {
-        json(&call)
-    }
-    fn decode_reply(body: Bytes) -> Result<Answer, CallError> {
-        serde_json::from_slice(&body).map_err(|e| CallError::Codec(e.to_string()))
-    }
+    const NAME: &'static str = "tally";
 }
 
-impl ActorProtocol for AccountApi {
-    type Mailbox = (Call, Option<Reply<Answer>>);
-    fn encode_reply(answer: Answer) -> Result<Bytes, CallError> {
-        json(&answer)
-    }
-    fn decode(body: Bytes, reply: Option<Reply<Answer>>) -> Result<Self::Mailbox, Rejection> {
-        serde_json::from_slice(&body).map(|call| (call, reply)).map_err(|_| Rejection::InvalidMessage)
-    }
-}
+struct Tally(u64);
 
-struct Account(u64);
-
-impl Actor for Account {
+impl Actor for Tally {
     type Message = (Call, Option<Reply<Answer>>);
     type Error = ();
     fn on_message(&mut self, (call, reply): Self::Message, _cx: &mut Context<'_, Self>) -> Result<(), ()> {
         let answer = match call {
-            Call::Deposit(n) => {
+            Call::Add(n) => {
                 self.0 += n;
                 Answer::Done
             }
-            Call::Balance => Answer::Balance(self.0),
+            Call::Total => Answer::Total(self.0),
         };
         drop(reply.map(|r| r.send(answer)));
         Ok(())
     }
 }
 
-struct AccountClient(RemoteRef<AccountApi>);
+struct TallyClient(RemoteRef<TallyApi>);
 
-impl AccountClient {
-    async fn deposit(&self, n: u64) -> Result<(), CallError> {
-        match self.0.request(Call::Deposit(n)).await? {
+impl TallyClient {
+    async fn add(&self, n: u64) -> Result<(), CallError> {
+        match self.0.request(Call::Add(n)).await? {
             Answer::Done => Ok(()),
             _ => Err(CallError::Codec("unexpected answer".into())),
         }
     }
-    async fn balance(&self) -> Result<u64, CallError> {
-        match self.0.request(Call::Balance).await? {
-            Answer::Balance(n) => Ok(n),
+    async fn total(&self) -> Result<u64, CallError> {
+        match self.0.request(Call::Total).await? {
+            Answer::Total(n) => Ok(n),
             _ => Err(CallError::Codec("unexpected answer".into())),
         }
     }
@@ -678,12 +679,13 @@ async fn main() {
 #     let (system_a, a) = node("a", &discovery).await;
 #     let (_system_b, b) = node("b", &discovery).await;
 #     b.wait_view(|view| view.members.len() == 2).await.unwrap();
-    // Two nodes as in the first program; the account lives on `a`, the client on `b`.
-    a.publish::<AccountApi>(&system_a.spawn(Account(0)).start().unwrap(), "account").unwrap();
+    // Two nodes as in the first program; the tally lives on `a`, the client on `b`.
+    a.publish::<TallyApi>(&system_a.spawn(Tally(0)).start().unwrap(), "tally").unwrap();
 
-    let account = AccountClient(b.resolve::<AccountApi>("account").await.unwrap());
-    account.deposit(30).await.unwrap();
-    assert_eq!(account.balance().await.unwrap(), 30);
+    let tally = TallyClient(b.resolve::<TallyApi>("tally").await.unwrap());
+    tally.add(30).await.unwrap();
+    assert_eq!(tally.total().await.unwrap(), 30);
+    assert_eq!(axon_cluster::protocol_label(<TallyApi as Contract>::ID, <TallyApi as Contract>::NAME), "tally");
 }
 ```
 
@@ -1724,7 +1726,10 @@ A cluster can run two builds side by side while you roll it one node at a time: 
   not meet are refused: the error, `Negotiation::Version { ours, theirs }`, names both, and a listener counts it under
   the handshake failure reason `version`. From 1.0, a release speaks its own version and the one before it, so a
   cluster rolls from one release to the next; skipping a release means a stop, not a roll. Before 1.0 there is no
-  such promise: this release speaks only version 7, and a node of an earlier build is refused.
+  such promise: this release speaks only version 8, and a node of an earlier build is refused. Version 8 is a clean
+  break, so a cluster on version 7 does not roll to it: stop every node and seed server, start them all on the new
+  build in any order, and check that `listener.handshake_failures{reason="version"}` stays 0 on every node. A node
+  of each version left running splits the cluster in two, each half seeing only its own.
 - **Your protocols.** A node serves several `SCHEMA`s of one protocol `ID` side by side. `publish` the same name once
   per schema, the new build publishing both; a kind takes the old schema with `.also::<Old>()`, and each key's one
   actor answers either. A call goes to a node that serves its caller's schema: `resolve_all` returns those, and

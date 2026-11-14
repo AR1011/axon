@@ -10,6 +10,8 @@ pub enum Rejection {
     Forbidden = 5,
     InvalidMessage = 6,
     Stopped = 7,
+    /// The call names another contract's `ID` than the endpoint serves: its target was made wrong.
+    ProtocolMismatch = 8,
 }
 
 impl Rejection {
@@ -20,6 +22,7 @@ impl Rejection {
             4 => Self::Full,
             5 => Self::Forbidden,
             7 => Self::Stopped,
+            8 => Self::ProtocolMismatch,
             _ => Self::InvalidMessage,
         }
     }
@@ -163,7 +166,9 @@ impl CallError {
             Self::NoRoute
             | Self::StaleNode
             | Self::Unreachable(_)
-            | Self::Rejected(Rejection::UnknownActor | Rejection::Stopped) => Retry::Resolve,
+            | Self::Rejected(Rejection::UnknownActor | Rejection::Stopped | Rejection::ProtocolMismatch) => {
+                Retry::Resolve
+            }
             Self::Timeout | Self::OutcomeUnknown | Self::NoReply => Retry::IfIdempotent,
             Self::Closed
             | Self::Codec(_)

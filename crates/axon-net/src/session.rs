@@ -291,7 +291,7 @@ impl Sender {
         if !frame.fits(self.shared.peer.max_frame) {
             return Err(SubmitReason::Oversized);
         }
-        Ok((HEADER_LEN + frame.payload.len()) as u32)
+        Ok((HEADER_LEN + frame.wire_len()) as u32)
     }
 
     pub fn try_submit(&self, frame: Frame) -> Result<(), SubmitError> {
@@ -345,7 +345,7 @@ impl Sender {
     /// the frame has to go through the outbox.
     fn write_now(&self, frame: &Frame, credit: OwnedSemaphorePermit) -> Result<(), OwnedSemaphorePermit> {
         let s = &self.shared;
-        if frame.payload.len() > WRITE_NOW_MAX {
+        if frame.wire_len() > WRITE_NOW_MAX {
             return Err(credit);
         }
         // A socket that refused the last write is left to the writer task. Credit taken here and not written is

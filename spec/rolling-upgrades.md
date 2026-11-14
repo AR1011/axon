@@ -12,12 +12,12 @@ how the code keeps that promise. The user's view is [guide/cluster.md § Rolling
   The promise covers the transport and every internal protocol: membership, the directory, remote calls, remote
   spawn, watches, leases, streams, quotas and telemetry.
 - **Before 1.0, no promise.** Every release may break the wire, and a pre-1.0 release speaks only its own version.
-  This release speaks version 7 only (`axon_net::VERSIONS`, `handshake.rs:23`); the next speaks 8 only (§6).
-  Version 7 named the lane in the hello ([lanes.md §4.1](lanes.md#41-the-lane-and-the-hello-v7)); version 6 added
+  This release speaks version 8 only (`axon_net::VERSIONS`, `handshake.rs:23`), a clean break from 7 (§6).
+  Version 8 put the contract's id in every call (§6.1); version 7 named the lane in the hello ([lanes.md §4.1](lanes.md#41-the-lane-and-the-hello-v7)); version 6 added
   requests in parts (the `BODY` bit on `REQUEST`, `PART`, `END` and `CREDIT`); version 5 says in a spawn's answer whether that request started the actor, so that one node records
   an eager restart; version 4 added replies in parts (`PART`, `CREDIT`, the `PARTS` bit); version 3 put the nodes a
   keyed start passed in the spawn request and added `axon.owns`
-  ([paxos-leases.md §5.3](paxos-leases.md#53-placement-under-partial-cuts)). A node of version 6 is refused at the
+  ([paxos-leases.md §5.3](paxos-leases.md#53-placement-under-partial-cuts)). A node of version 7 is refused at the
   handshake. A node on version 1, whose hello named a single version where the lowest is now, is
   refused as `Negotiation::Version` with `theirs` = `(1, 1)` and counted under `version`, so a range starts at 2.
 - **User protocols are the user's.** A protocol's `ID` stays fixed, and a breaking change takes a larger `SCHEMA`.
@@ -136,7 +136,7 @@ The test asserts the following for every seed in `SEEDS=0..512`:
 
 ## 6. Wire v8
 
-Status: designed, not built. Wire v8 is one release and a clean break: `VERSIONS = 8..=8`. A v8 node and a v7 node
+Status: §6.1 and §6.2 built; the trace bytes and `axon.kinds` with their own specs. Wire v8 is one release and a clean break: `VERSIONS = 8..=8`. A v8 node and a v7 node
 refuse each other at the handshake (`Negotiation::Version`), and no code picks a format by `Peer::version`. The
 pre-1.0 policy (§1) allows it, and a window would be code deleted in the release after.
 
@@ -162,12 +162,17 @@ route caching, is admitted by another contract's endpoint at the same schema, an
 **Design.**
 
 - A call's body starts with its contract's id, `u64`, before the trace context. The server compares `(ID, SCHEMA)`
-  with the endpoint's and refuses a mismatch `Rejection::ProtocolMismatch`, which the caller sees as
-  `ClusterError::ProtocolMismatch` (`retry()` `Resolve`). Eight bytes a call; `scripts/bench.sh` `route` and `remote`
-  gate it.
+  with the endpoint's and refuses another id `Rejection::ProtocolMismatch` (END code 8, counted under
+  `protocol_mismatch`), which the caller sees as `CallError::Rejected(ProtocolMismatch)`, `retry()` `Resolve`: the
+  target was made wrong, and a fresh lookup makes it again. `ClusterError::ProtocolMismatch`, a lookup that finds the
+  name served by another protocol, stays `Never`. The system endpoints and the directory carry `axon.control`'s id.
+  Eight bytes a call: `Cluster::max_frame(lane)`, the largest call body, is the frame less 8. The id, trace, deadline
+  and window go in the frame's `Prefix` (axon-net, at most `PREFIX_MAX`, 48 bytes), which the encoder writes in front
+  of the payload, so a call's body is not copied to put them there. `scripts/bench.sh` `route` and `remote` gate it.
 - `WireProtocol::NAME: &'static str`, default `""`. A protocol's label, in telemetry and the console, is its `NAME`, or
-  else its `ID` as 16 hex digits. axon's own: `axon.control` (the system endpoints), `axon.stream`, `axon.lease`,
-  `axon.quota`, `axon.telemetry`.
+  else its `ID` as 16 hex digits: `axon_cluster::protocol_label(id, name)`. axon's own protocols are raw endpoints
+  with no `WireProtocol`, so `protocol_label` names them by id: `axon.control` (the system endpoints and the control
+  services, telemetry among them, which share its id), `axon.stream`, `axon.lease`, `axon.quota`.
 - In axon-cluster, behind its `serde` feature:
 
   ```rust,ignore
@@ -199,7 +204,8 @@ route caching, is admitted by another contract's endpoint at the same schema, an
   (fails today: admitted and decoded)
 - `crates/axon-cluster/tests/cluster/remote.rs::a_contract_from_serde_types_round_trips_tell_send_and_request`
 - `crates/axon-cluster/tests/cluster/remote.rs::a_body_its_codec_cannot_read_is_rejected_invalid_message_and_a_bad_reply_is_a_codec_error`
-- `crates/axon-obs/tests/telemetry.rs::a_protocol_is_labelled_by_its_name_or_else_its_hex_id`
+- `crates/axon-cluster/src/wire.rs::a_protocol_is_labelled_by_its_name_or_else_its_hex_id`; the series that carry the
+  label are [lanes.md §8.1](lanes.md#81-link-meters-wire-v8)'s.
 - A guide program in `guide/cluster.md` (an axon-obs doctest) in place of the `json()` glue.
 
 ### 6.2 Upgrading a cluster to v8

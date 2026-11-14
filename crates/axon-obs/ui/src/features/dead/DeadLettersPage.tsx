@@ -40,6 +40,7 @@ const REASONS: Record<string, [label: string, detail: string]> = {
   forbidden: ["forbidden", "The authorizer refused a tell from another node."],
   invalid_message: ["invalid message", "This node could not decode a tell from another node."],
   stopped: ["recipient stopped", "A tell from another node reached an actor that was already stopped."],
+  protocol_mismatch: ["protocol mismatch", "A tell from another node named a different protocol than the endpoint serves."],
 };
 
 const reasonOf = (l: DeadLetterRecord) => REASONS[l.reason] ?? [l.reason.replaceAll("_", " "), ""];

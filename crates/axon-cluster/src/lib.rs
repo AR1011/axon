@@ -49,7 +49,9 @@ pub use seed::{
 pub use spawn::{
     HELD_RETRY, Hosted, HostedKey, HostedKind, KEYED_ENDS, KEYED_STARTS, KeyWatch, KindBuilder, Owner, SpawnContext,
 };
-pub use wire::{ActorProtocol, Unaddressed, WireProtocol};
+pub use wire::{ActorProtocol, Unaddressed, WireProtocol, protocol_label};
+#[cfg(feature = "serde")]
+pub use wire::{Codec, Contract};
 
 /// What the simulations share.
 #[cfg(test)]

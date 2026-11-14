@@ -20,7 +20,7 @@ use crate::{Config, Error, Identity, Lane, Negotiation, PeerContext};
 
 const MAGIC: &[u8; 4] = b"AXON";
 /// The wire versions this build speaks. Its sessions run the highest one both ends speak.
-pub const VERSIONS: RangeInclusive<u16> = 7..=7;
+pub const VERSIONS: RangeInclusive<u16> = 8..=8;
 const HEAD: usize = 10;
 const FIXED: usize = 32 + 16 + 4 + 1;
 /// Room for what a later version appends.
@@ -207,10 +207,10 @@ mod tests {
     }
 
     #[test]
-    fn the_v7_hello_is_these_bytes() {
+    fn the_v8_hello_is_these_bytes() {
         let mut hello = encode(&config("a"), Lane::Control);
         hello[HEAD..HEAD + 48].fill(0);
-        let mut want = vec![0x41, 0x58, 0x4F, 0x4E, 0x00, 0x07, 0x00, 0x07, 0x00, 0x42];
+        let mut want = vec![0x41, 0x58, 0x4F, 0x4E, 0x00, 0x08, 0x00, 0x08, 0x00, 0x42];
         want.extend([0; 48]);
         want.extend([0x00, 0x10, 0x00, 0x00, 0x07, 0x00, 0x01, 0x61, 0x00, 0x07]);
         want.extend(b"default");

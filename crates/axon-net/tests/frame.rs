@@ -1,5 +1,5 @@
 use axon_net::frame::{Decoder, Encoder, HEADER_LEN, pack};
-use axon_net::{Codecs, Compression, Frame, FrameError};
+use axon_net::{Codecs, Compression, Frame, FrameError, Prefix};
 use bytes::{Bytes, BytesMut};
 
 fn frame(id: u64, payload: Vec<u8>) -> Frame {
@@ -96,6 +96,28 @@ fn a_packed_frame_is_written_as_is_and_decodes_like_any_other() {
     assert_eq!(encoder(Compression::None).encode(&big, &mut out), Err(FrameError::Oversized));
     let short = Frame { payload: Bytes::from_static(b"ab"), ..packed };
     assert_eq!(encoder(Compression::None).encode(&short, &mut out), Err(FrameError::Oversized));
+    assert!(out.is_empty());
+}
+
+/// A prefix is sent as the payload's first bytes, compressed with it, and counts against the frame limit; a packed
+/// payload takes none.
+#[test]
+fn a_prefix_arrives_as_the_payloads_first_bytes_under_every_codec() {
+    let mut prefix = Prefix::default();
+    prefix.put(&0xc0u64.to_be_bytes());
+    for (codec, payload) in [(Compression::None, b"hi".to_vec()), (Compression::Lz4, b"abcd".repeat(2000))] {
+        let (mut enc, mut wire) = (encoder(codec), Vec::new());
+        let compressed = enc.encode(&Frame { prefix, ..frame(1, payload.clone()) }, &mut wire).unwrap();
+        assert_eq!(compressed, codec != Compression::None);
+        let (header, seen) =
+            Decoder::new(Codecs::ALL, 1 << 16).decode(&mut BytesMut::from(&wire[..])).unwrap().unwrap();
+        assert_eq!((header.codec, &seen[..8], &seen[8..]), (codec, &[0, 0, 0, 0, 0, 0, 0, 0xc0][..], &payload[..]));
+    }
+    let mut out = Vec::new();
+    let full = Frame { prefix, ..frame(0, vec![0; (1 << 16) - 7]) };
+    assert_eq!(encoder(Compression::None).encode(&full, &mut out), Err(FrameError::Oversized));
+    let packed = Frame { payload: pack(b"abcd", 1).unwrap(), packed: Compression::Zstd, prefix, ..frame(0, vec![]) };
+    assert_eq!(encoder(Compression::None).encode(&packed, &mut out), Err(FrameError::Oversized));
     assert!(out.is_empty());
 }
 

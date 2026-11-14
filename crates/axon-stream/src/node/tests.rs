@@ -766,3 +766,9 @@ async fn a_host_below_the_push_window_records_one_event_at_start() {
     drop((node.unwrap(), cluster));
     system.shutdown().await.unwrap();
 }
+
+/// The cluster labels this protocol by its id: the two must not drift apart.
+#[test]
+fn the_stream_protocol_is_labelled_axon_stream() {
+    assert_eq!(axon_cluster::protocol_label(PROTOCOL, ""), "axon.stream");
+}

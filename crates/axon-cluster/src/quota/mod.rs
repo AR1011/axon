@@ -6,7 +6,7 @@ mod core;
 mod model;
 #[cfg(test)]
 mod sim;
-mod wire;
+pub(crate) mod wire;
 
 use std::borrow::Borrow;
 use std::collections::BTreeMap;

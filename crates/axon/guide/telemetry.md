@@ -274,7 +274,7 @@ A dead letter is a message a node accepted and never handled, with nobody told. 
   (`Exit::discarded`, by `Actor::label`): `actor_stopped`, `actor_failed` (a stop by a link too),
   `actor_panicked`, `drain_deadline`, `drained` (still stashed when a drain ended), `shutdown`, `fenced`;
 - a `tell` from another node that this node refuses: `unknown_actor`, `schema_mismatch`, `full`, `forbidden`,
-  `invalid_message`, `stopped`;
+  `invalid_message`, `stopped`, `protocol_mismatch`;
 - a topic's publish that a subscriber refuses ([actors § Topics](actors.md#topics)), labelled `publish` with the
   topic as its target: `full`, `too_large`, `not_ready` (a family between generations), `closed`.
 

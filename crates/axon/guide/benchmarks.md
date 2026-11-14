@@ -306,6 +306,24 @@ moves are their load. `disk` and `scale-subscribers` did not move against main; 
 quiet box for any of these rows, which it never was; the rows of the other jobs; and the reason for the `fanout` cost.
 No row of the baseline was recorded again.
 
+**The contract id, wire v8, 2026-11-14.** `scripts/bench.sh` cannot measure on the box this ran on (an AMD Ryzen 7
+5800X with no baseline, the `schedutil` governor, and other lanes' builds at a load of 4 to 39), so `remote_calls
+2000000 5000000` (cores 0-11) and `perf route` ran from release builds of spec/v8 and lane/wire in turn, three rounds
+each. With the id copied in front of each body, `tell` sent read 2.66, 3.18 and 2.91 M msg/s on spec/v8 against 2.18,
+2.00 and 2.07 on the branch: an allocation and a copy of the body on every call that had had neither. With the id,
+trace, deadline and window sent as the frame's `Prefix` instead, so the body is not copied:
+
+| Row | spec/v8 | lane/wire |
+|---|---|---|
+| `tell` 256 B sent, M msg/s | 3.20, 1.42, 2.69 | 3.11, 1.33, 3.04 |
+| 256 requests in flight, k req/s | 1 078, 153, 990 | 904, 229, 951 |
+| 16 requests in flight, k req/s | 237, 60, 221 | 148, 60, 227 |
+| sequential request p50, µs | 21.9, 61.6, 25.4 | 23.7, 85.2, 23.7 |
+| `route direct`, ns/msg | 117, 123, 108 | 120, 102, 104 |
+
+Round 2 of both ran at a load of 10 to 39 and moves with it. What this does not establish: the gate's bands, on a
+quiet box with a baseline; and whether the one 16-in-flight round at 148 k on the branch is load or the change.
+
 ## Transport (`axon-net`)
 
 TCP loopback, one process, plaintext + shared secret, compression threshold 0. Old is

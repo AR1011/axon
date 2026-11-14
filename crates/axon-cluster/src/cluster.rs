@@ -192,7 +192,8 @@ pub(crate) struct Route {
 pub(crate) type Endpoint = (u64, u16, Lane);
 
 impl Route {
-    /// The endpoint that takes `schema` of `protocol`, or any for the reserved protocol 0, `Unaddressed`.
+    /// The endpoint that takes `schema` of `protocol`, or any for the reserved protocol 0, `Unaddressed`. A call
+    /// carries its target's protocol, and no endpoint takes 0: one made with it is refused `ProtocolMismatch`.
     pub fn target(&self, node: Arc<str>, protocol: u64, schema: u16) -> Result<Target, ClusterError> {
         if protocol != 0 && protocol != self.protocol {
             return Err(ClusterError::ProtocolMismatch);
@@ -203,7 +204,7 @@ impl Route {
             served.sort_unstable();
             return Err(ClusterError::SchemaMismatch { wanted: schema, served });
         };
-        Ok(Target { node, incarnation: self.incarnation, endpoint, schema, lane })
+        Ok(Target { node, incarnation: self.incarnation, endpoint, protocol, schema, lane })
     }
 
     /// `protocol u64 | (endpoint u64 | schema u16 | lane u8)+`
@@ -681,7 +682,7 @@ impl Cluster {
         }
         let endpoint = self.0.expose(actor, Schema::of::<P>(), name.into(), true)?;
         let (node, incarnation) = (self.0.local_node().into(), self.0.engine.local.identity.incarnation);
-        let target = Target { node, incarnation, endpoint, schema: P::SCHEMA, lane: P::LANE };
+        let target = Target { node, incarnation, endpoint, protocol: P::ID, schema: P::SCHEMA, lane: P::LANE };
         Ok(RemoteRef::new(self.0.engine.clone(), target, None))
     }
 
@@ -856,9 +857,10 @@ impl Cluster {
         &self.0.engine.cfg.tracer
     }
 
-    /// The largest request or reply body this node's sessions on `lane` carry.
+    /// The largest call body this node's sessions on `lane` carry: the frame, less the 8 bytes of the call's contract
+    /// id. A call's deadline and window take room from it too, and a reply may be 8 bytes larger.
     pub fn max_frame(&self, lane: Lane) -> usize {
-        self.0.engine.cfg.transport.lanes.get(lane).limits.max_frame
+        self.0.engine.cfg.transport.lanes.get(lane).limits.max_frame.saturating_sub(CONTRACT_LEN)
     }
 
     /// How long a [`request`](Self::request) waits for its reply.
@@ -866,7 +868,8 @@ impl Cluster {
         self.0.engine.cfg.request_timeout
     }
 
-    /// One request to a [`serve`](Self::serve) endpoint on `node`, bounded by `request_timeout`.
+    /// One request to a [`serve`](Self::serve) endpoint on `node`, bounded by `request_timeout`. `protocol` is the
+    /// endpoint's: the serving node refuses another, 0 included, `Rejected(ProtocolMismatch)`.
     pub async fn request(
         &self,
         node: &str,

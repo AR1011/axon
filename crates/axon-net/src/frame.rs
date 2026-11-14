@@ -2,7 +2,8 @@
 //!
 //! 32-byte big-endian header, then the payload:
 //! `len u32 | sequence u32 | kind u16 | schema u16 | codec u8 | control u8 | 0 u16 | protocol u64 | id u64`.
-//! A compressed payload is `decoded_len u32` followed by one independent block.
+//! A compressed payload is `decoded_len u32` followed by one independent block. A frame's [`Prefix`] is sent as the
+//! payload's first bytes.
 
 use bytes::{Buf, Bytes, BytesMut};
 
@@ -23,23 +24,63 @@ pub struct Frame {
     /// peer accepts. Not carried on the wire: a received frame always has it unset.
     pub compress: bool,
     /// The payload is already `decoded_len u32 | block` in this codec, as [`pack`] makes it,
-    /// and is written as is: one compression shared by every session it is sent on.
+    /// and is written as is: one compression shared by every session it is sent on. It takes no prefix.
     pub packed: Compression,
+    /// Sent in front of the payload, as its first bytes, so a small header needs no copy of the payload. A received
+    /// frame has none.
+    pub prefix: Prefix,
+}
+
+/// The most bytes a [`Prefix`] holds.
+pub const PREFIX_MAX: usize = 48;
+
+/// Up to [`PREFIX_MAX`] bytes a frame sends in front of its payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Prefix {
+    len: u8,
+    bytes: [u8; PREFIX_MAX],
+}
+
+impl Default for Prefix {
+    fn default() -> Self {
+        Self { len: 0, bytes: [0; PREFIX_MAX] }
+    }
+}
+
+impl Prefix {
+    /// Appends `data`; panics past [`PREFIX_MAX`] bytes.
+    pub fn put(&mut self, data: &[u8]) {
+        let at = self.len as usize;
+        self.bytes[at..at + data.len()].copy_from_slice(data);
+        self.len += data.len() as u8;
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.len as usize]
+    }
 }
 
 impl Frame {
-    /// The payload's length once decoded; `None` for a packed payload without its length.
+    /// The bytes it takes on the wire after the header, prefix and payload.
+    pub fn wire_len(&self) -> usize {
+        self.prefix.len as usize + self.payload.len()
+    }
+
+    /// The payload's length once decoded, its prefix included; `None` for a packed payload without its length.
     pub fn decoded_len(&self) -> Option<usize> {
         match self.packed {
-            Compression::None => Some(self.payload.len()),
+            Compression::None => Some(self.wire_len()),
             _ => self.payload.first_chunk::<4>().map(|len| u32::from_be_bytes(*len) as usize),
         }
     }
 
-    /// Whether a side whose limit is `max_frame` will take this frame.
+    /// Whether a side whose limit is `max_frame` will take this frame. A packed one with a prefix it never takes.
     pub fn fits(&self, max_frame: usize) -> bool {
+        if self.packed != Compression::None && self.prefix.len != 0 {
+            return false;
+        }
         let prefix = if self.packed == Compression::None { 0 } else { 4 };
-        self.payload.len() <= max_frame + prefix && self.decoded_len().is_some_and(|len| len <= max_frame)
+        self.wire_len() <= max_frame + prefix && self.decoded_len().is_some_and(|len| len <= max_frame)
     }
 }
 
@@ -147,6 +188,8 @@ pub struct Encoder {
     sequence: u32,
     zstd: Option<zstd::bulk::Compressor<'static>>,
     scratch: Vec<u8>,
+    /// A prefix and its payload made one, for a compressor that takes one slice.
+    joined: Vec<u8>,
 }
 
 impl Encoder {
@@ -170,6 +213,7 @@ impl Encoder {
             sequence: 0,
             zstd,
             scratch: Vec::new(),
+            joined: Vec::new(),
         })
     }
 
@@ -189,12 +233,18 @@ impl Encoder {
         s
     }
 
+    /// Whether a payload of `len` bytes is worth trying to compress.
+    fn tries(&self, len: usize, requested: bool) -> bool {
+        let codec = if requested { self.on_request } else { self.codec };
+        codec != Compression::None && len >= self.threshold
+    }
+
     /// Compresses into `scratch`; `None` when compression is off, fails, or does not pay.
     fn compress(&mut self, payload: &[u8], requested: bool) -> Option<(Compression, usize)> {
-        let codec = if requested { self.on_request } else { self.codec };
-        if codec == Compression::None || payload.len() < self.threshold {
+        if !self.tries(payload.len(), requested) {
             return None;
         }
+        let codec = if requested { self.on_request } else { self.codec };
         if codec == Compression::Zstd && self.zstd.is_none() {
             self.zstd = Some(zstd::bulk::Compressor::new(self.zstd_level).ok()?);
         }
@@ -214,7 +264,7 @@ impl Encoder {
 
     /// Appends one frame; `out` is untouched on error. Returns whether it was compressed.
     pub fn encode(&mut self, frame: &Frame, out: &mut Vec<u8>) -> Result<bool, FrameError> {
-        let payload = &frame.payload[..];
+        let (prefix, payload) = (frame.prefix.as_slice(), &frame.payload[..]);
         if !frame.fits(self.max_frame) {
             return Err(FrameError::Oversized);
         }
@@ -222,8 +272,21 @@ impl Encoder {
         if packed && !self.accepted.contains(frame.packed) {
             return Err(FrameError::Codec);
         }
-        let compressed = if packed { None } else { self.compress(payload, frame.compress) };
-        let (codec, encoded_len) = compressed.map_or((frame.packed, payload.len()), |(codec, n)| (codec, n + 4));
+        let compressed = match (packed, prefix.is_empty()) {
+            (true, _) => None,
+            (false, true) => self.compress(payload, frame.compress),
+            (false, false) if !self.tries(frame.wire_len(), frame.compress) => None,
+            (false, false) => {
+                let mut joined = std::mem::take(&mut self.joined);
+                joined.clear();
+                joined.extend_from_slice(prefix);
+                joined.extend_from_slice(payload);
+                let compressed = self.compress(&joined, frame.compress);
+                self.joined = joined;
+                compressed
+            }
+        };
+        let (codec, encoded_len) = compressed.map_or((frame.packed, frame.wire_len()), |(codec, n)| (codec, n + 4));
         Header {
             encoded_len: encoded_len as u32,
             sequence: self.next_sequence(),
@@ -237,10 +300,13 @@ impl Encoder {
         .put(out);
         match compressed {
             Some((_, n)) => {
-                out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+                out.extend_from_slice(&(frame.wire_len() as u32).to_be_bytes());
                 out.extend_from_slice(&self.scratch[..n]);
             }
-            None => out.extend_from_slice(payload),
+            None => {
+                out.extend_from_slice(prefix);
+                out.extend_from_slice(payload);
+            }
         }
         Ok(packed || compressed.is_some())
     }

@@ -24,7 +24,7 @@ pub use config::{
     Authenticator, CertificateIdentity, Config, Identity, LaneConfig, Lanes, Limits, PeerContext, SharedSecret,
 };
 pub use error::{Error, FrameError, Negotiation, SubmitError, SubmitReason, Timeout};
-pub use frame::{Codecs, Compression, Frame};
+pub use frame::{Codecs, Compression, Frame, PREFIX_MAX, Prefix};
 pub use handshake::{Role, VERSIONS};
 pub use net::{
     AcceptLimits, ClientTls, Dial, DialError, HANDSHAKE_FAILURE_REASONS, Incoming, Io, Listener, ListenerStats,
