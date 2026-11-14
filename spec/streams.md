@@ -161,6 +161,9 @@ has no followers of its own behind the open (the fourth case above is tested in 
   a replay a close or a reset stops leaves a `Live` follower at the last position it was given, as any `Live`
   follower, and a `FollowAfter` waiting for it. Before, a `Live` one waited too: a restart ended it
   `GenerationChanged`, and a close and an open of the next generation dropped that generation's first records.
+- `crates/axon-stream/src/core/tests.rs::a_follower_whose_catch_up_stops_is_told_it_caught_up_once_where_it_goes_on`:
+  a `Live` follower gets one `CaughtUp` for each catch-up, at the end of the replay or at the last position it was
+  given when the replay stops (`Sub::stop_replay`). Before, one whose replay stopped got none.
 - `crates/axon-stream/src/core/tests.rs::origin_lost_told_to_a_follower_still_replaying_comes_after_the_records_it_holds`:
   `OriginLost` waits behind the live records held behind a replay. Before, they came ahead of the replay.
 - `crates/axon-stream/src/core/tests.rs::a_subscriber_in_the_new_generation_goes_on_beside_a_follower_parked_in_the_old`:

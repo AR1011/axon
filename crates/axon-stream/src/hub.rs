@@ -586,7 +586,8 @@ impl Sub {
 
     /// At a close or a reset the source of its replay goes: a follower still replaying goes on from the last position
     /// it was given, and the live batches held behind the replay are given back. One held to its generation waits for
-    /// its stream to come back to that position; a `Live` one goes on as any `Live` follower at it.
+    /// its stream to come back to that position, and is told `CaughtUp` there; a `Live` one is told it at once, and
+    /// goes on as any `Live` follower at it.
     fn stop_replay(&mut self, total: &mut QueueUsage) {
         let Phase::Recovering { next_after, cut, .. } = self.phase else { return };
         for _ in 0..self.tail {
@@ -596,6 +597,9 @@ impl Sub {
         let given = Cursor { generation: cut.generation, sequence: next_after };
         let phase = if self.one_generation { Phase::Waiting(Some(given)) } else { Phase::Live };
         (self.tail, self.at, self.phase) = (0, Some(given), phase);
+        if !self.one_generation {
+            self.queue.push_back(StreamEvent::CaughtUp { through: given });
+        }
     }
 
     /// Behind the position its stream opened at, which `source` holds from its own on: it is told its own position,

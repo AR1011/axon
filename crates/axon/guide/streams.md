@@ -720,7 +720,9 @@ The old origin calls `close_stream` once it knows it may no longer publish, for 
 see the close and ask the new origin from their own positions, so `Live` and `FollowAfter` subscribers go on in the
 same generation without a reset. Followers on the standby itself go on the same way: the open is after the last
 record its log holds, which can be past what reached it as a relay, and they replay the records between from the
-history source, then go on live (a follower denied `Access::Replay` is reset `HistoryUnavailable` instead). A crashed
+history source, then go on live (a follower denied `Access::Replay` is reset `HistoryUnavailable` instead). A `Live`
+one is told `CaughtUp` once where it goes on live: at the end of the replay, or, when a close or a restart stops the
+replay, at the last record it was given. A crashed
 or paused old origin cannot close: its children move once the cluster calls it gone. Let the standby relay the key
 from the origin (its `upstream` names the origin's labels), so taking over is a relay opening a key it pulls.
 `open_stream_after` is refused `InvalidOptions` without a history source for the namespace, for a namespace kept on

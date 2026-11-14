@@ -915,7 +915,8 @@ fn a_standby_catching_up<A: Authorizer>(authorizer: A) -> (RelayCore<A>, u64) {
 }
 
 /// A `Live` follower whose replay from the history stops at a new generation, a restart or a close and an open of
-/// the next, follows the new generation from its first record, as any `Live` follower does.
+/// the next, follows the new generation from its first record, as any `Live` follower does. Its `CaughtUp`: the test
+/// below.
 #[test]
 fn a_follower_whose_catch_up_stops_at_a_new_generation_follows_it_from_its_first_record() {
     let rows = ["restart", "close and open"].map(|row| {
@@ -927,9 +928,41 @@ fn a_follower_whose_catch_up_stops_at_a_new_generation_follows_it_from_its_first
             standby.open_stream(&key(0), 2, DeliveryPolicy::ReplayRequired).expect("opens generation 2");
         }
         standby.publish(&key(0), vec![Bytes::from_static(b"x"); 20]).expect("publishes");
-        (row, seen(&mut standby, live), standby.is_subscribed(live))
+        let mut events = seen(&mut standby, live);
+        events.retain(|e| !e.starts_with("CaughtUp"));
+        (row, events, standby.is_subscribed(live))
     });
     assert_eq!(rows, [("restart", vec!["2 1..20".into()], true), ("close and open", vec!["2 1..20".into()], true)]);
+}
+
+/// A `Live` follower is told `CaughtUp` once for each catch-up, where it goes on live: at the end of its replay, or,
+/// when a restart or a close stops the replay, at the last position it was given. Before, one whose replay stopped
+/// was never told.
+#[test]
+fn a_follower_whose_catch_up_stops_is_told_it_caught_up_once_where_it_goes_on() {
+    let caught_up = |sequence| format!("{:?}", StreamEvent::CaughtUp { through: Cursor { generation: 1, sequence } });
+    let rows = ["finishes", "restart", "close and open"].map(|row| {
+        let (mut standby, live) = a_standby_catching_up(AllowAll);
+        let mut events = if row == "finishes" { seen(&mut standby, live) } else { Vec::new() };
+        if row == "close and open" {
+            standby.close_stream(&key(0)).expect("closes");
+            standby.open_stream(&key(0), 2, DeliveryPolicy::ReplayRequired).expect("opens generation 2");
+        } else {
+            standby.restart_stream(&key(0), 2).expect("restarts");
+        }
+        standby.publish(&key(0), vec![Bytes::from_static(b"x"); 20]).expect("publishes");
+        events.extend(seen(&mut standby, live));
+        (row, events)
+    });
+    let new = "2 1..20".to_string();
+    assert_eq!(
+        rows,
+        [
+            ("finishes", vec!["1 11..20".into(), caught_up(20), new.clone()]),
+            ("restart", vec![caught_up(10), new.clone()]),
+            ("close and open", vec![caught_up(10), new]),
+        ]
+    );
 }
 
 /// `OriginLost` told to a follower still replaying its start waits behind the live records held behind the replay:
