@@ -1545,7 +1545,10 @@ impl<A: Authorizer> RelayCore<A> {
         };
         let options = SubscribeOptions { start, slow_consumer: SlowConsumerPolicy::Reset, limits: self.cfg.branch };
         let id = self.hub.subscribe(peer, &want.key, options, Some(self.history(&want.key))).map_err(|e| match e {
-            StreamError::Forbidden => Status::Forbidden,
+            // Subscribe and Snapshot passed above, and the start is `After` or `First`: only Replay was denied. A start
+            // this node may not replay is one it cannot give, so the child takes the stream live, as from a parent
+            // without the history, and does not ask for the position forever.
+            StreamError::Forbidden => Status::HistoryUnavailable,
             StreamError::Recovery(RecoveryError::HistoryUnavailable) => Status::HistoryUnavailable,
             StreamError::Recovery(RecoveryError::GenerationMismatch) => Status::GenerationMismatch,
             StreamError::LimitExceeded | StreamError::QuotaExceeded { .. } => Status::LimitExceeded,

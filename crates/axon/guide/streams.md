@@ -257,7 +257,9 @@ event as a message; see the sources section of the actors guide.
   old one still feeds the stream; overlap is dropped by position, and the old branch is released when the new one
   reports `CaughtUp`. A parent that refuses a stream is retried with exponential backoff from `retry_refused`.
 - **Per-stream fallthrough.** A parent that lacks a stream, or the history a child needs, refuses that stream only;
-  the child asks the next candidate for it. If every candidate lacks the history, and none has appeared for
+  the child asks the next candidate for it. A parent that denies the child `Access::Replay` refuses a start behind
+  its own position as lacking the history (`HistoryUnavailable`), so the child takes the stream live rather than
+  asking for the position again and again. If every candidate lacks the history, and none has appeared for
   `upstream_timeout` (3 s), counting one that left the view and came back however briefly, the stream rejoins live:
   local subscribers get `ResetRequired(HistoryUnavailable)`, a `Live` one a new `Ready` when the stream comes back in a
   newer generation and `ResetRequired(HistoryUnavailable)` when it comes back in the same one, past what the node

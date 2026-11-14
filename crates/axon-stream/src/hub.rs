@@ -20,6 +20,8 @@ use crate::recovery::{
 pub enum Access {
     Publish,
     Subscribe,
+    /// A start before the live edge. A relay that denies a child it refuses the child's start behind its position as
+    /// `HistoryUnavailable`, so the child takes the stream live.
     Replay,
     Snapshot,
 }

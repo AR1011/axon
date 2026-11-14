@@ -38,7 +38,13 @@ fn follow(origin: &mut RelayCore, child: &PeerId, keys: usize, now: Instant) {
 }
 
 /// The child asks its parent until it has nothing more to ask.
-pub(crate) fn ask(parent: &mut RelayCore, p: &PeerId, child: &mut RelayCore, c: &PeerId, now: Instant) {
+pub(crate) fn ask<A: Authorizer, B: Authorizer>(
+    parent: &mut RelayCore<A>,
+    p: &PeerId,
+    child: &mut RelayCore<B>,
+    c: &PeerId,
+    now: Instant,
+) {
     for _ in 0..8 {
         let asked = child.reconcile(std::slice::from_ref(p), now);
         if asked.is_empty() {
@@ -730,6 +736,69 @@ fn a_relay_asks_again_after_the_position_its_stream_closed_at() {
     let asked = relay.reconcile(std::slice::from_ref(&o), later);
     let starts: Vec<_> = asked.iter().flat_map(|(_, i)| &i.wants).map(|w| w.start).collect();
     assert_eq!(starts, vec![StartPosition::After(Cursor { generation: 1, sequence: 33 })]);
+}
+
+/// Everything, except replay for node "r".
+struct NoReplayToR;
+
+impl Authorizer for NoReplayToR {
+    fn authorize(&self, peer: &PeerId, _: &StreamKey, access: Access) -> bool {
+        access != Access::Replay || &*peer.node != "r"
+    }
+}
+
+/// A relay its parent may not replay to asks again after the position its stream closed at. A parent that has gone
+/// past it refuses the start as `HistoryUnavailable`, not `Forbidden`, so the relay takes the stream live and its
+/// follower, which missed records, is reset. Before, the relay asked after the position forever and the follower
+/// heard nothing.
+#[test]
+fn a_relay_its_parent_may_not_replay_to_goes_on_live_after_a_close() {
+    // Records the origin publishes before the relay asks again, and what the relay's follower then sees.
+    let reset = format!("{:?}", StreamEvent::ResetRequired(ResetReason::HistoryUnavailable));
+    let rows: [(usize, Vec<String>); 2] = [(0, vec!["1 34..34".into()]), (2, vec![reset])];
+    for (early, expected) in rows {
+        let now = Instant::now();
+        let (o, r) = (PeerId::new("o", 1), PeerId::new("r", 1));
+        let mut origin =
+            RelayCore::new(&o, NoReplayToR, CoreConfig { relay: false, ..scaled() }).expect("a valid config");
+        let log = MemoryStore::new(MemoryLimits::default()).expect("valid limits");
+        origin.set_history("md", Arc::new(Mutex::new(log)));
+        origin.open_stream(&key(0), 1, DeliveryPolicy::ReplayRequired).expect("opens");
+        origin.publish(&key(0), vec![Bytes::from_static(b"x"); 32]).expect("publishes");
+        let mut relay = RelayCore::new(&r, AllowAll, CoreConfig { relay: true, ..scaled() }).expect("a valid config");
+        let follower = relay.subscribe(&key(0), SubscribeOptions::default()).expect("follows");
+        ask(&mut origin, &o, &mut relay, &r, now);
+        origin.publish(&key(0), vec![Bytes::from_static(b"x")]).expect("publishes");
+        deliver(&mut origin, &o, &mut relay, &r, now);
+        assert_eq!(records(&mut relay, follower), vec![33]);
+        origin.close_stream(&key(0)).expect("closes");
+        deliver(&mut origin, &o, &mut relay, &r, now);
+        origin
+            .open_stream_after(&key(0), Cursor { generation: 1, sequence: 33 }, DeliveryPolicy::ReplayRequired)
+            .expect("opens after");
+        for _ in 0..early {
+            origin.publish(&key(0), vec![Bytes::from_static(b"x")]).expect("publishes");
+        }
+        // Past any refusal backoff and the upstream timeout, twice: the relay asks, then gives up the position.
+        let mut at = now;
+        for _ in 0..4 {
+            at += Duration::from_secs(60);
+            ask(&mut origin, &o, &mut relay, &r, at);
+            deliver(&mut origin, &o, &mut relay, &r, at);
+        }
+        origin.publish(&key(0), vec![Bytes::from_static(b"x")]).expect("publishes");
+        deliver(&mut origin, &o, &mut relay, &r, at);
+        let seen: Vec<String> = std::iter::from_fn(|| relay.poll(follower))
+            .filter_map(|event| match event {
+                StreamEvent::Batch(b) => {
+                    Some(format!("{} {}..{}", b.generation(), b.first(), b.first() + b.len() as u64 - 1))
+                }
+                StreamEvent::Ready { .. } => None,
+                other => Some(format!("{other:?}")),
+            })
+            .collect();
+        assert_eq!(seen, expected, "{early} records published before the relay asked again");
+    }
 }
 
 /// A replay from the namespace's history, four branches long, goes to the child a window at a time: the branch is

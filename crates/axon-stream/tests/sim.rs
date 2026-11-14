@@ -1102,7 +1102,7 @@ fn a_new_generation_its_parent_cannot_give_from_record_1_comes_from_the_live_edg
     drive(&mut cores, tree, &mut now, 10);
     let events = leaf(&mut cores);
     assert_eq!(events[events.len() - 2..], [ready(2, 3), "2 4..5".into()], "{events:?}");
-    assert_eq!(cores["l"].1.stats().refusals[Status::Forbidden as usize], 1);
+    assert_eq!(cores["l"].1.stats().refusals[Status::HistoryUnavailable as usize], 1, "the replay it may not have");
 
     let tree: Tree = &[("l", &["o", "x"])];
     let rings = vec![RingLimits { namespace: "md".into(), max_records: 4, max_bytes: 1 << 20 }];
