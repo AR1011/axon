@@ -73,15 +73,15 @@ its `ClusterStats` with the authority's `describe()` and the engine's links, its
 **Design.** A cargo example, `crates/axon-obs/examples/ops.rs`, no new crate: axon-obs already depends on axon-cluster
 and axon-stream.
 
-- `ops <nodes|leases|streams|links> [--json]`, the discovery and the certificate from the environment, as the
-  playground takes them. Node id `<host>-<pid>.<ops principal>`, so §1's rules can let it in.
+- `ops <nodes|leases|streams|links> [--json]`, the discovery and the shared secret from the environment, as the
+  playground takes them (`AXON_CONSUL`, `AXON_SERVICE`, `AXON_SECRET`), and `AXON_BIND` for its own address. Node id
+  `<host>-<pid>.<AXON_PRINCIPAL>`, so §1's rules can let it in.
 - It starts a `Cluster` that registers no kind, reads the view, and asks each member for its `NodeSnapshot`
   (`Request::Snapshot`) and, for `streams`, `Request::Streams`, at most 16 at once, each within `request_timeout`.
   A member that does not answer is a row that says so.
 - `nodes`: id, incarnation, labels, reachable, isolated, wire version. `leases`: each node's authority `describe()`
   and the leased keys it holds per kind. `streams`: per node, the keys it originates and relays, with cursor and
-  parent. `links`: per node, each peer and lane, up or down, round trip, and the link meters of
-  [lanes.md §8.1](lanes.md#81-link-meters-wire-v8) by region pair and protocol.
+  parent. `links`: per node, each peer and lane, up or down, round trip and wire version.
 - It calls `system.shutdown()` before it exits, on SIGINT too, so it leaves the view at once instead of after idle
   plus `idle_hold`.
 
@@ -92,9 +92,11 @@ nothing; the test below holds that with counts.
 
 **Tests.**
 
-- `scripts/check.sh` builds the example and runs `ops nodes --json` against a playground (`scripts/check.sh smoke`).
+- `scripts/check.sh` builds the example; `scripts/check.sh smoke` with `AXON_CONSUL` set runs `ops nodes --json`
+  against a playground and checks every playground node answered.
 - `crates/axon-cluster/tests/world.rs::a_member_that_joins_and_leaves_each_second_moves_no_key_and_drops_no_call`,
-  with literal counts of keys moved and calls failed (0 and 0).
+  with literal counts of keys moved and calls failed (0 and 0), and of leaves seen and nodes that went unreachable
+  first (10 and 0).
 
 ## Open
 
@@ -104,5 +106,8 @@ nothing; the test below holds that with counts.
   today (its records reach the follower), and would need a relay that loses its parent to keep its followers.
 - §1: a principal from the verified certificate itself, carried as `Peer::principal` (an `Authenticator` API change),
   for certificates with URI names rather than wildcards. Not chosen: the node-id suffix needs no new plumbing.
+- §2: TLS for `ops`: it takes a shared secret only, not a certificate and key from the environment.
+- §2: `links` with the link meters of [lanes.md §8.1](lanes.md#81-link-meters-wire-v8) by region pair and protocol,
+  once those meters land.
 - §2: a join that clears no route cache when the member registers no name and no kind. Add it if the churn test shows
   a cost.

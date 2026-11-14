@@ -1524,6 +1524,13 @@ There is no client mode. A process that only calls, such as a command-line tool,
 its own, and is listed, dialled and kept alive like any other. It runs no keyed actor unless it registers a kind. Call
 `system.shutdown()` before it exits, or it stays listed until discovery drops it.
 
+`crates/axon-obs/examples/ops.rs` is such a tool: `ops <nodes|leases|streams|links> [--json]` joins as
+`<host>-<pid>.<principal>` (`AXON_PRINCIPAL`, `ops`) on `AXON_BIND` (`127.0.0.1:0`; `Cluster::start` refuses a
+wildcard without `advertise`), so `Rules` let it in by its principal, asks each member for its telemetry snapshot
+(and its streams), 16 at once, and shuts down on exit and on SIGINT. A member that registers no kind owns no key: its
+join and its leave clear each node's route cache and move nothing, which
+`tests/world.rs::a_member_that_joins_and_leaves_each_second_moves_no_key_and_drops_no_call` holds with counts.
+
 ### Seed servers
 
 `SeedDiscovery` needs nothing but axon. A few machines, three in production, each run a `SeedServer`: it keeps

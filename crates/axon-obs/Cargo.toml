@@ -75,5 +75,8 @@ name = "scale"
 name = "playground"
 required-features = ["dashboard"]
 
+[[example]]
+name = "ops"
+
 [lints]
 workspace = true
