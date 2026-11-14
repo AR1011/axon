@@ -86,6 +86,11 @@ in 64. "Hold" is the lock held per page, timed inside `read` in an instrumented 
 - **Segments.** A page held the lock 2.3 µs, above the spec's 2 µs, so the ring is segments of 32 spans that a
   reader clones under the lock and copies after it. Sealing a segment by copying it into an `Arc<[Span]>` cost a
   traced message 23 ns (161.4–172.7); swapping the open `Arc<Vec<Span>>` for an empty one costs nothing measurable.
+- **Full size at the start.** The list of segments is allocated for a full ring when the tracer is made, so a
+  recorder never waits on it growing under the lock; before, it grew while the ring first filled, a copy of one
+  pointer a segment. In `perf trace_drain` (load 5–7, three rounds each) record is unchanged: p50 280–290 ns against
+  290–310, p99.9 29.2–29.7 µs against 28.2–29.5. Readers already take a page of 256 a hold, so no read holds the lock
+  for the whole ring.
 
 What this establishes: a reader never holds a recording thread up for more than a few hundred nanoseconds, and a
 traced message costs what it did. What it costs: the untraced hosted path is 4–7 ns a message dearer, because a

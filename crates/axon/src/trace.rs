@@ -365,7 +365,6 @@ const SEGMENT: usize = 32;
 
 /// Spans in consecutive positions, the newest last, in segments. A reader clones the segments it wants under the
 /// lock and copies their spans after it, so the lock is held for an `Arc` a segment.
-#[derive(Default)]
 struct Ring {
     /// The last position given out.
     next: u64,
@@ -409,7 +408,10 @@ impl Tracer {
     }
 
     pub(crate) fn clocked(capacity: usize, sample_every: u32, clock: Clock) -> Arc<Self> {
-        Arc::new(Self { capacity, sample_every, ring: Mutex::default(), most_held: AtomicUsize::new(0), clock })
+        // Room for every segment the ring holds at its fullest, taken now: a recorder never waits on the list growing.
+        let sealed = VecDeque::with_capacity(if capacity == 0 { 0 } else { capacity.div_ceil(SEGMENT) + 2 });
+        let ring = Mutex::new(Ring { next: 0, sealed, open: Arc::new(Vec::with_capacity(SEGMENT)) });
+        Arc::new(Self { capacity, sample_every, ring, most_held: AtomicUsize::new(0), clock })
     }
 
     pub(crate) fn sample(&self, ordinal: u64) -> Option<TraceContext> {
@@ -594,4 +596,16 @@ fn quietly(event: impl FnOnce()) {
 fn mix_is_splitmix64s_finish() {
     // splitmix64's first output from state 0.
     assert_eq!(mix(0x9e37_79b9_7f4a_7c15), 0xe220_a839_7b1d_cdaf);
+}
+
+#[cfg(test)]
+#[test]
+fn the_ring_takes_its_full_size_at_the_start_and_never_grows_under_its_lock() {
+    let tracer = Tracer::new(1000, 0);
+    let room = tracer.ring.lock().sealed.capacity();
+    assert!(room > 1000 / SEGMENT, "room for {room} segments");
+    for id in 1..=5000 {
+        tracer.record(Span::begin(TraceContext::fresh(), id, SpanKind::Handle, "work"));
+        assert_eq!(tracer.ring.lock().sealed.capacity(), room, "grew at span {id}");
+    }
 }
