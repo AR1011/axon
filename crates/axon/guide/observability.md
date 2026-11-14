@@ -310,3 +310,4 @@ What else counts, the ring each node keeps and how repeats share a row, and wher
 [telemetry § Dead letters](telemetry.md#dead-letters). The console lists them with a link to the trace when there is
 one. A traced message dropped before any handler ran it leaves one failed handle span of zero length in the tracer,
 named by its label, under the span that sent it, so the link opens the trace at the place the message ended.
+Its error is `dead_letter`, and its `reason` attribute is the letter's reason.

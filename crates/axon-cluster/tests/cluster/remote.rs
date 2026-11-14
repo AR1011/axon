@@ -42,9 +42,10 @@ async fn publish_resolve_call() {
         let lost =
             letters.iter().any(|l| (l.reason, l.label, l.peer.as_deref()) == ("unknown_actor", "tell", Some("b")));
         let spans = a.system.tracer().trace(root.trace);
+        let reason = [("reason", axon::Attr::from("unknown_actor"))];
         lost && spans.iter().any(|s| {
-            (s.kind, &*s.name, s.error, s.peer.as_deref())
-                == (SpanKind::Handle, "tell", Some("unknown_actor"), Some("b"))
+            (s.kind, &*s.name, s.error, s.attrs.as_deref(), s.peer.as_deref())
+                == (SpanKind::Handle, "tell", Some("dead_letter"), Some(&reason[..]), Some("b"))
         })
     })
     .await;

@@ -95,7 +95,7 @@ A failed span says why in `error`, a short kind, `None` when it succeeded:
 | Span | `error` |
 |---|---|
 | a handler | `error` when it returned an error, `panic` when it panicked |
-| a dropped message | the dead letter's reason, such as `actor_stopped` |
+| a dropped message | `dead_letter`, with the dead letter's reason, such as `actor_stopped`, in its `reason` attribute |
 | a call | `CallError::kind`: `timeout`, `outcome_unknown`, `no_route`, `unreachable`, `stale_node`, `closed`, `busy`, `no_reply`, `codec`, `rejected.<name>` for the endpoint's `Rejection`, `not_sent.<reason>` when the session refused to send it |
 | a publish | the `StreamError`'s name, such as `quota_exceeded` |
 | an app span | what the application passed to `AppSpan::error` |

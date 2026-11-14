@@ -332,11 +332,11 @@ pub struct Span {
     /// Time in the mailbox before the handler ran.
     pub wait: Duration,
     pub busy: Duration,
-    /// What it ended with, when it failed: `error` or `panic` for a handler, a dead letter's reason, a call's
-    /// `CallError::kind`, a stream's error, or the application's own.
+    /// What it ended with, when it failed: `error` or `panic` for a handler, `dead_letter` for a message dropped
+    /// before a handler ran it, a call's `CallError::kind`, a stream's error, or the application's own.
     pub error: Option<&'static str>,
-    /// An `App` span's attributes, `None` on axon's own. Shared rather than owned, so that copying a page of spans
-    /// out of the ring costs no more for them (guide/benchmarks.md).
+    /// An `App` span's attributes, and a dropped message's `reason`; `None` on axon's other spans. Shared rather than
+    /// owned, so that copying a page of spans out of the ring costs no more for them (guide/benchmarks.md).
     pub attrs: Option<Arc<[(&'static str, Attr)]>>,
 }
 

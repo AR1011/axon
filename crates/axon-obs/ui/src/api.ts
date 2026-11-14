@@ -556,9 +556,9 @@ export interface SpanRecord {
   wait_ns: number;
   busy_ns: number;
   failed: boolean;
-  /** Why a failed span failed (`timeout`, `rejected.full`, `panic`, ...); empty when it did not, or when a store kept it before error kinds. */
+  /** Why a failed span failed (`timeout`, `rejected.full`, `panic`, `dead_letter` for a message dropped unrun, ...); empty when it did not, or when a store kept it before error kinds. */
   error?: string;
-  /** An app span's attributes. */
+  /** An app span's attributes, and a dropped message's `reason`. */
   attrs?: Record<string, string>;
 }
 

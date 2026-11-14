@@ -684,12 +684,16 @@ async fn messages_discarded_at_exit_become_dead_letters() {
         ]
     );
     assert_eq!(system.stats().dead_letters, 3);
-    // No handler ran the traced message, so the drop is its trace's span: without it the trace would not exist.
+    // No handler ran the traced message, so the drop is its trace's span: without it the trace would not exist. Its
+    // error kind says it was dropped, and its `reason` attribute why.
     let spans = system.tracer().trace(trace.trace);
-    let seen: Vec<_> =
-        spans.iter().map(|s| (&*s.name, s.kind, s.parent, s.error, s.busy, s.actor.map(|a| a.0))).collect();
-    let quick =
-        ("quick", SpanKind::Handle, 0, Some("actor_stopped"), Duration::ZERO, Some(actor.address.incarnation()));
+    let seen: Vec<_> = spans
+        .iter()
+        .map(|s| (&*s.name, s.kind, s.parent, s.error, s.attrs.as_deref(), s.busy, s.actor.map(|a| a.0)))
+        .collect();
+    let reason = [("reason", Attr::from("actor_stopped"))];
+    let incarnation = Some(actor.address.incarnation());
+    let quick = ("quick", SpanKind::Handle, 0, Some("dead_letter"), Some(&reason[..]), Duration::ZERO, incarnation);
     assert_eq!(seen, [quick]);
 }
 
@@ -712,8 +716,11 @@ async fn a_generation_that_fails_and_restarts_leaves_its_queue_as_dead_letters()
     assert_eq!(seen, [("quick", 2, "actor_failed", Some("sleepy"))]);
     assert_eq!(letters[0].actor.unwrap().0.generation, 1);
     let spans = system.tracer().trace(trace.trace);
-    let ended: Vec<_> = spans.iter().map(|s| (&*s.name, s.error, s.actor.map(|a| a.0.generation))).collect();
-    assert_eq!(ended, [("quick", Some("actor_failed"), Some(1))], "the failed generation's queue ends its traces");
+    let ended: Vec<_> =
+        spans.iter().map(|s| (&*s.name, s.error, s.attrs.as_deref(), s.actor.map(|a| a.0.generation))).collect();
+    let reason = [("reason", Attr::from("actor_failed"))];
+    let quick = ("quick", Some("dead_letter"), Some(&reason[..]), Some(1));
+    assert_eq!(ended, [quick], "the failed generation's queue ends its traces");
     let lost = || system.diagnostics_page(None, 10).unwrap().actors[0].diagnostics.dead_letters;
     assert_eq!(lost(), 2, "the family counts its generations' dead letters");
     // The ring lets go of them; the count does not.

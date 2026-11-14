@@ -833,8 +833,11 @@ test("dead letters list what was dropped, why, and link to the trace", async ({ 
   await expect(first).toContainText(/scratch.*work.*actor stopped.*local/);
   await first.getByRole("link", { name: "open" }).click();
   await expect(page).toHaveURL(/\/ops\/axon\/traces\/[0-9a-f]{32}/);
-  // The message was dropped before any handler ran: the drop itself is the trace's span.
-  await expect(page.getByRole("list", { name: "Spans" }).getByRole("listitem").filter({ hasText: "work" }).first()).toBeVisible({ timeout: 15_000 });
+  // The message was dropped before any handler ran: the drop itself is the trace's span, and its error kind says so.
+  const drop = page.getByRole("list", { name: "Spans" }).getByRole("listitem").filter({ hasText: "work" }).first();
+  await expect(drop).toBeVisible({ timeout: 15_000 });
+  await drop.getByRole("button").click();
+  await expect(drop).toContainText("OutcomeDropped before a handler ran it: actor_stopped");
 });
 
 test("a list that failed to load says so, never that nothing is there", async ({ page }) => {

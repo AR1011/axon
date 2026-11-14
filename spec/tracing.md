@@ -62,7 +62,7 @@ ring and lose the parent links.
 **Design.**
 
 - `SpanKind::App`, and `Span.attrs: Option<Arc<[(&'static str, Attr)]>>`, `enum Attr { U64(u64), I64(i64),
-  Str(Cow<'static, str>) }`; `None` on axon's own spans. Not a `Vec`, as first designed: an empty `Vec` allocates
+  Str(Cow<'static, str>) }`; `None` on axon's own spans but a dropped message's (§4). Not a `Vec`, as first designed: an empty `Vec` allocates
   nothing, but cloning a span that holds one cost 2.2 µs more a page of 256 (`perf trace_drain`,
   [benchmarks](../crates/axon/guide/benchmarks.md)); an `Option<Arc<_>>` that is `None` costs 0.2 µs. `AppSpan` keeps
   a `Vec` while it runs and shares it when it records.
@@ -123,8 +123,10 @@ with a failed call does not say whether it timed out, was refused as full or los
 - `Span.error: Option<&'static str>` in place of `failed`. `CallError::kind(&self) -> &'static str` names it: `timeout`,
   `outcome_unknown`, `no_route`, `unreachable`, `stale_node`, `closed`, `busy`, `no_reply`, `codec`, `rejected.<name>`
   from `REJECTION_NAMES` (`engine.rs:713-714`) and `not_sent.<reason>` from `SUBMIT_REASONS`
-  (`crates/axon-net/src/session.rs:90`). A handler's span gives `error` or `panic`, a dead letter its reason, a stream
-  span its `StreamError`'s name.
+  (`crates/axon-net/src/session.rs:90`). A handler's span gives `error` or `panic`, a dead letter `dead_letter` with its
+  reason in the attribute `reason`, a stream span its `StreamError`'s name. A kind of its own, not the reason itself,
+  so that a reader tells a drop from a handler's failure by the kind alone: an application records letters with
+  reasons of its own.
 - `SpanRecord` keeps `failed`, now derived (`error.is_some()`), so stored rows and the console's filter keep working,
   and gains `error`; ClickHouse `error LowCardinality(String)` by `ALTER`. The console's "The call failed" names the
   kind.
@@ -136,6 +138,9 @@ with a failed call does not say whether it timed out, was refused as full or los
 - `crates/axon-cluster/tests/cluster/trace.rs::a_failed_call_span_names_its_error_kind`: a timeout, `rejected.full`, and
   `outcome_unknown` after a session cut (the partition row of [faults.md § actors: tracing](faults.md#actors-tracing)).
 - `crates/axon-obs/tests/metrics.rs::a_stored_span_keeps_failed_beside_its_error`
+- `crates/axon/tests/system.rs::messages_discarded_at_exit_become_dead_letters` and
+  `crates/axon-cluster/tests/cluster/remote.rs::publish_resolve_call`: a drop's span is `dead_letter` with its `reason`;
+  `crates/axon-obs/ui/tests/dashboard.spec.ts`: the console names the drop from the kind.
 
 ## 5. Dropped spans
 

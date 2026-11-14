@@ -1,1 +1,0 @@
-import{kn as e}from"./atoms-DWNTEJXX.js";import{P as t}from"./index-BY4svfos.js";var n=e();function r(){return(0,n.jsxs)(n.Fragment,{children:[(0,n.jsx)(`h1`,{className:`sr-only-h1`,children:`Actors`}),(0,n.jsx)(t,{})]})}export{r as ActorsPage};

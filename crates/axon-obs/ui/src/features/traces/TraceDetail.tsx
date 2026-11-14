@@ -24,12 +24,12 @@ const KINDS: Record<SpanRecord["kind"], { label: string; field: string; busy: (s
 /** A kind a newer node sends is drawn as a handled message. */
 const kindOf = (span: SpanRecord) => KINDS[span.kind] ?? KINDS.handle;
 
-/** What became of the span: a handler's own failure, or the kind of error that ended it. */
+/** What became of the span: dropped unrun, a handler's own failure, or the kind of error that ended it. */
 function outcome(span: SpanRecord): string {
   if (!span.failed) return "Completed";
+  if (span.error === "dead_letter") return `Dropped before a handler ran it${span.attrs?.reason ? `: ${span.attrs.reason}` : ""}`;
   if (span.kind === "handle" && span.error === "panic") return "The handler panicked and the actor stopped";
   if (span.kind === "handle" && (!span.error || span.error === "error")) return "The handler failed and the actor stopped";
-  if (span.kind === "handle") return `Dropped before a handler ran it: ${span.error}`;
   return `${span.kind === "call" ? "The call failed" : "Failed"}${span.error ? `: ${span.error}` : ""}`;
 }
 

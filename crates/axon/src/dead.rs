@@ -8,7 +8,7 @@ use std::time::Duration;
 use parking_lot::Mutex;
 
 use crate::clock::Clock;
-use crate::trace::{Span, SpanKind, TraceContext, TraceId, Tracer, unix_micros};
+use crate::trace::{Attr, Span, SpanKind, TraceContext, TraceId, Tracer, unix_micros};
 use crate::types::{ActorIncarnation, Exit, RejectReason, StopReason};
 
 const CAPACITY: usize = 1024;
@@ -113,13 +113,14 @@ impl DeadLetters {
     }
 
     /// A repeat of a recent letter within a second of its last sighting takes over its count. `cause` is what the first
-    /// traced message in it carried: no handler ran that message, so its drop becomes its span, of zero length and
-    /// failed with the letter's reason, or its trace would show nothing where it ended. `cause`, when given, also sets
-    /// `trace`; with `None` the letter keeps the trace it carries.
+    /// traced message in it carried: no handler ran that message, so its drop becomes its span, of zero length, failed
+    /// with `dead_letter` and the letter's reason as its `reason` attribute, or its trace would show nothing where it
+    /// ended. `cause`, when given, also sets `trace`; with `None` the letter keeps the trace it carries.
     pub fn record(&self, mut letter: DeadLetter, cause: Option<TraceContext>) {
         if let Some(cause) = cause {
             let mut span = Span::begin(cause, cause.child().span, SpanKind::Handle, letter.label);
-            (span.actor, span.peer, span.error) = (letter.actor, letter.peer.clone(), Some(letter.reason));
+            (span.actor, span.peer, span.error) = (letter.actor, letter.peer.clone(), Some("dead_letter"));
+            span.attrs = Some([("reason", Attr::from(letter.reason))].into());
             self.tracer.record(span);
             letter.trace = Some(cause.trace);
         }

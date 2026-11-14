@@ -34,7 +34,7 @@ pub struct SpanRecord {
     /// What it failed with ([`axon::Span::error`]), or empty.
     #[serde(default)]
     pub error: String,
-    /// An `app` span's attributes.
+    /// An `app` span's attributes, and a dropped message's `reason`.
     #[serde(default)]
     pub attrs: BTreeMap<String, String>,
 }
