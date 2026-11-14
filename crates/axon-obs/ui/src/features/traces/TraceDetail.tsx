@@ -13,7 +13,25 @@ import { endedUs, layoutTrace, nodeHue, place, spanTitle } from "../../model/tra
 import { nodePath } from "../select";
 import { Flag, NodeName } from "../../components/Flag";
 
-const KIND = { handle: "Handled", call: "Call", stream: "Stream batch" } as const;
+/** Per kind of span: its name, what its name field is called, and the title and text of its busy bar's tooltip. */
+const KINDS: Record<SpanRecord["kind"], { label: string; field: string; busy: (s: SpanRecord) => string; what: (s: SpanRecord) => string }> = {
+  handle: { label: "Handled", field: "Message", busy: () => "Handler time", what: (s) => `${s.name || "message"} · ${s.actor_name || shortType(s.actor_type)}` },
+  call: { label: "Call", field: "Call", busy: (s) => (s.name === "request" ? "Until answered" : "Send"), what: (s) => `${s.node_id} → ${s.peer}` },
+  stream: { label: "Stream batch", field: "Stream", busy: (s) => (s.peer ? "Batch taken" : "Publish"), what: (s) => (s.peer ? `${s.peer} → ${s.node_id}` : s.name) },
+  app: { label: "Application step", field: "Step", busy: () => "Step time", what: (s) => s.name },
+};
+
+/** A kind a newer node sends is drawn as a handled message. */
+const kindOf = (span: SpanRecord) => KINDS[span.kind] ?? KINDS.handle;
+
+/** What became of the span: a handler's own failure, or the kind of error that ended it. */
+function outcome(span: SpanRecord): string {
+  if (!span.failed) return "Completed";
+  if (span.kind === "handle" && span.error === "panic") return "The handler panicked and the actor stopped";
+  if (span.kind === "handle" && (!span.error || span.error === "error")) return "The handler failed and the actor stopped";
+  if (span.kind === "handle") return `Dropped before a handler ran it: ${span.error}`;
+  return `${span.kind === "call" ? "The call failed" : "Failed"}${span.error ? `: ${span.error}` : ""}`;
+}
 
 /** Nodes keep their colour across the waterfall. */
 const nodeColour = (index: number) => `hsl(${nodeHue(index)} 52% 56%)`;
@@ -220,12 +238,11 @@ function WaitTip({ span, totalUs }: { span: SpanRecord; totalUs: number }) {
 }
 
 function BusyTip({ span, totalUs, offsetUs }: { span: SpanRecord; totalUs: number; offsetUs: number }) {
-  const what =
-    span.kind === "call" ? `${span.node_id} → ${span.peer}` : span.kind === "stream" ? (span.peer ? `${span.peer} → ${span.node_id}` : span.name) : `${span.name || "message"} · ${span.actor_name || shortType(span.actor_type)}`;
+  const kind = kindOf(span);
   return (
-    <Tip title={span.kind === "call" ? (span.name === "request" ? "Until answered" : "Send") : span.kind === "stream" ? (span.peer ? "Batch taken" : "Publish") : "Handler time"} ns={span.busy_ns} totalUs={totalUs}>
-      {what}
-      {span.failed ? " · failed" : ""} · at +{duration(offsetUs * 1000)}
+    <Tip title={kind.busy(span)} ns={span.busy_ns} totalUs={totalUs}>
+      {kind.what(span)}
+      {span.failed ? ` · failed${span.error ? ` (${span.error})` : ""}` : ""} · at +{duration(offsetUs * 1000)}
     </Tip>
   );
 }
@@ -246,8 +263,8 @@ function Guides({ guides, spacer = false }: { guides: boolean[]; spacer?: boolea
 function SpanFacts({ span, gapUs, offsetUs }: { span: SpanRecord; gapUs: number; offsetUs: number }) {
   return (
     <dl className="flex flex-wrap gap-x-6 gap-y-1 bg-raised px-3 pt-1 pb-2 pl-[30px] text-[11px]">
-      <Field label="Kind">{KIND[span.kind] ?? span.kind}</Field>
-      <Field label={span.kind === "stream" ? "Stream" : span.kind === "call" ? "Call" : "Message"}>{span.name || "—"}</Field>
+      <Field label="Kind">{KINDS[span.kind]?.label ?? span.kind}</Field>
+      <Field label={kindOf(span).field}>{span.name || "—"}</Field>
       <Field label="Node">
         <NodeName id={span.node_id} className="underline decoration-border underline-offset-2" />
       </Field>
@@ -268,7 +285,12 @@ function SpanFacts({ span, gapUs, offsetUs }: { span: SpanRecord; gapUs: number;
       {span.kind === "handle" && <Field label="In mailbox">{duration(span.wait_ns)}</Field>}
       <Field label={span.kind === "call" ? "Until answered" : "Took"}>{duration(span.busy_ns)}</Field>
       <Field label="Ends at">+{duration((endedUs(span) - span.start_us + offsetUs) * 1000)}</Field>
-      <Field label="Outcome">{span.failed ? (span.kind === "call" ? "The call failed" : "The handler failed and the actor stopped") : "Completed"}</Field>
+      <Field label="Outcome">{outcome(span)}</Field>
+      {Object.entries(span.attrs ?? {}).map(([key, value]) => (
+        <Field key={key} label={key}>
+          {value}
+        </Field>
+      ))}
       <Field label="Span">{span.span}</Field>
     </dl>
   );

@@ -546,7 +546,7 @@ impl DiskStore {
         &mut self,
         key: &StreamKey,
         records: Vec<Payload>,
-        trace: Option<(u64, u64)>,
+        trace: Option<axon::TraceContext>,
         admit: impl FnOnce(&[Payload], Option<usize>) -> Result<(), StreamError>,
     ) -> Result<Cursor, PublishError<Vec<Payload>>> {
         let bytes = frame_len(&records);

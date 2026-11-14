@@ -2,11 +2,11 @@
 
 A trace is one id that follows a piece of work through every actor, node and stream hop it touches. Each hop leaves a
 span; the dashboard draws them as a waterfall. Nothing is traced unless a trace was started, and an untraced
-message costs one thread-local read at admission and 16 bytes in its mailbox entry.
+message costs one thread-local read at admission and 32 bytes in its mailbox entry.
 
 ## Context
 
-`TraceContext { trace, span }` is ambient. While an actor handles a traced message the context is the worker thread's
+`TraceContext { trace, span, flags }` is ambient. While an actor handles a traced message the context is the worker thread's
 current one, so everything the handler does is caused by that span without the handler saying so:
 
 | From a traced handler | What carries the trace |
@@ -14,21 +14,34 @@ current one, so everything the handler does is caused by that span without the h
 | `tell` / `send` / `ask`, any mailbox admission | the mailbox entry |
 | `schedule_at` / `schedule_after` | the timer's message (a repeating timer starts clean) |
 | `submit_io` / `submit_future` | the job while it runs, and its completion message |
-| `RemoteRef::tell` / `send` / `request`, `Cluster::request` | the frame: kind bit `0x8000` and 16 bytes ahead of the body; an untraced call is byte for byte what it was, and a body within 16 bytes of the peer's `max_frame` is sent untraced rather than refused |
+| `RemoteRef::tell` / `send` / `request`, `Cluster::request` | the frame: kind bit `0x8000` and 25 bytes ahead of the body; an untraced call is byte for byte what it was, and a body within 25 bytes of the peer's `max_frame` is sent untraced rather than refused |
 | `StreamNode::publish` | the batch, on every live hop to every subscriber; a batch replayed from history has none |
 
 Outside an actor the application says where a trace starts and what belongs to it:
 
 ```rust,ignore
 let trace = TraceContext::root();
-trace.scope(async { orders.ask(Order::place).await }).await;   // across awaits, on any thread
+trace.scope(async { uploads.ask(Upload::Store).await }).await;   // across awaits, on any thread
 trace.enter(|| streams.publish(&key, records));                // synchronous code
-if let Some(trace) = batch.trace_context() { trace.enter(|| handle(batch)) }   // a stream subscriber
+if let Some(trace) = batch.trace() { trace.enter(|| handle(batch)) }           // a stream subscriber
 ```
 
 `ActorSystem::builder().tracing(spans, sample_every)`: the system keeps the newest `spans` spans (4096) in a ring.
 With `sample_every = N`, one in N messages that arrive with no trace starts one, per mailbox; 0, the default, leaves
-starting traces to `TraceContext::root`. Ids are random 64-bit numbers, 16 hex digits on the wire to the browser.
+starting traces to `TraceContext::root`.
+
+The context is a W3C `traceparent`'s: a 128-bit `TraceId`, a 64-bit span id and a flags byte, 25 bytes on the wire in
+that order, big-endian. `root()` draws a random trace id and sets the sampled flag (`TraceContext::SAMPLED`); a child
+keeps its parent's trace and flags. A trace id reads as 32 hex digits, a span id as 16. To join a trace started
+outside axon, `TraceContext::from_traceparent(header)` reads the header an HTTP request came with, refusing one that is
+malformed or has a zero id, and `traceparent()` writes it back for the next service. Write it from inside a handler,
+where `TraceContext::current()` names the span that runs: a root's span is 0, which W3C refuses, so a header written
+from `root()` itself starts a new trace at the next service.
+
+```rust,ignore
+let trace = TraceContext::from_traceparent(header).unwrap_or_else(TraceContext::root);
+trace.scope(async { jobs.ask(Job::run).await }).await;   // the spans keep the caller's trace id and flags
+```
 
 A trace started by hand, then read back from the node's ring:
 
@@ -59,7 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     root.scope(async { worker.send("checkout").await }).await?;
 
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let spans = system.tracer().trace(root.trace.get());
+    let spans = system.tracer().trace(root.trace);
     assert_eq!(spans[0].name, "checkout");
     println!("waited {:?}, ran {:?}", spans[0].wait, spans[0].busy);
 
@@ -75,7 +88,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 | `handle` | the node whose actor handled the message, or that dropped it unrun ([dead letters](observability.md#dead-letters)) | `Actor::label`; `tell` for a tell the node refused | `wait` in the mailbox, `busy` in the handler; `failed` when the handler returned an error or panicked, and for a drop, which has zero length |
 | `call` | the calling node | `tell`, `send` or `request`, with the peer | `busy` until the outbox took it (`tell`) or the answer came; `failed` on any `CallError` |
 | `stream` | the origin when it publishes, then every node the batch reaches over the wire | the stream key; the parent it came from, none at the origin | `busy` publishing, or handling the push |
+| `app` | the application, with `Tracer::app` | the name it gave | `busy` from `app` until it is dropped |
 
+A failed span says why in `error`, a short kind, `None` when it succeeded:
+
+| Span | `error` |
+|---|---|
+| a handler | `error` when it returned an error, `panic` when it panicked |
+| a dropped message | the dead letter's reason, such as `actor_stopped` |
+| a call | `CallError::kind`: `timeout`, `outcome_unknown`, `no_route`, `unreachable`, `stale_node`, `closed`, `busy`, `no_reply`, `codec`, `rejected.<name>` for the endpoint's `Rejection`, `not_sent.<reason>` when the session refused to send it |
+| a publish | the `StreamError`'s name, such as `quota_exceeded` |
+| an app span | what the application passed to `AppSpan::error` |
+
+An app span is a step inside a handler, or inside a `scope`, that the application wants on the waterfall with a few
+attributes. `Tracer::app(name)` is `None` outside a trace, so an untraced message pays nothing for it. What the
+closure given to `AppSpan::enter` sends is the step's child, and the span records itself when it is dropped:
+
+```rust,ignore
+// `self.tracer` is `system.tracer().clone()`, given to the actor when it was spawned.
+fn on_message(&mut self, batch: Batch, _cx: &mut Context<'_, Self>) -> Result<(), Error> {
+    let mut step = self.tracer.app("resize");
+    if let Some(step) = &mut step {
+        step.attr("items", batch.len() as u64).attr("format", batch.format());
+    }
+    let resized = self.resize(&batch);
+    match &mut step {
+        Some(step) => step.enter(|| self.store.tell(resized)),   // the store's span is the step's child
+        None => self.store.tell(resized),
+    }?;
+    Ok(())
+}
+```
+
+An attribute is a `u64`, an `i64` or a string; a span without any allocates nothing for them.
 `start_us` is the recording node's wall clock, so spans from different nodes line up only as well as their clocks do.
 
 ## Collection
@@ -87,8 +132,15 @@ span may be written twice, so a sink keeps one per `(trace, span)`. `MemoryMetri
 ClickHouse keeps `spans` (`ReplacingMergeTree`, ordered by `(trace, span)`, partitioned by day, TTL
 `retention_days`). `Capabilities::traces` says whether a provider answers `MetricsQuery::traces` and `trace`: where
 it is false, the collector refuses `Traces` and `Trace` without asking it, and the console asks the nodes alone.
-A span the ring dropped before a collection cycle reached it is lost: size the ring for the traced rate.
-`trace.spans` counts what a node recorded.
+A reader takes at most `Tracer::PAGE` (256) spans a hold of the ring's lock, and one that wants more takes it again
+from the last `seq` it got. The ring keeps its spans in segments of 32 that a reader clones under the lock and copies
+after it, so a hold is a few `Arc` clones, under a microsecond, however big the ring.
+
+A span the ring let go of before a collection cycle reached it is lost: size the ring for the traced rate. The
+collector counts the loss in `MetricsHealth::dropped_spans` (`collector.dropped_spans`), from `SpanPage::missed`, the
+spans between its cursor and the oldest one the node still held. `trace.spans` counts what a node recorded and
+`trace.spans_evicted` what its ring let go of, collected or not. An exporter that drains with `Tracer::since(after, n)`
+counts its own gap as `first.seq - after - 1`.
 
 ## Dashboard
 
@@ -109,9 +161,9 @@ sees axon's work there. Two things are emitted, both at `DEBUG` with target `axo
 the usual `INFO` needs a directive such as `RUST_LOG=axon::trace=debug`, and a `tracing` `max_level_*` feature above
 `debug` compiles them out:
 
-- Every span a tracer records, handle, call or stream, is an event with the span's `trace`, `span` and `parent` ids
-  (16 hex digits, as the dashboard shows them), `name`, `actor`, `peer`, `start_us`, `wait_us`, `busy_us` and
-  `failed`; its message is the kind. The event goes out when the span is recorded, before the ring, so a system
+- Every span a tracer records, handle, call, stream or app, is an event with the span's `trace` (32 hex digits),
+  `span` and `parent` ids (16), as the dashboard shows them, `name`, `actor`, `peer`, `start_us`, `wait_us`, `busy_us`
+  and, for a failed span, `error`; its message is the kind. The event goes out when the span is recorded, before the ring, so a system
   built with `ActorSystem::builder().tracing(0, n)` keeps no ring and still emits them. Its `tracing` parent is the
   span current where it is recorded: the caller's for a call or a publish, none for a handler or a stream batch
   taken from a peer. A line-per-event layer such as `fmt` or JSON shows every event; a span-based exporter such as
@@ -165,39 +217,39 @@ impl Subscriber for Lines {
     fn exit(&self, _: &Id) {}
 }
 
-enum Order {
-    Place(ReplyTo<()>),
+enum Upload {
+    Store(ReplyTo<()>),
 }
 
-struct Orders(ActorHandle<u64>);
+struct Uploads(ActorHandle<u64>);
 
-impl Actor for Orders {
-    type Message = Order;
+impl Actor for Uploads {
+    type Message = Upload;
     type Error = &'static str;
 
-    fn on_message(&mut self, Order::Place(reply): Order, _cx: &mut Context<'_, Self>) -> Result<(), Self::Error> {
-        self.0.tell(42u64).map_err(|_| "payments is full")?;
+    fn on_message(&mut self, Upload::Store(reply): Upload, _cx: &mut Context<'_, Self>) -> Result<(), Self::Error> {
+        self.0.tell(42u64).map_err(|_| "thumbnails is full")?;
         let _ = reply.reply(());
         Ok(())
     }
 
-    fn label(_: &Order) -> &'static str {
-        "place"
+    fn label(_: &Upload) -> &'static str {
+        "store"
     }
 }
 
-struct Payments;
+struct Thumbnails;
 
-impl Actor for Payments {
+impl Actor for Thumbnails {
     type Message = u64;
     type Error = ();
 
-    fn on_message(&mut self, _amount: u64, _cx: &mut Context<'_, Self>) -> Result<(), ()> {
+    fn on_message(&mut self, _size: u64, _cx: &mut Context<'_, Self>) -> Result<(), ()> {
         Ok(())
     }
 
     fn label(_: &u64) -> &'static str {
-        "charge"
+        "resize"
     }
 }
 
@@ -205,12 +257,12 @@ impl Actor for Payments {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::subscriber::set_global_default(Lines)?;
     let system = ActorSystem::builder().build()?;
-    let payments = system.spawn(Payments).start()?;
-    let orders = system.spawn(Orders(payments)).start()?;
+    let thumbnails = system.spawn(Thumbnails).start()?;
+    let uploads = system.spawn(Uploads(thumbnails)).start()?;
 
     let request = tracing::info_span!("request");
     let trace = request.in_scope(TraceContext::root);
-    trace.scope(orders.ask(Order::Place)).await?;
+    trace.scope(uploads.ask(Upload::Store)).await?;
     system.shutdown().await?;
 
     let lines = LINES.lock().expect("not poisoned");
@@ -222,10 +274,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-It prints the start, then the two handle spans; `charge`'s `parent` is `place`'s `span`:
+It prints the start, then the two handle spans; `resize`'s `parent` is `store`'s `span`:
 
 ```text
-axon::trace message=trace started trace=46e0d1b1578c25a4
-axon::trace message=Handle trace=46e0d1b1578c25a4 span=9db34d60fdcf3e8e parent=0000000000000000 name=place actor="tracing::Orders" start_us=1790413949126765 wait_us=5 busy_us=6 failed=false
-axon::trace message=Handle trace=46e0d1b1578c25a4 span=2d0e3c292eccc373 parent=9db34d60fdcf3e8e name=charge actor="tracing::Payments" start_us=1790413949126784 wait_us=17 busy_us=0 failed=false
+axon::trace message=trace started trace=46e0d1b1578c25a4c1f0e5a2b7d3986e
+axon::trace message=Handle trace=46e0d1b1578c25a4c1f0e5a2b7d3986e span=9db34d60fdcf3e8e parent=0000000000000000 name=store actor="tracing::Uploads" start_us=1790413949126765 wait_us=5 busy_us=6
+axon::trace message=Handle trace=46e0d1b1578c25a4c1f0e5a2b7d3986e span=2d0e3c292eccc373 parent=9db34d60fdcf3e8e name=resize actor="tracing::Thumbnails" start_us=1790413949126784 wait_us=17 busy_us=0
 ```

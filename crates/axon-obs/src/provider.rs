@@ -8,7 +8,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize, Serializer};
 
 use crate::model::{HELD_MS, SampleBatch, Str, Value, check};
-use crate::traces::{DeadLetterRecord, SpanRecord, TraceQuery, TraceSummary, hex, summarize};
+use crate::traces::{DeadLetterRecord, SpanRecord, TraceQuery, TraceSummary, stored_ids, summarize};
 
 pub type MetricsFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, String>> + Send + 'a>>;
 
@@ -131,7 +131,8 @@ pub trait MetricsQuery: Send + Sync + 'static {
     fn traces(&self, _query: &TraceQuery) -> MetricsFuture<'_, Vec<TraceSummary>> {
         Box::pin(std::future::ready(Err(NO_TRACES.into())))
     }
-    fn trace(&self, _trace: u64) -> MetricsFuture<'_, Vec<SpanRecord>> {
+    /// Its spans, stored under either of [`stored_ids`].
+    fn trace(&self, _trace: axon::TraceId) -> MetricsFuture<'_, Vec<SpanRecord>> {
         Box::pin(std::future::ready(Err(NO_TRACES.into())))
     }
     /// Newest first.
@@ -948,9 +949,9 @@ impl MetricsQuery for MemoryMetrics {
         Box::pin(std::future::ready(Ok(letters)))
     }
 
-    fn trace(&self, trace: u64) -> MetricsFuture<'_, Vec<SpanRecord>> {
-        let id = hex(trace);
-        let spans = self.stored.lock().spans.iter().filter(|s| s.trace == id).cloned().collect();
+    fn trace(&self, trace: axon::TraceId) -> MetricsFuture<'_, Vec<SpanRecord>> {
+        let ids = stored_ids(trace);
+        let spans = self.stored.lock().spans.iter().filter(|s| ids.contains(&s.trace)).cloned().collect();
         Box::pin(std::future::ready(Ok(spans)))
     }
 }

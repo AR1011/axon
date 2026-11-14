@@ -8,7 +8,7 @@ use std::time::Duration;
 use parking_lot::Mutex;
 
 use crate::clock::Clock;
-use crate::trace::{Span, SpanKind, TraceContext, Tracer, unix_micros};
+use crate::trace::{Span, SpanKind, TraceContext, TraceId, Tracer, unix_micros};
 use crate::types::{ActorIncarnation, Exit, RejectReason, StopReason};
 
 const CAPACITY: usize = 1024;
@@ -31,8 +31,8 @@ pub struct DeadLetter {
     pub target: Option<Arc<str>>,
     /// The node that sent it, when it came from another node.
     pub peer: Option<Arc<str>>,
-    /// The first trace among the coalesced messages; 0 for none.
-    pub trace: u64,
+    /// The first trace among the coalesced messages.
+    pub trace: Option<TraceId>,
     pub count: u64,
 }
 
@@ -51,7 +51,7 @@ fn letter(
     target: Option<Arc<str>>,
     count: u64,
 ) -> DeadLetter {
-    DeadLetter { seq: 0, at_us: unix_micros(), reason, label, actor, target, peer: None, trace: 0, count }
+    DeadLetter { seq: 0, at_us: unix_micros(), reason, label, actor, target, peer: None, trace: None, count }
 }
 
 #[derive(Default)]
@@ -113,15 +113,15 @@ impl DeadLetters {
     }
 
     /// A repeat of a recent letter within a second of its last sighting takes over its count. `cause` is what the first
-    /// traced message in it carried: no handler ran that message, so its drop becomes its span, failed and of zero
-    /// length, or its trace would show nothing where it ended. `cause`, when given, also sets `trace`; with `None` the
-    /// letter keeps the trace it carries.
+    /// traced message in it carried: no handler ran that message, so its drop becomes its span, of zero length and
+    /// failed with the letter's reason, or its trace would show nothing where it ended. `cause`, when given, also sets
+    /// `trace`; with `None` the letter keeps the trace it carries.
     pub fn record(&self, mut letter: DeadLetter, cause: Option<TraceContext>) {
         if let Some(cause) = cause {
             let mut span = Span::begin(cause, cause.child().span, SpanKind::Handle, letter.label);
-            (span.actor, span.peer, span.failed) = (letter.actor, letter.peer.clone(), true);
+            (span.actor, span.peer, span.error) = (letter.actor, letter.peer.clone(), Some(letter.reason));
             self.tracer.record(span);
-            letter.trace = cause.trace.get();
+            letter.trace = Some(cause.trace);
         }
         let now = self.clock.now();
         let mut ring = self.ring.lock();
@@ -137,7 +137,7 @@ impl DeadLetters {
         if let Some((was, _, old)) = found.and_then(|back| letters.remove(letters.len() - 1 - back)) {
             first = was;
             letter.count += old.count;
-            letter.trace = if old.trace != 0 { old.trace } else { letter.trace };
+            letter.trace = old.trace.or(letter.trace);
         }
         *next += 1;
         letter.seq = *next;
@@ -178,7 +178,7 @@ mod tests {
             actor: None,
             target: None,
             peer: None,
-            trace: 0,
+            trace: None,
             count: 1,
         };
         let manual = Clock::manual();

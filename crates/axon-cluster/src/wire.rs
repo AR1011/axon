@@ -182,10 +182,12 @@ mod tests {
     /// guards: a node that does not know a bit of `kind` closes the session, so a new bit is a breaking change.
     #[test]
     fn call_frame_bytes_are_pinned() {
-        let trace = TraceContext::from_bytes([0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 9]);
+        let mut context = [0; TraceContext::WIRE_LEN];
+        (context[0], context[15], context[23], context[24]) = (0x4b, 7, 9, 1);
+        let trace = TraceContext::from_bytes(context);
         let body = Bytes::from_static(b"hi");
         let (kind, both) = stamp(REQUEST, trace, Some(Duration::from_micros(1500)), None, body.clone());
-        let mut pinned = vec![0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 9];
+        let mut pinned = vec![0x4b, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 9, 1];
         pinned.extend([0, 0, 0, 0, 0, 0, 0x05, 0xdc, b'h', b'i']);
         assert_eq!((kind, &both[..]), (0xc003, &pinned[..]));
         let (kind, left) = stamp(REQUEST, None, Some(Duration::from_millis(2)), None, body.clone());
@@ -194,7 +196,7 @@ mod tests {
         let (kind, window) = stamp(REQUEST, None, None, Some(4 << 20), body.clone());
         assert_eq!((kind, &window[..]), (0x2003, &[0, 0x40, 0, 0, b'h', b'i'][..]));
         let (kind, all) = stamp(REQUEST, trace, Some(Duration::from_micros(1500)), Some(4 << 20), body);
-        pinned.splice(24..24, [0, 0x40, 0, 0]);
+        pinned.splice(33..33, [0, 0x40, 0, 0]);
         assert_eq!((kind, &all[..]), (0xe003, &pinned[..]));
         assert_eq!((PART, CREDIT), (6, 7));
         let (kind, upload) = stamp(REQUEST | BODY, None, None, Some(4 << 20), Bytes::from_static(b"hi"));

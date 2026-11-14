@@ -82,7 +82,7 @@ async fn a_trace_follows_tells_timers_and_jobs_and_nothing_else_is_recorded() {
     assert_eq!(TraceContext::current(), None);
     worker.join().await;
 
-    let spans = system.tracer().trace(root.trace.get());
+    let spans = system.tracer().trace(root.trace);
     assert_eq!(system.tracer().recorded(), spans.len() as u64, "the untraced message left no span");
     let named = |name: &str| spans.iter().find(|s| s.name == name).unwrap_or_else(|| panic!("no span {name}"));
     let (go, later, fetched, fail) = (named("go"), named("later"), named("fetched"), named("fail"));
@@ -90,7 +90,7 @@ async fn a_trace_follows_tells_timers_and_jobs_and_nothing_else_is_recorded() {
     assert_eq!(go.parent, 0);
     assert_eq!((later.parent, fetched.parent), (go.span, later.span));
     assert_eq!(fail.parent, fetched.span);
-    assert!(fail.failed && !go.failed);
+    assert_eq!((fail.error, go.error), (Some("error"), None));
     let work: Vec<u64> = spans.iter().filter(|s| s.name == "work").map(|s| s.parent).collect();
     assert!(work.contains(&go.span) && work.contains(&later.span), "{work:?}");
     assert_eq!(go.actor.unwrap().0, router.address.incarnation());
@@ -135,7 +135,7 @@ async fn an_attached_source_does_not_join_the_trace_that_attached_it() {
     }
     drop(tx);
     sink.join().await;
-    let names: Vec<_> = system.tracer().trace(root.trace.get()).iter().map(|s| s.name.to_string()).collect();
+    let names: Vec<_> = system.tracer().trace(root.trace).iter().map(|s| s.name.to_string()).collect();
     assert_eq!(names, ["attach".to_string()], "the items were handled outside the trace");
 }
 
@@ -226,9 +226,204 @@ fn a_wall_step_back_inside_a_trace_keeps_its_order_parents_and_durations() {
     let names: Vec<_> = spans.iter().map(|s| s.name.as_ref()).collect();
     assert_eq!(names, ["back", "after"], "in the order they ran");
     let (back, after) = (&spans[0], &spans[1]);
-    assert_eq!((back.trace, after.trace, after.parent), (root.trace.get(), root.trace.get(), back.span));
+    assert_eq!((back.trace, after.trace, after.parent), (root.trace, root.trace, back.span));
     assert_eq!(back.busy, Duration::from_millis(5), "a duration is read on the actor clock");
     assert!(after.start_us < back.start_us, "a start is the wall's, which stepped back");
+}
+
+/// The label and context of each message a [`Witness`] handled.
+type Witnessed = Arc<parking_lot::Mutex<Vec<(&'static str, Option<TraceContext>)>>>;
+
+/// Keeps the label and context of each message it handles.
+struct Witness(Witnessed);
+
+impl Actor for Witness {
+    type Message = Back;
+    type Error = ();
+
+    fn on_message(&mut self, msg: Back, _: &mut Context<'_, Self>) -> Result<(), ()> {
+        self.0.lock().push((Self::label(&msg), TraceContext::current()));
+        Ok(())
+    }
+
+    fn label(msg: &Back) -> &'static str {
+        Worker::label(msg)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_context_from_outside_keeps_its_id_and_flags_through_tells_timers_and_jobs() {
+    let system = ActorSystem::builder().build().unwrap();
+    let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let witness = system.spawn(Witness(seen.clone())).start().unwrap();
+    let router = system.spawn(Router(witness.clone())).start().unwrap();
+    let id = TraceId::new(0x4bf9_2f35_77b3_4da6_a3ce_929d_0e0e_4736).unwrap();
+    let outside = TraceContext::new(id, 0x00f0_67aa_0ba9_02b7, 0);
+
+    outside.scope(async { router.send(Front::Go).await.unwrap() }).await;
+    for _ in 0..250 {
+        if seen.lock().len() == 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Go tells, Later is a timer's and tells, Fetched is a job's completion and tells.
+    let seen = seen.lock().clone();
+    assert_eq!(seen.iter().map(|(label, _)| *label).collect::<Vec<_>>(), ["work", "work", "fail"]);
+    assert!(seen.iter().all(|(_, c)| c.is_some_and(|c| (c.trace, c.flags) == (id, 0))), "{seen:?}");
+    let spans = system.tracer().trace(id);
+    assert_eq!(spans.len(), 6, "every hop is in the trace begun outside: {spans:?}");
+    let go = spans.iter().find(|s| s.name == "go").unwrap();
+    assert_eq!(go.parent, outside.span, "the first span's parent is the one from outside");
+    assert_eq!(TraceContext::root().flags, TraceContext::SAMPLED);
+}
+
+#[test]
+fn traceparent_text_round_trips_and_a_malformed_one_is_refused() {
+    let text = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+    let parsed = TraceContext::from_traceparent(text).unwrap();
+    assert_eq!(parsed.trace.get(), 0x4bf9_2f35_77b3_4da6_a3ce_929d_0e0e_4736);
+    assert_eq!((parsed.span, parsed.flags), (0x00f0_67aa_0ba9_02b7, 1));
+    assert_eq!(parsed.traceparent(), text);
+    assert_eq!(parsed.trace.to_string(), "4bf92f3577b34da6a3ce929d0e0e4736");
+    let child = parsed.child();
+    assert_eq!((child.trace, child.flags), (parsed.trace, parsed.flags));
+    assert_eq!(TraceContext::from_traceparent(&child.traceparent()), Some(child));
+
+    // A later version may add fields after a dash; the four it shares with 00 are read as 00's.
+    let later = "cc-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-what-comes-next";
+    assert_eq!(TraceContext::from_traceparent(later), Some(parsed));
+    for bad in [
+        "",
+        "00-4BF92F3577B34DA6A3CE929D0E0E4736-00f067aa0ba902b7-01",
+        "00-00000000000000000000000000000000-00f067aa0ba902b7-01",
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01",
+        "ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-",
+        "cc-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01x",
+        "00-4bf92f3577b34da6a3ce929d0e0e473-600f067aa0ba902b7-01",
+        "00_4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-0g",
+        "00-4bf92f3577b34da6a3ce929d0e0e47é-00f067aa0ba902b7-01",
+    ] {
+        assert_eq!(TraceContext::from_traceparent(bad), None, "{bad}");
+    }
+
+    // On the wire: the same fields, big-endian, in the same order.
+    let mut wire = 0x4bf9_2f35_77b3_4da6_a3ce_929d_0e0e_4736_u128.to_be_bytes().to_vec();
+    wire.extend(0x00f0_67aa_0ba9_02b7_u64.to_be_bytes());
+    wire.push(1);
+    assert_eq!(parsed.to_bytes()[..], wire[..]);
+    assert_eq!(TraceContext::from_bytes(parsed.to_bytes()), Some(parsed));
+    assert_eq!(TraceContext::from_bytes([0; TraceContext::WIRE_LEN]), None, "a trace id is never 0");
+}
+
+enum Step2 {
+    Go,
+}
+
+/// Records a step of its own around the tell it makes.
+struct Stepping(Arc<Tracer>, ActorHandle<Back>);
+
+impl Actor for Stepping {
+    type Message = Step2;
+    type Error = ();
+
+    fn on_message(&mut self, Step2::Go: Step2, _: &mut Context<'_, Self>) -> Result<(), ()> {
+        let mut step = self.0.app("resize").expect("handled inside a trace");
+        step.attr("items", 3u64).attr("delta", -2i64).attr("region", "west").attr("note", format!("n{}", 7));
+        step.enter(|| self.1.tell(Back::Work)).map_err(drop)?;
+        step.error("stale_input");
+        Ok(())
+    }
+
+    fn label(_: &Step2) -> &'static str {
+        "go"
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_app_span_records_its_attributes_and_parents_what_it_sends() {
+    let system = ActorSystem::builder().build().unwrap();
+    let worker = system.spawn(Worker).start().unwrap();
+    let stepping = system.spawn(Stepping(system.tracer().clone(), worker.clone())).start().unwrap();
+    let root = TraceContext::root();
+    root.scope(async { stepping.send(Step2::Go).await.unwrap() }).await;
+    for _ in 0..250 {
+        if system.tracer().trace(root.trace).len() == 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let spans = system.tracer().trace(root.trace);
+    let named = |name: &str| spans.iter().find(|s| s.name == name).unwrap_or_else(|| panic!("no {name}: {spans:?}"));
+    let (go, resize, work) = (named("go"), named("resize"), named("work"));
+    assert_eq!((resize.kind, resize.parent, work.parent), (SpanKind::App, go.span, resize.span));
+    let attrs: Vec<_> = resize.attrs.as_deref().unwrap_or_default().iter().map(|(k, v)| (*k, v.to_string())).collect();
+    assert_eq!(
+        attrs,
+        [("items", "3"), ("delta", "-2"), ("region", "west"), ("note", "n7")].map(|(k, v)| (k, v.into()))
+    );
+    assert_eq!(resize.attrs.as_deref().unwrap_or_default()[0].1, Attr::U64(3));
+    assert_eq!((resize.error, go.error), (Some("stale_input"), None));
+    assert!(go.attrs.is_none(), "axon's own spans have no attributes");
+}
+
+#[test]
+fn an_app_span_outside_a_trace_is_none_and_records_nothing() {
+    let tracer = Tracer::new(16, 0);
+    assert!(tracer.app("step").is_none());
+    assert_eq!(tracer.recorded(), 0);
+    let root = TraceContext::root();
+    let step = root.enter(|| tracer.app("step")).expect("inside a trace");
+    assert_eq!(tracer.recorded(), 0, "recorded when dropped, not before");
+    drop(step);
+    let spans = tracer.since(0, 16);
+    assert_eq!((spans.len(), spans[0].kind, spans[0].trace, spans[0].parent), (1, SpanKind::App, root.trace, 0));
+}
+
+#[test]
+fn reading_the_whole_ring_holds_its_lock_for_one_page_at_most() {
+    const SPANS: usize = 65_536;
+    let tracer = Tracer::new(SPANS, 0);
+    let (one, other) = (TraceContext::root(), TraceContext::root());
+    for i in 0..SPANS + 10 {
+        let parent = if i % 1000 == 0 { one } else { other };
+        tracer.record(Span::begin(parent, i as u64 + 1, SpanKind::Handle, "work"));
+    }
+    assert_eq!(tracer.evicted(), 10);
+    // What `Request::Traces` asks for.
+    let all = tracer.since(0, usize::MAX);
+    assert_eq!((all.len(), all[0].seq, all[SPANS - 1].seq), (SPANS, 11, SPANS as u64 + 10));
+    assert!(all.windows(2).all(|w| w[1].seq == w[0].seq + 1), "no span is skipped or repeated between pages");
+    assert_eq!(tracer.trace(one.trace).len(), 65, "every thousandth, but the first, which the ring let go");
+    assert_eq!(tracer.since(SPANS as u64, 1000).len(), 10);
+    assert_eq!(tracer.most_held(), Tracer::PAGE);
+}
+
+#[test]
+fn a_ring_of_any_capacity_keeps_exactly_its_newest_spans_from_any_position() {
+    let seqs = |spans: Vec<Span>| spans.iter().map(|s| s.seq).collect::<Vec<_>>();
+    for capacity in [1, 5, 31, 32, 33, 100, 300] {
+        let tracer = Tracer::new(capacity, 0);
+        let root = TraceContext::root();
+        for recorded in 1..=700u64 {
+            tracer.record(Span::begin(root, recorded, SpanKind::Handle, "work"));
+            let oldest = recorded.saturating_sub(capacity as u64) + 1;
+            assert_eq!(tracer.evicted(), oldest - 1, "capacity {capacity} after {recorded}");
+            for after in [0, oldest - 1, oldest, (oldest + recorded) / 2, recorded - 1, recorded] {
+                let want: Vec<u64> = ((after + 1).max(oldest)..=recorded).take(300).collect();
+                assert_eq!(
+                    seqs(tracer.since(after, 300)),
+                    want,
+                    "capacity {capacity}, {recorded} recorded, after {after}"
+                );
+            }
+        }
+        assert_eq!(tracer.trace(root.trace).len(), capacity);
+    }
 }
 
 /// Each `axon::trace` event as its fields, with the `tracing` span it was emitted in.
@@ -285,8 +480,8 @@ mod bridge {
         INSTALL.call_once(|| tracing::subscriber::set_global_default(Capture).unwrap());
     }
 
-    pub fn events(trace: u64) -> Vec<(Option<u64>, Fields)> {
-        let trace = format!("{trace:016x}");
+    pub fn events(trace: axon::TraceId) -> Vec<(Option<u64>, Fields)> {
+        let trace = trace.to_string();
         EVENTS.lock().unwrap().iter().filter(|(_, fields)| fields.get("trace") == Some(&trace)).cloned().collect()
     }
 }
@@ -304,21 +499,21 @@ async fn the_tracing_bridge_sees_each_span_the_ring_holds_and_the_app_span_that_
     root.scope(async { router.send(Front::Go).await.unwrap() }).await;
     worker.join().await;
     for _ in 0..250 {
-        if system.tracer().trace(root.trace.get()).len() == 6 {
+        if system.tracer().trace(root.trace).len() == 6 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
     let hex = |id: u64| format!("{id:016x}");
-    let events = bridge::events(root.trace.get());
+    let events = bridge::events(root.trace);
     let (started, spans): (Vec<_>, Vec<_>) = events.into_iter().partition(|(_, f)| !f.contains_key("span"));
     assert_eq!(started.len(), 1, "{started:?}");
     assert_eq!(started[0].0, request.id().map(|id| id.into_u64()), "logged in the span that started the trace");
 
     let keys = ["span", "parent", "name", "start_us", "wait_us", "busy_us"];
     let mut bridged: Vec<_> = spans.iter().map(|(_, f)| keys.map(|k| f[k].clone())).collect();
-    let ring = system.tracer().trace(root.trace.get());
+    let ring = system.tracer().trace(root.trace);
     let mut ring: Vec<_> = ring
         .iter()
         .map(|s| {
@@ -335,7 +530,7 @@ async fn the_tracing_bridge_sees_each_span_the_ring_holds_and_the_app_span_that_
     let (fetched, fail) = (named("fetched"), named("fail"));
     assert_eq!(fail["parent"], fetched["span"], "the worker's span is a child of the router's");
     assert!(fetched["actor"].contains("Router") && fail["actor"].contains("Worker"));
-    assert_eq!((fetched["message"].as_str(), fail["failed"].as_str()), ("Handle", "true"));
+    assert_eq!((fetched["message"].as_str(), fail["error"].as_str()), ("Handle", "\"error\""));
 }
 
 #[cfg(feature = "tracing")]
@@ -359,7 +554,7 @@ fn a_subscriber_that_panics_loses_its_event_and_nothing_else() {
         fn exit(&self, _: &Id) {}
     }
     let tracer = Tracer::new(8, 0);
-    let parent = TraceContext { trace: std::num::NonZeroU64::MIN, span: 0 };
+    let parent = TraceContext::new(TraceId::new(1).unwrap(), 0, 0);
     tracing::subscriber::with_default(Panics, || {
         tracer.record(Span::begin(parent, 1, SpanKind::Handle, "work"));
         let _started = TraceContext::root();
@@ -371,11 +566,11 @@ fn a_subscriber_that_panics_loses_its_event_and_nothing_else() {
 #[test]
 fn a_tracer_that_keeps_no_ring_still_emits_each_span() {
     let tracer = Tracer::new(0, 0);
-    let parent = TraceContext { trace: std::num::NonZeroU64::new(0xca5e).unwrap(), span: 0 };
+    let parent = TraceContext::new(TraceId::new(0xca5e).unwrap(), 0, 0);
     tracing::subscriber::with_default(bridge::Capture, || {
         tracer.record(Span::begin(parent, 1, SpanKind::Handle, "work"))
     });
-    assert_eq!(bridge::events(0xca5e).len(), 1);
+    assert_eq!(bridge::events(parent.trace).len(), 1);
 }
 
 /// A sampled trace starts at the receiver, under the mailbox's lock: it is not logged in the sender's `tracing` span.

@@ -87,7 +87,7 @@ function Stores() {
         const caps = s.capabilities;
         const problem = collectorProblem(c);
         const facts: [string, string][] = c
-          ? [["cycles", count(c.cycles)], ["last cycle", `${c.last_cycle_duration_ms} ms`], ["stored batches", count(c.stored_batches)], ["stored spans", count(c.stored_spans)], ["rejected batches", count(c.rejected_batches)], ["collection gaps", count(c.collection_gaps)], ["source resets", count(c.source_resets)], ["write errors", count(c.write_errors)], ["dropped events", count(c.dropped_events)], ["pending events", count(c.pending_events)]]
+          ? [["cycles", count(c.cycles)], ["last cycle", `${c.last_cycle_duration_ms} ms`], ["stored batches", count(c.stored_batches)], ["stored spans", count(c.stored_spans)], ["rejected batches", count(c.rejected_batches)], ["collection gaps", count(c.collection_gaps)], ["source resets", count(c.source_resets)], ["write errors", count(c.write_errors)], ["dropped events", count(c.dropped_events)], ["dropped spans", count(c.dropped_spans ?? 0)], ["pending events", count(c.pending_events)]]
           : [];
         const usage = Object.entries(c?.sink_usage ?? {});
         for (const [sink, u] of usage) facts.push(...usageFacts(sink, u, usage.length > 1));

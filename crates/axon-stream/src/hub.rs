@@ -301,6 +301,29 @@ impl From<RecoveryError> for StreamError {
     }
 }
 
+impl StreamError {
+    /// Its name on a publish's span.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Forbidden => "forbidden",
+            Self::StaleSession => "stale_session",
+            Self::UnknownStream => "unknown_stream",
+            Self::UnknownSubscription => "unknown_subscription",
+            Self::AlreadyExists => "already_exists",
+            Self::LimitExceeded => "limit_exceeded",
+            Self::InvalidOptions => "invalid_options",
+            Self::StaleRevision => "stale_revision",
+            Self::RevisionConflict => "revision_conflict",
+            Self::OutOfSync => "out_of_sync",
+            Self::NotRecovering => "not_recovering",
+            Self::StateFull => "state_full",
+            Self::Disk(_) => "disk",
+            Self::Recovery(_) => "recovery",
+            Self::QuotaExceeded { .. } => "quota_exceeded",
+        }
+    }
+}
+
 impl std::fmt::Display for StreamError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{self:?}")
@@ -1102,7 +1125,7 @@ impl<A: Authorizer> StreamHub<A> {
         publisher: &PeerId,
         key: &StreamKey,
         records: Vec<Payload>,
-        trace: Option<(u64, u64)>,
+        trace: Option<axon::TraceContext>,
         admit: impl FnOnce(&[Payload], Option<usize>) -> Result<(), StreamError>,
     ) -> Result<SequencedBatch, PublishError<Vec<Payload>>> {
         let allowed = self.allowed(publisher, key, Access::Publish);
@@ -1180,6 +1203,10 @@ impl<A: Authorizer> StreamHub<A> {
     /// The relay entry point: admits records that already carry origin positions. Overlap with
     /// published positions is dropped by position, not content; a gap fails without mutation.
     /// Returns what was new, if anything.
+    #[expect(
+        clippy::result_large_err,
+        reason = "a batch is 80 bytes with its trace context, and a rejected one goes back whole, as publish's do"
+    )]
     pub fn accept_batch(
         &mut self,
         publisher: &PeerId,

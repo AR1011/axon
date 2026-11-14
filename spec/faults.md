@@ -321,7 +321,7 @@ fault into that feature.
 | crash | `crates/axon/tests/system.rs::messages_discarded_at_exit_become_dead_letters` |
 | restart | `crates/axon/tests/system.rs::a_generation_that_fails_and_restarts_leaves_its_queue_as_dead_letters` |
 | pause | n/a: a trace context lives in the message that carries it |
-| partition | n/a: the context rides its message; the transport rows cover the message |
+| partition | `crates/axon-cluster/tests/cluster/trace.rs::a_failed_call_span_names_its_error_kind` |
 | one-way cut | n/a: the context rides its message; the transport rows cover the message |
 | loss | n/a: the context rides its message; the transport rows cover the message |
 | duplication | n/a: the context rides its message; the transport rows cover the message |
@@ -335,7 +335,7 @@ fault into that feature.
 | fd exhaustion | n/a: no descriptors |
 | panic | `crates/axon/tests/faults.rs::a_panic_at_any_callback_never_unwinds_a_turn_or_leaks_accounting`, `crates/axon/tests/trace.rs::a_subscriber_that_panics_loses_its_event_and_nothing_else` |
 | overload | `crates/axon-cluster/tests/cluster/trace.rs::a_body_that_fills_the_frame_is_sent_without_its_trace_rather_than_refused` |
-| hostile input | `crates/axon-cluster/tests/cluster/trace.rs::a_call_with_a_short_or_zero_trace_context_is_refused_unrun`, `crates/axon-stream/src/wire/tests.rs::frames_round_trip_and_every_truncation_is_refused`, `fuzz/fuzz_targets/stream_wire.rs::fuzz_target` |
+| hostile input | `crates/axon-cluster/tests/cluster/trace.rs::a_call_with_a_short_or_zero_trace_context_is_refused_unrun`, `crates/axon/tests/trace.rs::traceparent_text_round_trips_and_a_malformed_one_is_refused`, `crates/axon-stream/src/wire/tests.rs::frames_round_trip_and_every_truncation_is_refused`, `fuzz/fuzz_targets/stream_wire.rs::fuzz_target` |
 
 ## transport
 

@@ -41,10 +41,11 @@ async fn publish_resolve_call() {
         let letters = a.system.dead_letters().recent(10);
         let lost =
             letters.iter().any(|l| (l.reason, l.label, l.peer.as_deref()) == ("unknown_actor", "tell", Some("b")));
-        let spans = a.system.tracer().trace(root.trace.get());
-        lost && spans
-            .iter()
-            .any(|s| (s.kind, &*s.name, s.failed, s.peer.as_deref()) == (SpanKind::Handle, "tell", true, Some("b")))
+        let spans = a.system.tracer().trace(root.trace);
+        lost && spans.iter().any(|s| {
+            (s.kind, &*s.name, s.error, s.peer.as_deref())
+                == (SpanKind::Handle, "tell", Some("unknown_actor"), Some("b"))
+        })
     })
     .await;
     twin.lifecycle.stop();

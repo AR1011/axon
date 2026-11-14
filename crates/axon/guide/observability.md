@@ -258,8 +258,10 @@ The same data is served as JSON over HTTP by the dashboard (`api/overview`, `api
 
 A trace follows a message through every actor, node and stream it causes. Start one with `TraceContext::root()`, or
 sample them with `ActorSystem::builder().tracing(spans, sample_every)`; the collector stores the spans, and the
-console's traces page shows each trace as a waterfall. How the context travels, what each span records and how to
-read one back: [tracing](tracing.md).
+console's traces page shows each trace as a waterfall. A trace id is 128 bits, as a W3C `traceparent` has it, so a
+trace started by an HTTP request outside axon keeps its id; a failed span names why (`timeout`, `rejected.full`,
+`panic`, ...), and `Tracer::app` adds the application's own steps, with attributes. How the context travels, what each
+span records and how to read one back: [tracing](tracing.md).
 
 ## Dead letters
 

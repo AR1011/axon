@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use axon::{ActorSystem, Histogram};
+use axon::{ActorSystem, Histogram, TraceId};
 use axon_cluster::{
     AccessPolicy, ActorProtocol, BoxFuture, CallError, Cluster, Discovery, DiscoveryError, MemoryDiscovery,
     MemoryLeases, NodeRecord, Placement, Rejection, Reply, Snapshot, WireProtocol,
@@ -122,7 +122,7 @@ impl MetricsQuery for Flaky {
         self.store.traces(query)
     }
 
-    fn trace(&self, trace: u64) -> MetricsFuture<'_, Vec<SpanRecord>> {
+    fn trace(&self, trace: axon::TraceId) -> MetricsFuture<'_, Vec<SpanRecord>> {
         self.store.trace(trace)
     }
 }
@@ -254,14 +254,14 @@ async fn a_collector_stores_the_cluster_and_answers_history() {
     let recent = TraceQuery { to_ms: u64::MAX / 1000, limit: 10, ..Default::default() };
     eventually("the span is collected", || async {
         let found: Vec<TraceSummary> = query_metrics(&r, "c", &MetricsRequest::Traces(recent.clone())).await.unwrap();
-        found.iter().any(|t| (&*t.trace, &*t.root, &*t.root_node) == (&*hex(root.trace.get()), "probe", "a"))
+        found.iter().any(|t| (&*t.trace, &*t.root, &*t.root_node) == (&*root.trace.to_string(), "probe", "a"))
     })
     .await;
     eventually("the collector with a hung sink stores spans in its healthy one", || async {
         service.health().stored_spans > 0
     })
     .await;
-    let stored = MetricsRequest::Trace { trace: hex(root.trace.get()) };
+    let stored = MetricsRequest::Trace { trace: root.trace.to_string() };
     let stored: Vec<SpanRecord> = query_metrics(&r, "c", &stored).await.unwrap();
     assert_eq!(stored.iter().map(|s| &*s.span).collect::<Vec<_>>(), [hex(9)]);
     assert!(query_metrics::<Vec<SpanRecord>>(&r, "c", &MetricsRequest::Trace { trace: "1".into() }).await.is_err());
@@ -806,7 +806,7 @@ impl MetricsQuery for Unannounced {
         self.0.traces(query)
     }
 
-    fn trace(&self, trace: u64) -> MetricsFuture<'_, Vec<SpanRecord>> {
+    fn trace(&self, trace: axon::TraceId) -> MetricsFuture<'_, Vec<SpanRecord>> {
         self.0.trace(trace)
     }
 }
@@ -1053,9 +1053,9 @@ async fn contract<P: MetricsSink + MetricsQuery>(provider: &P) {
     acquired.retain(|e| e.node_id.starts_with(&node));
     assert_eq!(acquired, [events[2].clone()]);
 
-    let trace = base << 8 | 1;
+    let trace = TraceId::new(7 << 64 | (base << 8 | 1) as u128).unwrap();
     let span = |id: u64, parent: u64, at: u64, failed: bool| SpanRecord {
-        trace: hex(trace),
+        trace: trace.to_string(),
         span: hex(id),
         parent: if parent == 0 { String::new() } else { hex(parent) },
         kind: "handle".into(),
@@ -1069,15 +1069,17 @@ async fn contract<P: MetricsSink + MetricsQuery>(provider: &P) {
         wait_ns: 5,
         busy_ns: 2_000_000,
         failed,
+        error: if failed { "rejected.full".into() } else { String::new() },
+        attrs: if id == 2 { BTreeMap::from([("note".into(), "it's \"quoted\"\t".into())]) } else { BTreeMap::new() },
     };
     let spans = [span(1, 0, 0, false), span(2, 1, 500, false), span(3, 2, 900, true)];
     provider.write_spans(&spans).await.unwrap();
     provider.write_spans(&spans[1..]).await.unwrap();
     assert_eq!(provider.trace(trace).await.unwrap(), spans);
-    assert_eq!(provider.trace(trace + 1).await.unwrap(), []);
+    assert_eq!(provider.trace(TraceId::new(trace.get() + 1).unwrap()).await.unwrap(), []);
     let list = |query: TraceQuery| async move {
         let found = provider.traces(&query).await.unwrap();
-        found.into_iter().filter(|t| t.trace == hex(trace)).collect::<Vec<_>>()
+        found.into_iter().filter(|t| t.trace == trace.to_string()).collect::<Vec<_>>()
     };
     let query = TraceQuery { from_ms: base, to_ms: base + 1, limit: 1000, ..Default::default() };
     let found = list(query.clone()).await;
@@ -1107,7 +1109,7 @@ async fn contract<P: MetricsSink + MetricsQuery>(provider: &P) {
         actor_type: "app::Worker".into(),
         target: "orders".into(),
         peer: "far".into(),
-        trace: hex(trace),
+        trace: trace.to_string(),
         count: 3,
     };
     let letters = [letter(1), letter(2)];
@@ -1120,6 +1122,105 @@ async fn contract<P: MetricsSink + MetricsQuery>(provider: &P) {
     let mut invalid = batches(&node, base);
     invalid[0].sequence = 0;
     assert_eq!(provider.write(&invalid).await.unwrap_err(), "sequence must not be 0");
+}
+
+/// What a node writes for one span of `trace`.
+fn stored_span(trace: String, id: u64, start_us: u64) -> SpanRecord {
+    let (span, kind, name, node_id) = (hex(id), "handle".into(), "work".into(), "n".into());
+    SpanRecord { trace, span, kind, name, node_id, start_us, busy_ns: 1000, ..Default::default() }
+}
+
+/// A trace id that no other run's spans in a shared store have.
+fn fresh_trace(high: u64) -> TraceId {
+    TraceId::new((high as u128) << 64 | axon::trace::random_u64() as u128).unwrap()
+}
+
+async fn sixteen_digit_ids_still_open<P: MetricsSink + MetricsQuery>(provider: &P) {
+    // Before wire v8 a trace id was 64 bits, stored as 16 hex digits; one that is 0 in its high half is the same id.
+    let low = fresh_trace(0);
+    let old = stored_span(hex(low.get() as u64), 1, now_ms() * 1000);
+    let new = stored_span(fresh_trace(9).to_string(), 2, now_ms() * 1000);
+    provider.write_spans(&[old.clone(), new.clone()]).await.unwrap();
+    assert_eq!(provider.trace(parse_id(&old.trace).unwrap()).await.unwrap(), std::slice::from_ref(&old));
+    assert_eq!(provider.trace(low).await.unwrap(), [old], "the id read with its 32 digits");
+    assert_eq!(provider.trace(parse_id(&new.trace).unwrap()).await.unwrap(), [new]);
+}
+
+async fn app_attributes_round_trip<P: MetricsSink + MetricsQuery>(provider: &P) {
+    let root = axon::TraceContext::new(fresh_trace(3), 0, 1);
+    let mut span = axon::Span::begin(root, 5, axon::SpanKind::App, "resize");
+    span.attrs =
+        Some([("items", axon::Attr::U64(3)), ("delta", axon::Attr::I64(-2)), ("note", "it's\t\"x\"".into())].into());
+    let record = SpanRecord::new(&span, "n", "");
+    let attrs = [("delta", "-2"), ("items", "3"), ("note", "it's\t\"x\"")].map(|(k, v)| (k.to_string(), v.to_string()));
+    assert_eq!((&*record.kind, &record.attrs), ("app", &BTreeMap::from(attrs)));
+    provider.write_spans(std::slice::from_ref(&record)).await.unwrap();
+    assert_eq!(provider.trace(root.trace).await.unwrap(), [record]);
+}
+
+async fn failed_kept_beside_its_error<P: MetricsSink + MetricsQuery>(provider: &P) {
+    let root = axon::TraceContext::new(fresh_trace(4), 0, 1);
+    let at = now_ms() * 1000;
+    let mut timed_out = axon::Span::begin(root, 1, axon::SpanKind::Call, "request");
+    (timed_out.error, timed_out.start_us) = (Some("timeout"), at);
+    let mut fine = axon::Span::begin(root, 2, axon::SpanKind::Handle, "work");
+    fine.start_us = at + 1;
+    let (timed_out, fine) = (SpanRecord::new(&timed_out, "n", ""), SpanRecord::new(&fine, "n", ""));
+    assert_eq!((timed_out.failed, &*timed_out.error, fine.failed, &*fine.error), (true, "timeout", false, ""));
+    // Stored before error kinds, a failed span has `failed` alone.
+    let before = SpanRecord { failed: true, ..stored_span(root.trace.to_string(), 3, at + 2) };
+    let spans = [timed_out, fine, before];
+    provider.write_spans(&spans).await.unwrap();
+    assert_eq!(provider.trace(root.trace).await.unwrap(), spans);
+    let query = TraceQuery { to_ms: u64::MAX / 1000, limit: 1000, failed: true, ..Default::default() };
+    let failed = provider.traces(&query).await.unwrap();
+    assert!(failed.iter().any(|t| t.trace == root.trace.to_string() && t.failed), "{failed:?}");
+}
+
+#[tokio::test]
+async fn a_trace_stored_with_a_64_bit_id_still_opens() {
+    sixteen_digit_ids_still_open(&MemoryMetrics::new(64 << 10)).await;
+}
+
+#[tokio::test]
+async fn an_app_spans_attributes_round_trip_through_the_store() {
+    app_attributes_round_trip(&MemoryMetrics::new(64 << 10)).await;
+}
+
+#[tokio::test]
+async fn a_stored_span_keeps_failed_beside_its_error() {
+    failed_kept_beside_its_error(&MemoryMetrics::new(64 << 10)).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spans_the_ring_let_go_before_the_collector_reached_them_are_counted() {
+    let discovery = MemoryDiscovery::new();
+    // A ring of 4, so the 10 spans recorded between two collections cannot all wait in it.
+    let builder = ActorSystem::builder().tracing(4, 0);
+    let (a_system, a) = common::loopback("a", discovery.clone(), builder, |_| {}).await;
+    Telemetry::start(&a_system, &a, sampled()).await.unwrap();
+    let (system, cluster) = node("k", &discovery).await;
+    eventually("the collector sees a", || async { cluster.view().get("a").is_some() }).await;
+    // Collected every second, so that the spans below are recorded between two collections.
+    let collect = MetricsConfig { collection_interval: Some(Duration::from_secs(1)), ..Default::default() };
+    let store = Arc::new(MemoryMetrics::new(1 << 20));
+    let service = MetricsService::with_providers(&system, &cluster, vec![store.clone()], store, collect).await.unwrap();
+    let span = |id| axon::Span::begin(axon::TraceContext::root(), id, axon::SpanKind::Handle, "work");
+    a_system.tracer().record(span(1));
+    eventually("the first span is stored", || async { service.health().stored_spans == 1 }).await;
+
+    for id in 2..=11 {
+        a_system.tracer().record(span(id));
+    }
+    let lost = || {
+        let health = service.health();
+        (health.stored_spans, health.dropped_spans)
+    };
+    eventually("each span is stored or counted lost", || async { lost().0 + lost().1 == 11 }).await;
+    assert!(lost().1 >= 6, "the ring of 4 kept 4 of the 10 at most: {:?}", lost());
+    assert_eq!(a_system.tracer().evicted(), 7);
+    system.shutdown().await.unwrap();
+    a_system.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -1266,6 +1367,9 @@ async fn clickhouse_provider_contract() {
 
     let provider = ClickHouseProvider::connect(cfg.clone()).await.unwrap();
     contract(&provider).await;
+    sixteen_digit_ids_still_open(&provider).await;
+    app_attributes_round_trip(&provider).await;
+    failed_kept_beside_its_error(&provider).await;
     contract(&ClickHouseProvider::connect(cfg.clone()).await.unwrap()).await;
 
     let placed = format!("p{}", now_ms());

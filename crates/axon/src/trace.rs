@@ -8,15 +8,17 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::future::Future;
 use std::hash::{BuildHasher, Hasher, RandomState};
-use std::num::NonZeroU64;
+use std::num::NonZeroU128;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
 
+use crate::clock::Clock;
 use crate::histogram::sampled;
 use crate::types::ActorIncarnation;
 
@@ -90,11 +92,42 @@ pub fn simulated() -> bool {
     SEEDED.get()
 }
 
-/// `span` is the span that causes whatever is sent next; 0 at the root.
+/// A trace's id: 128 bits and never 0, as a W3C `traceparent` carries it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TraceId(NonZeroU128);
+
+impl TraceId {
+    pub const fn new(id: u128) -> Option<Self> {
+        match NonZeroU128::new(id) {
+            Some(id) => Some(Self(id)),
+            None => None,
+        }
+    }
+
+    pub const fn get(self) -> u128 {
+        self.0.get()
+    }
+
+    fn random() -> Self {
+        let id = (random_u64() as u128) << 64 | random_u64() as u128;
+        Self(NonZeroU128::new(id).expect("random_u64 is never 0"))
+    }
+}
+
+/// 32 hex digits, as W3C writes it.
+impl std::fmt::Display for TraceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:032x}", self.get())
+    }
+}
+
+/// `span` is the span that causes whatever is sent next; 0 at the root. `flags` are W3C's trace flags, carried as
+/// they came: axon records a traced message whatever they say.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TraceContext {
-    pub trace: NonZeroU64,
+    pub trace: TraceId,
     pub span: u64,
+    pub flags: u8,
 }
 
 struct Restore(Option<TraceContext>);
@@ -106,27 +139,35 @@ impl Drop for Restore {
 }
 
 impl TraceContext {
-    pub const WIRE_LEN: usize = 16;
+    /// Trace id, span id and flags, big-endian, in `traceparent` order.
+    pub const WIRE_LEN: usize = 25;
+    /// W3C's `sampled` flag, which a root sets.
+    pub const SAMPLED: u8 = 0x01;
+
+    /// One begun outside the cluster, such as from a `traceparent` header.
+    pub const fn new(trace: TraceId, span: u64, flags: u8) -> Self {
+        Self { trace, span, flags }
+    }
 
     /// Starts a new trace. With the `tracing` feature it says so, with the trace id, in the current `tracing` span.
     pub fn root() -> Self {
         let root = Self::fresh();
         #[cfg(feature = "tracing")]
-        quietly(|| tracing::debug!(trace = %format_args!("{:016x}", root.trace), "trace started"));
+        quietly(|| tracing::debug!(trace = %root.trace, "trace started"));
         root
     }
 
     fn fresh() -> Self {
-        Self { trace: NonZeroU64::new(random_u64()).expect("ids are non-zero"), span: 0 }
+        Self { trace: TraceId::random(), span: 0, flags: Self::SAMPLED }
     }
 
     pub fn current() -> Option<Self> {
         CURRENT.get()
     }
 
-    /// The same trace, caused by a new span.
+    /// The same trace and flags, caused by a new span.
     pub fn child(self) -> Self {
-        Self { trace: self.trace, span: random_u64() }
+        Self { span: random_u64(), ..self }
     }
 
     /// Messages sent from `f` on this thread belong to this trace.
@@ -141,17 +182,51 @@ impl TraceContext {
 
     pub fn to_bytes(self) -> [u8; Self::WIRE_LEN] {
         let mut out = [0; Self::WIRE_LEN];
-        out[..8].copy_from_slice(&self.trace.get().to_be_bytes());
-        out[8..].copy_from_slice(&self.span.to_be_bytes());
+        out[..16].copy_from_slice(&self.trace.get().to_be_bytes());
+        out[16..24].copy_from_slice(&self.span.to_be_bytes());
+        out[24] = self.flags;
         out
     }
 
+    /// `None` for a trace id of 0.
     pub fn from_bytes(bytes: [u8; Self::WIRE_LEN]) -> Option<Self> {
-        let (trace, span) = bytes.split_at(8);
+        let (trace, rest) = bytes.split_first_chunk::<16>()?;
+        let (span, flags) = rest.split_first_chunk::<8>()?;
         Some(Self {
-            trace: NonZeroU64::new(u64::from_be_bytes(trace.try_into().ok()?))?,
-            span: u64::from_be_bytes(span.try_into().ok()?),
+            trace: TraceId::new(u128::from_be_bytes(*trace))?,
+            span: u64::from_be_bytes(*span),
+            flags: flags[0],
         })
+    }
+
+    /// The W3C text form, `00-<trace>-<span>-<flags>`. A root's span is 0, which W3C does not allow: inside a
+    /// handler, [`current`](Self::current) names the span that runs.
+    pub fn traceparent(&self) -> String {
+        format!("00-{}-{:016x}-{:02x}", self.trace, self.span, self.flags)
+    }
+
+    /// `None` unless `text` is a valid `traceparent`: lowercase hex, neither id 0, version `00` exactly 55
+    /// characters, a later version at least that and `-` after it, and never version `ff`.
+    pub fn from_traceparent(text: &str) -> Option<Self> {
+        let hex = |at: usize, len: usize| {
+            let digits = text.get(at..at + len)?;
+            let lower = digits.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c));
+            lower.then(|| u128::from_str_radix(digits, 16).ok()).flatten()
+        };
+        let bytes = text.as_bytes();
+        let fits = match hex(0, 2)? {
+            0x00 => bytes.len() == 55,
+            0xff => false,
+            _ => bytes.len() == 55 || bytes.get(55) == Some(&b'-'),
+        };
+        if !fits || [2, 35, 52].iter().any(|&at| bytes.get(at) != Some(&b'-')) {
+            return None;
+        }
+        let span = hex(36, 16)? as u64;
+        if span == 0 {
+            return None;
+        }
+        Some(Self::new(TraceId::new(hex(3, 32)?)?, span, hex(53, 2)? as u8))
     }
 }
 
@@ -193,18 +268,62 @@ pub enum SpanKind {
     Call,
     /// A node took a stream batch.
     Stream,
+    /// A step the application recorded itself, with [`Tracer::app`].
+    App,
+}
+
+/// An attribute's value on an [`SpanKind::App`] span.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Attr {
+    U64(u64),
+    I64(i64),
+    Str(Cow<'static, str>),
+}
+
+impl From<u64> for Attr {
+    fn from(value: u64) -> Self {
+        Self::U64(value)
+    }
+}
+
+impl From<i64> for Attr {
+    fn from(value: i64) -> Self {
+        Self::I64(value)
+    }
+}
+
+impl From<&'static str> for Attr {
+    fn from(value: &'static str) -> Self {
+        Self::Str(value.into())
+    }
+}
+
+impl From<String> for Attr {
+    fn from(value: String) -> Self {
+        Self::Str(value.into())
+    }
+}
+
+impl std::fmt::Display for Attr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::U64(n) => write!(f, "{n}"),
+            Self::I64(n) => write!(f, "{n}"),
+            Self::Str(text) => f.write_str(text),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct Span {
     /// Position in the recording system's ring, from 1.
     pub seq: u64,
-    pub trace: u64,
+    pub trace: TraceId,
     pub span: u64,
     /// 0 for the first span of a trace.
     pub parent: u64,
     pub kind: SpanKind,
-    /// The message label, the call kind, or the stream.
+    /// The message label, the call kind, the stream, or the application's step.
     pub name: Cow<'static, str>,
     pub actor: Option<(ActorIncarnation, &'static str)>,
     pub peer: Option<Arc<str>>,
@@ -212,7 +331,12 @@ pub struct Span {
     /// Time in the mailbox before the handler ran.
     pub wait: Duration,
     pub busy: Duration,
-    pub failed: bool,
+    /// What it ended with, when it failed: `error` or `panic` for a handler, a dead letter's reason, a call's
+    /// `CallError::kind`, a stream's error, or the application's own.
+    pub error: Option<&'static str>,
+    /// An `App` span's attributes, `None` on axon's own. Shared rather than owned, so that copying a page of spans
+    /// out of the ring costs no more for them (guide/benchmarks.md).
+    pub attrs: Option<Arc<[(&'static str, Attr)]>>,
 }
 
 impl Span {
@@ -220,7 +344,7 @@ impl Span {
     pub fn begin(parent: TraceContext, id: u64, kind: SpanKind, name: impl Into<Cow<'static, str>>) -> Self {
         Self {
             seq: 0,
-            trace: parent.trace.get(),
+            trace: parent.trace,
             span: id,
             parent: parent.span,
             kind,
@@ -230,16 +354,36 @@ impl Span {
             start_us: unix_micros(),
             wait: Duration::ZERO,
             busy: Duration::ZERO,
-            failed: false,
+            error: None,
+            attrs: None,
         }
     }
 }
 
+/// Spans in a sealed segment of the ring.
+const SEGMENT: usize = 32;
+
+/// Spans in consecutive positions, the newest last, in segments. A reader clones the segments it wants under the
+/// lock and copies their spans after it, so the lock is held for an `Arc` a segment.
 #[derive(Default)]
 struct Ring {
     /// The last position given out.
     next: u64,
-    spans: VecDeque<Span>,
+    /// Full segments of [`SEGMENT`] spans, oldest first.
+    sealed: VecDeque<Arc<Vec<Span>>>,
+    /// The newest spans, fewer than [`SEGMENT`]. A writer copies them first if a reader still holds them.
+    open: Arc<Vec<Span>>,
+}
+
+impl Ring {
+    /// The position of the oldest span still in memory, kept or not.
+    fn base(&self) -> u64 {
+        self.next + 1 - (self.sealed.len() * SEGMENT + self.open.len()) as u64
+    }
+
+    fn segment(&self, index: usize) -> &Arc<Vec<Span>> {
+        self.sealed.get(index).unwrap_or(&self.open)
+    }
 }
 
 /// The most recent spans of one system.
@@ -247,13 +391,25 @@ pub struct Tracer {
     capacity: usize,
     sample_every: u32,
     ring: Mutex<Ring>,
+    /// The most spans a reader looked at in one hold of the ring's lock.
+    most_held: AtomicUsize,
+    /// What an [`AppSpan`]'s `busy` is read on.
+    clock: Clock,
 }
 
 impl Tracer {
+    /// The most spans a reader looks at in one hold of the ring's lock, so a traced handler recording a span waits
+    /// for one page at most.
+    pub const PAGE: usize = 256;
+
     /// Keeps `capacity` spans. One in `sample_every` messages that arrive outside any trace starts
     /// one; 0 leaves starting traces to [`TraceContext::root`].
     pub fn new(capacity: usize, sample_every: u32) -> Arc<Self> {
-        Arc::new(Self { capacity, sample_every, ring: Mutex::default() })
+        Self::clocked(capacity, sample_every, Clock::system())
+    }
+
+    pub(crate) fn clocked(capacity: usize, sample_every: u32, clock: Clock) -> Arc<Self> {
+        Arc::new(Self { capacity, sample_every, ring: Mutex::default(), most_held: AtomicUsize::new(0), clock })
     }
 
     pub(crate) fn sample(&self, ordinal: u64) -> Option<TraceContext> {
@@ -275,10 +431,33 @@ impl Tracer {
         let mut ring = self.ring.lock();
         ring.next += 1;
         span.seq = ring.next;
-        if ring.spans.len() == self.capacity {
-            ring.spans.pop_front();
+        if Arc::get_mut(&mut ring.open).is_none() {
+            // A reader still holds the open spans: copy them, with room for the whole segment.
+            let mut open = Vec::with_capacity(SEGMENT);
+            open.extend_from_slice(&ring.open);
+            ring.open = Arc::new(open);
         }
-        ring.spans.push_back(span);
+        Arc::make_mut(&mut ring.open).push(span);
+        let mut evicted = None;
+        if ring.open.len() == SEGMENT {
+            let sealed = std::mem::replace(&mut ring.open, Arc::new(Vec::with_capacity(SEGMENT)));
+            ring.sealed.push_back(sealed);
+            // The oldest segment goes once the newer ones hold `capacity` spans; a reader skips evicted spans before.
+            if (ring.sealed.len() - 1) * SEGMENT >= self.capacity {
+                evicted = ring.sealed.pop_front();
+            }
+        }
+        drop(ring);
+        drop(evicted);
+    }
+
+    /// A span of the application's under the current trace, named `name`; `None` outside a trace. It records itself
+    /// when dropped.
+    pub fn app(self: &Arc<Self>, name: impl Into<Cow<'static, str>>) -> Option<AppSpan> {
+        let parent = TraceContext::current()?;
+        let here = parent.child();
+        let span = Span::begin(parent, here.span, SpanKind::App, name);
+        Some(AppSpan { tracer: self.clone(), span, attrs: Vec::new(), here, began: self.clock.now() })
     }
 
     /// Spans recorded so far, including the ones the ring has dropped.
@@ -286,15 +465,99 @@ impl Tracer {
         self.ring.lock().next
     }
 
-    /// Up to `limit` spans after position `after`, oldest first.
-    pub fn since(&self, after: u64, limit: usize) -> Vec<Span> {
-        let ring = self.ring.lock();
-        let skip = ring.spans.partition_point(|s| s.seq <= after);
-        ring.spans.iter().skip(skip).take(limit).cloned().collect()
+    /// Spans the ring let go of to make room for newer ones.
+    pub fn evicted(&self) -> u64 {
+        self.recorded().saturating_sub(self.capacity as u64)
     }
 
-    pub fn trace(&self, trace: u64) -> Vec<Span> {
-        self.ring.lock().spans.iter().filter(|s| s.trace == trace).cloned().collect()
+    /// Up to `limit` spans after position `after`, oldest first, read a [`PAGE`](Self::PAGE) at a time.
+    pub fn since(&self, after: u64, limit: usize) -> Vec<Span> {
+        self.read(after, limit, None)
+    }
+
+    /// The spans of `trace` the ring holds, read a page at a time.
+    pub fn trace(&self, trace: TraceId) -> Vec<Span> {
+        self.read(0, usize::MAX, Some(trace))
+    }
+
+    /// Test only: the most spans a reader looked at in one hold of the ring's lock.
+    #[doc(hidden)]
+    pub fn most_held(&self) -> usize {
+        self.most_held.load(Ordering::Relaxed)
+    }
+
+    /// Copies the spans after `after`, of `trace` alone if given, up to `limit`, taking a page of them per hold of
+    /// the lock. It stops at the newest span of its first hold, so writers faster than it cannot keep it reading.
+    /// A span the ring lets go between two holds is skipped, as it would be had the reader come later.
+    fn read(&self, mut after: u64, limit: usize, trace: Option<TraceId>) -> Vec<Span> {
+        let keep = |span: &&Span| trace.is_none_or(|trace| span.trace == trace);
+        let (mut out, mut newest, mut most) = (Vec::new(), None, 0);
+        // Allocated outside the lock, and big enough for any page.
+        let mut segments = Vec::with_capacity(Self::PAGE / SEGMENT + 1);
+        while out.len() < limit {
+            let page = Self::PAGE.min(limit - out.len());
+            let ring = self.ring.lock();
+            let newest = *newest.get_or_insert(ring.next);
+            let base = ring.base();
+            let first = (after + 1).max(base).max((ring.next + 1).saturating_sub(self.capacity as u64));
+            let held = ((newest + 1).saturating_sub(first) as usize).min(page);
+            let (from, to) = ((first - base) as usize, (first - base) as usize + held);
+            let mut at = from;
+            while at < to {
+                let start = at / SEGMENT * SEGMENT;
+                let end = (start + SEGMENT).min(to);
+                segments.push((ring.segment(at / SEGMENT).clone(), at - start..end - start));
+                at = end;
+            }
+            drop(ring);
+            for (segment, range) in segments.drain(..) {
+                out.extend(segment[range].iter().filter(keep).cloned());
+            }
+            after = first + held as u64 - 1;
+            most = most.max(held);
+            if held < page {
+                break;
+            }
+        }
+        self.most_held.fetch_max(most, Ordering::Relaxed);
+        out
+    }
+}
+
+/// A step of the application's inside a trace, from [`Tracer::app`]. What is sent under [`enter`](Self::enter) is
+/// its child. Dropped, it records itself, `busy` from its start.
+pub struct AppSpan {
+    tracer: Arc<Tracer>,
+    span: Span,
+    attrs: Vec<(&'static str, Attr)>,
+    here: TraceContext,
+    began: Duration,
+}
+
+impl AppSpan {
+    pub fn attr(&mut self, key: &'static str, value: impl Into<Attr>) -> &mut Self {
+        self.attrs.push((key, value.into()));
+        self
+    }
+
+    /// Marks it failed, with `kind` the name of what went wrong.
+    pub fn error(&mut self, kind: &'static str) -> &mut Self {
+        self.span.error = Some(kind);
+        self
+    }
+
+    /// Runs `f` with this span current, so that what `f` sends is caused by it.
+    pub fn enter<T>(&self, f: impl FnOnce() -> T) -> T {
+        self.here.enter(f)
+    }
+}
+
+impl Drop for AppSpan {
+    fn drop(&mut self) {
+        let busy = self.tracer.clock.now().saturating_sub(self.began);
+        let attrs = (!self.attrs.is_empty()).then(|| std::mem::take(&mut self.attrs).into());
+        let name = std::mem::take(&mut self.span.name);
+        self.tracer.record(Span { name, attrs, busy, ..self.span.clone() });
     }
 }
 
@@ -304,7 +567,7 @@ impl Tracer {
 fn emit(span: &Span) {
     quietly(|| {
         tracing::debug!(
-            trace = %format_args!("{:016x}", span.trace),
+            trace = %span.trace,
             span = %format_args!("{:016x}", span.span),
             parent = %format_args!("{:016x}", span.parent),
             name = %span.name,
@@ -313,7 +576,7 @@ fn emit(span: &Span) {
             start_us = span.start_us,
             wait_us = span.wait.as_micros() as u64,
             busy_us = span.busy.as_micros() as u64,
-            failed = span.failed,
+            error = span.error,
             "{:?}",
             span.kind,
         );

@@ -69,7 +69,7 @@ pub use supervision::{RestartPolicy, Supervised, SupervisionHandle, SupervisionR
 pub use system::*;
 #[cfg(feature = "system")]
 pub use topic::{Subscriber, Topic};
-pub use trace::{Span, SpanKind, TraceContext, Tracer};
+pub use trace::{AppSpan, Attr, Span, SpanKind, TraceContext, TraceId, Tracer};
 pub use types::*;
 
 /// The most bytes a name or a node id may have.

@@ -91,7 +91,7 @@ pub struct SequencedBatch {
     first: u64,
     records: Arc<[Payload]>,
     bytes: usize,
-    trace: Option<(u64, u64)>,
+    trace: Option<axon::TraceContext>,
 }
 
 impl SequencedBatch {
@@ -106,20 +106,13 @@ impl SequencedBatch {
         Ok(Self { generation, first, records, bytes, trace: None })
     }
 
-    /// The trace this batch was published in and the span that caused it. Live delivery carries
-    /// it; a replay from history does not.
-    pub fn trace(&self) -> Option<(u64, u64)> {
+    /// The trace this batch was published in, with the span that caused it: enter it to continue the trace from what
+    /// a subscriber does with the batch. Live delivery carries it; a replay from history does not.
+    pub fn trace(&self) -> Option<axon::TraceContext> {
         self.trace
     }
 
-    /// Enter it to continue the trace from what a subscriber does with the batch.
-    #[cfg(feature = "cluster")]
-    pub fn trace_context(&self) -> Option<axon::TraceContext> {
-        let (trace, span) = self.trace?;
-        Some(axon::TraceContext { trace: trace.try_into().ok()?, span })
-    }
-
-    pub fn traced(self, trace: Option<(u64, u64)>) -> Self {
+    pub fn traced(self, trace: Option<axon::TraceContext>) -> Self {
         Self { trace, ..self }
     }
 

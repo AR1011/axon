@@ -1006,7 +1006,7 @@ fn a_replayed_message_keeps_its_trace_and_counts_as_activity() {
     }
     driver.run_until_idle(4).unwrap();
     assert_eq!(spawn.lifecycle.exit(), None, "no idle drain while a replay runs");
-    let spans = tracer.trace(root.trace.get());
+    let spans = tracer.trace(root.trace);
     assert_eq!(spans.len(), 2, "stashed, then replayed: {spans:?}");
     assert_eq!(spans[1].parent, spans[0].span, "the replay is caused by the handler that stashed it");
 }

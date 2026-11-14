@@ -122,6 +122,7 @@ export const METRICS: Record<string, [kind: "counter" | "gauge" | "histogram", a
   "stream.disk_refused": ["counter", "Publishes refused for the disk"],
   "stream.disk_truncated": ["counter", "Segments found truncated or corrupt"],
   "trace.spans": ["counter", "Spans recorded"],
+  "trace.spans_evicted": ["counter", "Spans the ring let go of"],
   "telemetry.samples_skipped": ["counter", "Unchanged samples omitted from a batch"],
   "listener.accepted": ["counter", "Connections accepted"],
   "listener.accept_errors": ["counter", "Accepts that failed"],

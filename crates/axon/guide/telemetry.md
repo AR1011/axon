@@ -70,7 +70,7 @@ store knows how far each node has reached even when nothing else moved.
 | `stream.disk_streams` · `.disk_bytes` · `.disk_unwritten` (bytes admitted and not synced yet) · `.disk_failing` (1 from a failed write until one succeeds, publishes refused meanwhile) | gauge | with a `StreamNodeConfig::disk` ([streams § History on disk](streams.md#history-on-disk)) |
 | `stream.disk_writes` | counter | `outcome` = ok, failed |
 | `stream.disk_refused` (publishes refused with a `DiskError`) · `.disk_truncated` (segments found cut short or corrupt when read back, each cut at its last whole record) | counter | |
-| `trace.spans`, spans this node recorded ([tracing](tracing.md)) | counter | |
+| `trace.spans`, spans this node recorded ([tracing](tracing.md)) · `.spans_evicted`, spans its ring let go of to make room | counter | |
 | `telemetry.samples_skipped`, unchanged samples left out of a batch | counter | |
 | `listener.accepted` · `.accept_errors` | counter | |
 | `listener.rejected` | counter | `reason` = busy, per_ip |
@@ -167,7 +167,7 @@ bounds, never below the true value and at most 12.5 % above it up to about 17 mi
 and per-node percentiles must not be averaged into a cluster percentile: merge the histograms instead.
 
 The collector stores its own health as `collector.cycles`, `.stored_batches`,
-`.rejected_batches`, `.gaps`, `.source_resets`, `.write_errors`, `.dropped_events` (counters),
+`.rejected_batches`, `.gaps`, `.source_resets`, `.write_errors`, `.dropped_events`, `.dropped_spans` (counters),
 `.cycle_duration`, `.node_errors` and `.failing_sinks` (gauges).
 
 `max_points` bounds the known values of the series read, in `(node, incarnation, labels)` order, before any sum: a
@@ -194,7 +194,8 @@ Each node also keeps its own: `ActorSystem::events()`, an `EventLog` of the newe
 `Cluster` (`cluster.events()`) and its stream node. Recording takes a short lock and never waits, so no actor turn
 does. The collector pages it with `Request::Events{incarnation, after, limit}` behind a cursor, as it does spans and
 dead letters, and stores each once under the id `{node}:{incarnation}:e{seq}`. Events the ring let go of before the
-collector asked are added to `dropped_events` once the rest of that page is stored; a node's new boot is read from
+collector asked are added to `dropped_events` once the rest of that page is stored, and spans the same way to
+`dropped_spans`; a node's new boot is read from
 its first. A subject or a detail longer than 1024 bytes is cut when it is recorded.
 
 | Kind | Subject | Detail | When |

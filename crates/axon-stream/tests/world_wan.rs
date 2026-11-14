@@ -14,7 +14,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axon::ActorSystem;
+use axon::{ActorSystem, SpanKind, TraceContext, TraceId};
 use axon_cluster::{
     Cluster, ClusterConfig, KEYED_ENDS, PaxosConfig, PaxosLeases, Placement, SeedConfig, SeedDiscovery, SeedServer,
     SeedServerConfig, SeedTimings, SpawnContext,
@@ -128,7 +128,7 @@ fn the_values_are_the_guides() {
 
 #[derive(Clone)]
 struct Node {
-    _system: ActorSystem,
+    system: ActorSystem,
     cluster: Cluster,
     stream: StreamNode,
     discovery: SeedDiscovery,
@@ -176,7 +176,7 @@ async fn boot(host: Host, timings: Timings) -> Node {
     if origin {
         stream.open_stream(&key(), u64::from(host.boot()), DeliveryPolicy::ReplayRequired).await.unwrap();
     }
-    Node { _system: system, cluster, stream, discovery, seed }
+    Node { system, cluster, stream, discovery, seed }
 }
 
 /// What a live follower read.
@@ -187,6 +187,8 @@ struct Follower {
     readies: u32,
     lost: u32,
     wrong: Option<String>,
+    /// The context of each traced batch, as the subscriber got it.
+    traced: Vec<TraceContext>,
 }
 
 #[derive(Default)]
@@ -254,6 +256,7 @@ fn follow(w: &mut World<Node>, seen: &Rc<Seen>, on: &'static str) {
                     Some(format!("generation {}", batch.generation()))
                 }
                 StreamEvent::Batch(batch) => batch.records().iter().find_map(|record| {
+                    f.traced.extend(batch.trace());
                     let got = (&record[..]).get_u64();
                     let gap = f.last.is_some_and(|last| got != last + 1);
                     let wrong = gap.then(|| format!("record {got} after {:?}", f.last));
@@ -524,6 +527,52 @@ fn every_call_and_a_live_follower_recover_from_each_fault_across_regions() {
 
 /// sin cut from the rest for 5 s, every SYN on its links and every answer to one lost once, and after the heal its
 /// connections to eu-b and us-b reset: how many times a node counted a peer unreachable.
+fn traced_publish(seed: u64) {
+    let (mut w, seen) = start(seed, Timings::Wan);
+    seen.stop.set(true);
+    w.run_for(Duration::from_secs(2));
+    // An id from outside, with the high half set, as a W3C trace id takes all 128 bits.
+    let id = TraceId::new(0xfeed_0000_0000_0000_0000_0000_0000_0001).unwrap();
+    let root = TraceContext::new(id, 0x5eed, TraceContext::SAMPLED);
+    let next = seen.next.get();
+    let published = w.spawn_on(ORIGIN, move |n| async move {
+        root.enter(|| n.stream.publish(&key(), vec![Bytes::copy_from_slice(&next.to_be_bytes())])).is_ok()
+    });
+    assert!(w.join(published).unwrap(), "seed {seed}: the origin refused the record");
+    w.run_until("both followers read the traced record", Duration::from_secs(5), |_| {
+        FOLLOWERS.iter().all(|f| seen.last(f) == Some(next))
+    });
+    assert_followers_right(&w, &seen);
+
+    // Every stream span of the trace, on whichever node took the batch: (node, parent).
+    let mut spans = BTreeMap::new();
+    for name in NODES {
+        for span in w.read(name, |n| n.system.tracer().trace(id)).unwrap_or_default() {
+            assert_eq!((span.trace, span.kind), (id, SpanKind::Stream), "seed {seed} on {name}");
+            spans.insert(span.span, (name, span.parent));
+        }
+    }
+    for on in FOLLOWERS {
+        let got = seen.followers.borrow()[on].traced.clone();
+        assert_eq!(got.len(), 1, "seed {seed}: {on} got {got:?}");
+        assert_eq!((got[0].trace, got[0].flags), (id, TraceContext::SAMPLED), "seed {seed} on {on}");
+        // From the follower's own span, back through each node the batch crossed, to the origin's publish.
+        let (mut hops, mut at) = (vec![], got[0].span);
+        while at != root.span {
+            let (node, parent) = spans.get(&at).copied().unwrap_or_else(|| panic!("seed {seed}: {at:x} of {on}"));
+            hops.push(node);
+            at = parent;
+        }
+        assert_eq!((hops.first(), hops.last()), (Some(&on), Some(&ORIGIN)), "seed {seed}: {hops:?}");
+        println!("world digest wan_traced seed {seed}: {on} by {hops:?}: {:016x}", w.digest());
+    }
+}
+
+#[test]
+fn a_traced_publish_keeps_its_128_bit_trace_on_every_hop_across_regions() {
+    check_seeds(seeds(0..4), traced_publish).unwrap();
+}
+
 fn lost_syns(seed: u64, timings: Timings) -> u64 {
     let (mut w, seen) = start(seed, timings);
     let unreachable = |w: &World<Node>| counters(w).values().map(|c| c.unreachable).sum::<u64>();

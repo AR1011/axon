@@ -762,7 +762,7 @@ test("a trace opens as a waterfall whose spans cross nodes, and the filters live
   await expect(first).toBeVisible({ timeout: 40_000 });
   await expect(first.locator("td").nth(1)).toHaveText("request");
   await first.click();
-  await expect(page).toHaveURL(/\/ops\/axon\/traces\/[0-9a-f]{16}/);
+  await expect(page).toHaveURL(/\/ops\/axon\/traces\/[0-9a-f]{32}/);
   const spans = page.getByRole("list", { name: "Spans" }).getByRole("listitem");
   await expect(spans.first()).toContainText(/\S+request → \S+/);
   await expect(spans.filter({ hasText: "work · relay-0" })).toHaveCount(1);
@@ -804,13 +804,27 @@ test("a trace opens as a waterfall whose spans cross nodes, and the filters live
   await expect(page.getByText("Trace not found")).toBeVisible();
 });
 
+test("an application step shows its attributes in the span's detail", async ({ page }) => {
+  await live(page, `${MOUNTED}traces?q=compact`);
+  const first = page.locator("tbody tr").first();
+  await expect(first).toBeVisible({ timeout: 40_000 });
+  await first.click();
+  const spans = page.getByRole("list", { name: "Spans" }).getByRole("listitem");
+  const step = spans.filter({ hasText: "compact" }).first();
+  await expect(step).toBeVisible();
+  // What it told inside the step is the step's child.
+  await expect(spans.filter({ hasText: "tick · relay-" })).toHaveCount(1, { timeout: 15_000 });
+  await step.getByRole("button").click();
+  for (const text of ["Application step", "segments3", "bytes49152", "tierwarm", "Completed"]) await expect(step).toContainText(text);
+});
+
 test("dead letters list what was dropped, why, and link to the trace", async ({ page }) => {
   await live(page, `${MOUNTED}dead-letters?q=work`);
   const first = page.locator("tbody tr").first();
   await expect(first).toBeVisible({ timeout: 40_000 });
   await expect(first).toContainText(/scratch.*work.*actor stopped.*local/);
   await first.getByRole("link", { name: "open" }).click();
-  await expect(page).toHaveURL(/\/ops\/axon\/traces\/[0-9a-f]{16}/);
+  await expect(page).toHaveURL(/\/ops\/axon\/traces\/[0-9a-f]{32}/);
   // The message was dropped before any handler ran: the drop itself is the trace's span.
   await expect(page.getByRole("list", { name: "Spans" }).getByRole("listitem").filter({ hasText: "work" }).first()).toBeVisible({ timeout: 15_000 });
 });

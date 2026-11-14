@@ -966,7 +966,7 @@ impl<A: Authorizer> RelayCore<A> {
         &mut self,
         key: &StreamKey,
         records: Vec<Payload>,
-        trace: Option<(u64, u64)>,
+        trace: Option<axon::TraceContext>,
         admit: impl FnOnce(&[Payload]) -> Result<(), StreamError>,
     ) -> Result<Cursor, PublishError<Vec<Payload>>> {
         if !self.originated.contains(key) {

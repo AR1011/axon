@@ -32,7 +32,8 @@ const MAX_SINKS: usize = 8;
 
 #[derive(Clone, Copy)]
 enum Rows<'a> {
-    Spans(&'a [SpanRecord]),
+    /// With the spans the node's ring let go of before they were pulled.
+    Spans(&'a [SpanRecord], u64),
     Letters(&'a [DeadLetterRecord]),
     /// With the events the node's ring let go of before they were pulled.
     Events(&'a [ClusterEvent], u64),
@@ -42,7 +43,7 @@ impl Rows<'_> {
     /// How many there are, or an error when one is not `node`'s own.
     fn own(self, node: &str) -> Result<usize, String> {
         let (len, foreign, what) = match self {
-            Rows::Spans(spans) => (spans.len(), spans.iter().any(|s| s.node_id != node), "spans"),
+            Rows::Spans(spans, _) => (spans.len(), spans.iter().any(|s| s.node_id != node), "spans"),
             Rows::Letters(letters) => (letters.len(), letters.iter().any(|l| l.node_id != node), "dead letters"),
             Rows::Events(events, _) => (events.len(), events.iter().any(|e| e.node_id != node), "events"),
         };
@@ -147,6 +148,9 @@ pub struct MetricsHealth {
     pub source_resets: u64,
     pub write_errors: u64,
     pub dropped_events: u64,
+    /// Spans a node's ring let go of before the collector reached them.
+    #[serde(default)]
+    pub dropped_spans: u64,
     pub pending_events: usize,
     /// Sinks whose last write failed, by `index:name`. Each sink keeps its own cursors, so one
     /// that is down falls behind alone.
@@ -612,7 +616,7 @@ impl Inner {
                         &node,
                         |c| &mut c.spans,
                         |incarnation, after, limit| Request::Spans { incarnation, after, limit },
-                        |p: &SpanPage| (&p.incarnation, p.next, Rows::Spans(&p.spans)),
+                        |p: &SpanPage| (&p.incarnation, p.next, Rows::Spans(&p.spans, p.missed)),
                     );
                     let letters = this.pull_rows(
                         &node,
@@ -759,7 +763,7 @@ impl Inner {
         let (cycle, mut stored) = (self.cycle.load(Relaxed), false);
         for sink in self.sinks.iter().filter(|s| s.rows_failed_in.load(Relaxed) != cycle) {
             let write = match rows {
-                Rows::Spans(spans) => sink.sink.write_spans(spans),
+                Rows::Spans(spans, _) => sink.sink.write_spans(spans),
                 Rows::Letters(letters) => sink.sink.write_dead_letters(letters),
                 Rows::Events(events, _) => sink.sink.write_events(events),
             };
@@ -772,7 +776,11 @@ impl Inner {
             }
         }
         match rows {
-            Rows::Spans(spans) if stored => self.health.lock().stored_spans += spans.len() as u64,
+            Rows::Spans(spans, missed) if stored => {
+                let mut health = self.health.lock();
+                health.stored_spans += spans.len() as u64;
+                health.dropped_spans += missed;
+            }
             Rows::Events(_, missed) if stored => self.health.lock().dropped_events += missed,
             _ => {}
         }
@@ -789,6 +797,7 @@ impl Inner {
         out.counter("collector.source_resets", "resets", &[], health.source_resets);
         out.counter("collector.write_errors", "errors", &[], health.write_errors);
         out.counter("collector.dropped_events", "events", &[], health.dropped_events);
+        out.counter("collector.dropped_spans", "spans", &[], health.dropped_spans);
         out.gauge("collector.node_errors", "nodes", &[], health.node_errors.len() as f64);
         out.gauge("collector.failing_sinks", "sinks", &[], health.sink_errors.len() as f64);
         SampleBatch {

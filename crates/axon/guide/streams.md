@@ -162,7 +162,7 @@ was emitted, not applied. Admission is not delivery. History is a bounded in-mem
 `RecoverySource` the application supplies; an origin can also keep it [on disk](#history-on-disk) to resume after a
 crash.
 
-A batch published inside a trace carries it to every live subscriber (`SequencedBatch::trace_context`), and each
+A batch published inside a trace carries it to every live subscriber (`SequencedBatch::trace`), and each
 node it crosses records a span ([tracing](tracing.md)).
 
 Guarantee: within a generation a subscriber gets every record once, in order, or an explicit reset. Never a

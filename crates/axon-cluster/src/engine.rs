@@ -657,7 +657,7 @@ impl<E: Deref<Target = Engine>> Counted<E> {
     fn end<T>(mut self, result: Result<T, CallError>) -> Result<T, CallError> {
         if let Some((mut span, started)) = self.span.take() {
             span.busy = started.elapsed();
-            span.failed = result.is_err();
+            span.error = result.as_ref().err().map(CallError::kind);
             self.engine.cfg.tracer.record(span);
         }
         let c = &self.engine.counters;
@@ -1096,7 +1096,7 @@ impl Engine {
                         actor: None,
                         target: target.or_else(|| Some(format!("endpoint {:x}", frame.protocol).into())),
                         peer: Some(peer.identity.node_id.as_str().into()),
-                        trace: 0,
+                        trace: None,
                         count: 1,
                     };
                     self.cfg.dead.record(letter, trace);

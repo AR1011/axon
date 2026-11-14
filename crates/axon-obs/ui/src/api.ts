@@ -423,6 +423,8 @@ export interface HistorySource {
     source_resets: number;
     write_errors: number;
     dropped_events: number;
+    /** Spans a node's ring let go of before the collector read them; absent from a collector that predates it. */
+    dropped_spans?: number;
     pending_events: number;
     sink_errors: Record<string, string>;
     node_errors: Record<string, string>;
@@ -526,7 +528,8 @@ export interface SpanRecord {
   span: string;
   /** Empty on the first span of a trace. */
   parent: string;
-  kind: "handle" | "call" | "stream";
+  /** `app` is a step the application recorded with `Tracer::app`. */
+  kind: "handle" | "call" | "stream" | "app";
   name: string;
   node_id: string;
   /** `runtime:slot:generation`, or empty. */
@@ -539,6 +542,10 @@ export interface SpanRecord {
   wait_ns: number;
   busy_ns: number;
   failed: boolean;
+  /** Why a failed span failed (`timeout`, `rejected.full`, `panic`, ...); empty when it did not, or when a store kept it before error kinds. */
+  error?: string;
+  /** An app span's attributes. */
+  attrs?: Record<string, string>;
 }
 
 export interface TraceSummary {
