@@ -48,8 +48,8 @@
 # starts only while it holds that flock, for a box shared with benchmarks.
 # TLS=1 runs the cluster over mutual TLS, its CA rotated in three passes mid-run; SEEDS=n serves seeds on b1..bn only.
 # RIG_BOX=<ip> runs all of it on that one box instead (spec/fault-rig.md § Layout): nodes b1..b5 are network
-# namespaces at 10.77.0.1..5, reached through ssh to the box and ~/rig/in.sh; RIG_BUILD defaults to it, and the clock
-# classes are left out. RIG_SRC names the build's directory on the build box (rig-src).
+# namespaces axrig-b1..5 at 10.77.0.1..5, reached through ssh to the box and ~/rig/in.sh; RIG_BUILD defaults to it, and
+# the clock classes are left out. RIG_SRC names the build's directory on the build box (rig-src).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 if [[ ${1:-} == gate ]]; then   # local files only: no nodes needed

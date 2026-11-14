@@ -152,8 +152,20 @@ has no followers of its own behind the open (the fourth case above is tested in 
 - `crates/axon-stream/tests/hub.rs::a_follow_after_subscription_parks_at_a_close_and_goes_on_at_a_reopen_of_its_generation`
 - `crates/axon-stream/tests/hub.rs::a_follow_after_subscription_ends_generation_changed_at_a_new_generation`
 - `crates/axon-stream/src/node/tests.rs::open_stream_after_without_a_history_source_is_refused`
-- The rig: a `move` role in `examples/rig/src/streams.rs`, judged by `check.py`'s `stream-gap` and `stream-dup`. Not
-  built: no rig hosts are left to run it.
+- The rig: `move/m0` and `move/m1` in `examples/rig/src/streams.rs` (`Mover`). The owner of the eager key `mov`, which
+  only b1 and b2 serve, opens both with `open_stream_after` after the record due last, or after the position its node
+  relays where that is later, and closes them when it stops (drained or fenced). A record is a function of its position
+  (`Due`, also the namespace's history source), so both origins publish the same bytes at a position (rule 1), and the
+  new origin holds every record before the one it opens after (rule 2). Every node follows both, `m0` `Live` and `m1`
+  `FollowAfter` its cursor; b3..b5 pull through b2 then b1, b1 and b2 through each other. `check.py` judges them by
+  `stream-dup`, `stream-reorder`, `stream-gap`, `stream-liveness` while b1 or b2 is up, and `stream-reset-kind`, which
+  on a `move/` stream also fails `GenerationChanged` and `StreamClosed`: every cursor goes on. Its selftest plants a
+  `GenerationChanged` end and a silence on a move stream, and with those two rules taken out it misses both.
+  Run on one box ([fault-rig.md § Layout](fault-rig.md#layout)):
+  `ONLY=kill,pause,leave,freeze smoke 71 10` moved the origin 16 times (14 closes, 9 drained and 5 fenced) and
+  `ONLY=kill,pause,leave,freeze,isolate,partition smoke 72 10` 23 times (20 closes, 11 drained and 9 fenced, and 38
+  `OriginLost` on the move streams). In both every stream invariant held and no follower of a move stream was reset;
+  72 passed, 71 failed only `latency-quiet` and `peer-leak`, in one window where every node stalled at once.
 - TLC: `OriginMove.cfg` and every `mutations/OriginMove-*.cfg` in `scripts/check.sh tla`.
 
 ## 3. Follower positions

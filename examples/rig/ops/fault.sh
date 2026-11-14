@@ -2,8 +2,9 @@
 # One node's faults, as root (spec/fault-rig.md § Fault classes). Network rules sit in chain RIG, which only TCP to or
 # from ports 7400 and 7001 off loopback reaches, and name the rig's addresses; never 22 or the store's 7900. tc filters
 # the same ports to the peers into band 4 of a prio qdisc, where netem sits. Disk faults swap the table of a dm disk,
-# rig-journal or rig-streams; cgroup faults set runtime properties of the unit rig-node. Inside network namespace bN
-# (one box, setup.sh --netns) these names carry bN (node.sh), and the clock classes are refused: the clock is the box's.
+# rig-journal or rig-streams; cgroup faults set runtime properties of the unit rig-node. Inside network namespace
+# axrig-bN (one box, setup.sh --netns) these names carry axrig-bN (node.sh), and the clock classes are refused: the
+# clock is the box's.
 #
 #   fault.sh [-i <id>] [-d <disk>] on|off <class> [args]
 #       kill <hold_s> | pause | freeze | leave | isolate | partition <ip,..> | bridge <ip,..> | oneway <ip,..>

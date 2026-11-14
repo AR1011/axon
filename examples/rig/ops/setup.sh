@@ -3,9 +3,9 @@
 # outside the rig ports on non-loopback interfaces, nothing started.
 #
 #   sudo setup.sh <ip1> .. <ip5>   tools, dm modules, the journal and streams devices, the rig port allowlist, the unit
-#   sudo setup.sh --netns <n>      one box for n nodes: node i in network namespace b<i> at 10.77.0.<i>, its veth on
-#                                  bridge rig0; each set up as above with its own names (node.sh), journal, chains
-#                                  and unit instance rig-node@b<i>
+#   sudo setup.sh --netns <n>      one box for n nodes: node i in network namespace axrig-b<i> at 10.77.0.<i>, its veth
+#                                  on bridge axrig0, names no other work on a shared box uses; each set up as above
+#                                  with its own names (node.sh), journal, chains and unit instance rig-node@axrig-b<i>
 #   sudo setup.sh --remove         undoes --netns: units, journals, namespaces, bridge
 #   setup.sh doctor                {"missing":[..],"tcp":{..}}, missing empty once set up (it runs before setup too);
 #                                  tcp the four host TCP settings spec/wan.md § 8 names, as this node sees them
@@ -63,12 +63,12 @@ if [[ $1 == --remove && -n $n ]]; then   # this node, from its namespace; its ch
     rm -rf $env $override $exe $up $state /run/systemd/system/$unit.service.d
     exit
 elif [[ $1 == --remove ]]; then
-    for ns in /run/netns/b[0-9]*; do
+    for ns in /run/netns/axrig-b[0-9]*; do
         [[ -e $ns ]] || continue
         nsenter --net="$ns" bash "$0" --remove
         ip netns del "${ns##*/}"
     done
-    ! ip link show rig0 >/dev/null 2>&1 || ip link del rig0
+    ! ip link show axrig0 >/dev/null 2>&1 || ip link del axrig0
     rm -f /etc/systemd/system/rig-node@.service $rig/netns
     systemctl daemon-reload
     exit
@@ -97,15 +97,15 @@ fi
 
 if [[ $1 == --netns ]]; then
     modprobe -a veth bridge
-    ip link show rig0 >/dev/null 2>&1 || ip link add rig0 type bridge
-    ip link set rig0 up
+    ip link show axrig0 >/dev/null 2>&1 || ip link add axrig0 type bridge
+    ip link set axrig0 up
     ips=()
     for i in $(seq "$2"); do ips+=(10.77.0.$i); done
     for i in $(seq "$2"); do
-        b=b$i
+        b=axrig-b$i
         [[ -e /run/netns/$b ]] || ip netns add $b
-        ip link show rig-$b >/dev/null 2>&1 || ip link add rig-$b type veth peer name eth0 netns $b
-        ip link set rig-$b master rig0 up
+        ip link show $b >/dev/null 2>&1 || ip link add $b type veth peer name eth0 netns $b
+        ip link set $b master axrig0 up
         ip -n $b addr replace 10.77.0.$i/24 dev eth0
         ip -n $b link set eth0 up
         ip -n $b link set lo up   # a node reaches its own address over lo
@@ -115,7 +115,7 @@ if [[ $1 == --netns ]]; then
     mkdir -p $rig
     touch $rig/netns
     chown ubuntu:ubuntu $rig $rig/netns
-    for i in $(seq "$2"); do nsenter --net=/run/netns/b$i bash "$0" "${ips[@]}"; done
+    for i in $(seq "$2"); do nsenter --net=/run/netns/axrig-b$i bash "$0" "${ips[@]}"; done
     exit
 fi
 

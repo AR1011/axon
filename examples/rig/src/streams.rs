@@ -5,6 +5,8 @@
 //! subscription every 10 to 30 s and subscribe again after their cursor, so ring recovery runs under every fault.
 //! With the disk workload the node keeps its disk streams (src/disk.rs) and follows every other node's the same way,
 //! logging `rewritten` where an origin's restart went back over records a follower had.
+//! The move streams `move/m0` and `move/m1` have no fixed origin: the owner of a leased key, on b1 or b2, opens them
+//! and closes them when it stops, and every node follows them, `m0` live and `m1` with `FollowAfter` (see `Mover`).
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -14,9 +16,11 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use axon::trace::random_u64;
+use axon::{Actor, Context, RestartPolicy, StopReason};
+use axon_cluster::{ActorProtocol, CallError, Placement, Rejection, Reply, SpawnContext, Unaddressed, WireProtocol};
 use axon_stream::{
-    Cursor, DeliveryPolicy, EndReason, RecoveryError, ResetReason, StartPosition, StreamError, StreamEvent, StreamKey,
-    StreamNode, StreamNodeConfig, SubscribeOptions,
+    Cursor, DeliveryPolicy, EndReason, ReadBounds, RecoveryError, RecoverySource, ReplayRange, ResetReason,
+    SequencedBatch, StartPosition, StreamError, StreamEvent, StreamKey, StreamNode, StreamNodeConfig, SubscribeOptions,
 };
 use bytes::Bytes;
 use serde_json::{Map, json};
@@ -104,7 +108,7 @@ struct Counts {
     reorders: AtomicU64,
     resets: AtomicU64,
     origin_lost: AtomicU64,
-    /// Subscriptions started `After` a cursor.
+    /// Subscriptions started `After` or `FollowAfter` a cursor.
     afters: AtomicU64,
     max_lag_ms: AtomicU64,
 }
@@ -113,6 +117,8 @@ struct Follower {
     key: StreamKey,
     name: String,
     live: bool,
+    /// After its cursor with `FollowAfter`, which goes on across a move of the origin, instead of `After`.
+    moves: bool,
     /// ms since the workload's start of the last record, or of the follower's start.
     last_ms: AtomicU64,
 }
@@ -153,6 +159,13 @@ pub async fn start(cx: &crate::Ctx<'_>) -> Result<Tick, Box<dyn Error>> {
     if disk {
         cfg.disk = Some(crate::disk::config(me)?);
     }
+    let movers = ids.get(..2).unwrap_or_default();
+    if !movers.is_empty() {
+        // A mover pulls from the other, as the standby the guide's § Standby describes; the rest through b2 first.
+        let tiers = movers.iter().filter(|n| *n != me).rev().map(|n| label(n)).collect();
+        cfg = cfg.upstream_for(MOVE_NAMESPACE, tiers);
+        cfg.history.insert(MOVE_NAMESPACE.into(), Arc::new(Due));
+    }
     if crate::wan() {
         // spec/wan.md § 9: a parent lost after one redial across regions, 6.4 s; one back for under 30 s not worth a
         // switch; a child's refresh through an idle-out and a redial
@@ -191,13 +204,206 @@ pub async fn start(cx: &crate::Ctx<'_>) -> Result<Tick, Box<dyn Error>> {
             keys.extend(crate::disk::NAMES.map(|s| StreamKey::new(crate::disk::namespace(origin), s)));
         }
         for (j, key) in keys.into_iter().enumerate() {
-            let f = Arc::new(Follower { name: key.to_string(), key, live: j % 2 == 0, last_ms: AtomicU64::new(0) });
+            let live = j % 2 == 0;
+            let f = Arc::new(Follower { name: key.to_string(), key, live, moves: false, last_ms: AtomicU64::new(0) });
             tokio::spawn(follow(sh.clone(), f.clone()));
             followers.push(f);
         }
     }
+    if !movers.is_empty() {
+        for (j, key) in move_keys().into_iter().enumerate() {
+            let live = j % 2 == 0;
+            let f = Arc::new(Follower { name: key.to_string(), key, live, moves: !live, last_ms: AtomicU64::new(0) });
+            tokio::spawn(follow(sh.clone(), f.clone()));
+            followers.push(f);
+        }
+    }
+    if movers.contains(&cx.sh.node) {
+        movers_start(cx, sh.clone()).await?;
+    }
     tokio::spawn(report(sh, followers));
     Ok(tick)
+}
+
+const MOVE_NAMESPACE: &str = "move";
+/// The leased key whose owner is the move streams' origin.
+const MOVE_KIND: &str = "mov";
+/// One for the run: the streams keep it across every move.
+const MOVE_GENERATION: u64 = 1;
+/// A move stream's record `n` is due `n` times this many µs after the Unix epoch.
+const DUE_US: u64 = 50_000;
+/// How far back `Due` serves: 10 min of records.
+const DUE_KEPT: u64 = 12_000;
+
+fn move_keys() -> [StreamKey; 2] {
+    [StreamKey::new(MOVE_NAMESPACE, "m0"), StreamKey::new(MOVE_NAMESPACE, "m1")]
+}
+
+/// `<stream> 1 <sequence> <µs it was due>`: a function of the position, so whoever publishes it gives the same bytes.
+fn move_record(key: &StreamKey, sequence: u64) -> Bytes {
+    Bytes::from(format!("{key} {MOVE_GENERATION} {sequence} {}", sequence.saturating_mul(DUE_US)))
+}
+
+/// The application's log of the move streams, as the World's `Numbered` source: every node holds every record due by
+/// now, so a new origin opens after the record due last (the guide's two rules for moving an origin hold by
+/// construction), and serves the positions before it that the old one never got to.
+struct Due;
+
+impl RecoverySource for Due {
+    fn available_range(&self, _: &StreamKey) -> Result<ReplayRange, RecoveryError> {
+        let last = now_us() / DUE_US;
+        Ok(ReplayRange { generation: MOVE_GENERATION, first: last.saturating_sub(DUE_KEPT), last: u64::MAX - 1 })
+    }
+
+    fn read_after(
+        &self,
+        key: &StreamKey,
+        after: Cursor,
+        through: u64,
+        bounds: ReadBounds,
+    ) -> Result<Vec<SequencedBatch>, RecoveryError> {
+        // A record is under 64 bytes.
+        let fit = bounds.max_records.min(bounds.max_bytes / 64) as u64;
+        let last = through.min(after.sequence + fit);
+        let records: Vec<Bytes> = (after.sequence + 1..=last).map(|s| move_record(key, s)).collect();
+        if records.is_empty() {
+            return Err(RecoveryError::LimitExceeded);
+        }
+        Ok(vec![SequencedBatch::new(MOVE_GENERATION, after.sequence + 1, records)?])
+    }
+}
+
+/// b1 and b2 serve `MOVE_KIND` and start its one key, which the cluster then keeps running on one of them (`eager`).
+async fn movers_start(cx: &crate::Ctx<'_>, sh: Arc<Shared>) -> Result<(), Box<dyn Error>> {
+    cx.cluster
+        .kind::<MoveApi>(MOVE_KIND)
+        .policy(RestartPolicy { max_restarts: 100, ..RestartPolicy::default() })
+        .eager(Bytes::new(), Placement::default())
+        .register(move |scx: &SpawnContext, _| {
+            let epoch = scx.epoch.ok_or("leased only")?;
+            Ok(Mover { sh: sh.clone(), epoch, next: 0, failing: Default::default() })
+        })
+        .await?;
+    let cluster = cx.cluster.downgrade();
+    tokio::spawn(async move {
+        for _ in 0..120 {
+            let Some(c) = cluster.upgrade() else { return };
+            if c.get_or_spawn::<Unaddressed>(MOVE_KIND, "m0", Bytes::new(), &Placement::default()).await.is_ok() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    });
+    Ok(())
+}
+
+/// The origin of the move streams while it holds its key's lease: it opens them after the record due last, or after
+/// the position its node relays where that is later, publishes each record when it is due, and closes them when it
+/// stops, so that relays ask the next owner from their own positions (spec/streams.md § 2).
+struct Mover {
+    sh: Arc<Shared>,
+    epoch: u64,
+    /// The next record to publish on both streams.
+    next: u64,
+    failing: [crate::Failing; 2],
+}
+
+enum Moved {
+    Opened(Result<u64, String>),
+    Due,
+}
+
+impl Actor for Mover {
+    type Message = Moved;
+    type Error = String;
+
+    fn on_start(&mut self, cx: &mut Context<'_, Self>) -> Result<(), String> {
+        let node = self.sh.node.clone();
+        let job = cx.submit_future(async move {
+            let keys = move_keys();
+            let relayed = keys.iter().filter_map(|k| node.cursor(k)).filter(|c| c.generation == MOVE_GENERATION);
+            let after = relayed.map(|c| c.sequence).fold(now_us() / DUE_US, u64::max);
+            let at = Cursor { generation: MOVE_GENERATION, sequence: after };
+            for (i, key) in keys.iter().enumerate() {
+                if let Err(e) = node.open_stream_after(key, at, DeliveryPolicy::ReplayRequired).await {
+                    for opened in &keys[..i] {
+                        let _ = node.close_stream(opened);
+                    }
+                    return Moved::Opened(Err(format!("open {key}: {e:?}")));
+                }
+            }
+            Moved::Opened(Ok(after))
+        });
+        let job = job.map_err(|e| format!("open refused: {e:?}"))?;
+        cx.pause_until(&job).map_err(|e| format!("{e:?}"))
+    }
+
+    fn on_message(&mut self, msg: Moved, cx: &mut Context<'_, Self>) -> Result<(), String> {
+        match msg {
+            Moved::Opened(Err(e)) => return Err(e),
+            Moved::Opened(Ok(after)) => {
+                self.next = after + 1;
+                self.sh.log.line("move_open", json!({"e": self.epoch, "after": after}));
+                cx.schedule_every(EVERY, || Moved::Due).map_err(|e| format!("{:?}", e.reason))?;
+            }
+            Moved::Due => {
+                // Each record when it is due: several after a turn ran late.
+                let last = (now_us() / DUE_US).min(self.next + 200);
+                if last < self.next {
+                    return Ok(());
+                }
+                for (key, failing) in move_keys().iter().zip(&mut self.failing) {
+                    let records = (self.next..=last).map(|s| move_record(key, s)).collect();
+                    match self.sh.node.publish(key, records) {
+                        Ok(_) => {
+                            failing.ok();
+                        }
+                        Err(e) => failing.err(&self.sh.log, key, &e.error),
+                    }
+                }
+                self.next = last + 1;
+            }
+        }
+        Ok(())
+    }
+
+    fn on_stop(&mut self, why: &StopReason) {
+        for key in move_keys() {
+            let _ = self.sh.node.close_stream(&key);
+        }
+        let line = json!({"e": self.epoch, "last": self.next.saturating_sub(1), "why": format!("{why:?}")});
+        self.sh.log.line("move_close", line);
+    }
+}
+
+/// `MOVE_KIND`'s protocol: nothing calls it, so it decodes nothing.
+struct MoveApi;
+
+impl WireProtocol for MoveApi {
+    type Message = std::convert::Infallible;
+    type Reply = std::convert::Infallible;
+    const ID: u64 = 0x30e5;
+    const SCHEMA: u16 = 1;
+
+    fn encode(message: Self::Message) -> Result<Bytes, CallError> {
+        match message {}
+    }
+
+    fn decode_reply(_: Bytes) -> Result<Self::Reply, CallError> {
+        Err(CallError::Rejected(Rejection::SchemaMismatch))
+    }
+}
+
+impl ActorProtocol for MoveApi {
+    type Mailbox = Moved;
+
+    fn encode_reply(reply: Self::Reply) -> Result<Bytes, CallError> {
+        match reply {}
+    }
+
+    fn decode(_: Bytes, _: Option<Reply<Self::Reply>>) -> Result<Moved, Rejection> {
+        Err(Rejection::InvalidMessage)
+    }
 }
 
 /// Counted in a file of the log directory, which no fault touches: not the wall clock, which `skew-restart` steps
@@ -240,23 +446,27 @@ async fn publish(sh: Arc<Shared>, keys: Vec<StreamKey>, generation: u64, round: 
 
 /// Follows one stream for good, as the streams guide's § Many origins does: a `Live` follower subscribes again live
 /// after an end; an `After` one after the last record it handled, from `First` once its cursor means nothing, and
-/// live once when the history after it is gone. An `After` follower also drops its subscription every 10 to 30 s.
+/// live once when the history after it is gone; a move stream's with `FollowAfter`, live until it has a cursor. These
+/// also drop their subscription every 10 to 30 s.
 async fn follow(sh: Arc<Shared>, f: Arc<Follower>) {
     f.last_ms.store(sh.ms(), Relaxed);
     let (mut cursor, mut live_once, mut run) = (None::<Cursor>, false, None);
     'subscribe: loop {
         let (start, tag) = match cursor {
             _ if f.live || live_once => (StartPosition::Live, "live"),
+            Some(c) if f.moves => (StartPosition::FollowAfter(c), "follow"),
             Some(c) => (StartPosition::After(c), "after"),
+            // A move stream's history from its record 1 is not kept: live until it has a cursor.
+            None if f.moves => (StartPosition::Live, "live"),
             None => (StartPosition::First, "first"),
         };
-        let mut seen = Seen::new(cursor.filter(|_| tag == "after"));
+        let mut seen = Seen::new(cursor.filter(|_| matches!(tag, "after" | "follow")));
         live_once = false;
         // Live for good; the others for 10 to 30 s, out of step with each other.
         let hold = Duration::from_secs(if f.live { 1 << 30 } else { 10 + random_u64() % 21 });
         let until = tokio::time::Instant::now() + hold;
         let sub = sh.node.subscribe(&f.key, SubscribeOptions { start, ..Default::default() });
-        if tag == "after" && sub.is_ok() {
+        if matches!(tag, "after" | "follow") && sub.is_ok() {
             sh.counts.afters.fetch_add(1, Relaxed);
         }
         match sub {
@@ -466,5 +676,21 @@ mod tests {
         assert_eq!(rewritten(&mut run, 2, 99, 15, 0), None, "a stale relay's generation changes nothing");
         assert_eq!(rewritten(&mut run, 4, 1, 15, 0), None, "a new generation, the disk formatted");
         assert_eq!(rewritten(&mut run, 4, 2, 16, 1), None);
+    }
+
+    #[test]
+    fn the_move_history_gives_each_position_the_record_an_origin_publishes_there() {
+        let key = &move_keys()[1];
+        let bounds = |max_records, max_bytes| ReadBounds { max_records, max_bytes };
+        let read = Due.read_after(key, at(1, 10), 20, bounds(3, 1 << 20)).expect("reads");
+        assert_eq!((read.len(), read[0].generation(), read[0].first(), read[0].last()), (1, 1, 11, 13));
+        let published: Vec<Bytes> = (11..=13).map(|s| move_record(key, s)).collect();
+        assert_eq!(read[0].records(), &published[..]);
+        assert_eq!(read[0].records()[0], Bytes::from("move/m1 1 11 550000"));
+        let last = Due.read_after(key, at(1, 18), 20, bounds(100, 1 << 20)).expect("reads");
+        assert_eq!((last[0].first(), last[0].last()), (19, 20), "none later than `through`");
+        assert!(matches!(Due.read_after(key, at(1, 10), 20, bounds(3, 10)), Err(RecoveryError::LimitExceeded)));
+        let range = Due.available_range(key).expect("a range");
+        assert_eq!((range.generation, range.last - range.first > DUE_KEPT), (1, true));
     }
 }
