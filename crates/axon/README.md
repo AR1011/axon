@@ -91,6 +91,7 @@ axon-cluster
   ClusterConfig::new(bind, transport, discovery)   .labels .tls .advertise .ownership .authorizer ; record.label(key) -> Option<&str> ; record.has_labels(&labels) every one, each value whole ; a label has one value: a node with two roles carries a label for each (runner=yes, control=yes)
   cluster.set_tls(Tls)?   new sessions and redials take the new certificates, sessions up keep theirs ; refused without TLS or when they would not pass as the node id
   cluster.set_authorizer(Option<Arc<dyn Authorizer>>)   each call, spawn and watch question that arrives after it is checked by the new one ; what was admitted finishes ; a stream the peer follows stops within its parent's StreamNodeConfig::downstream_expiry and a tick
+  Rules::new().allow(principal, Allow::call(prefix).spawn(kind).watch(kind).stream(namespace, [Access]))   an Authorizer for calls and, in axon-stream, streams ; principal(node_id) is the id after its first label, one wildcard certificate per deployable ; axon.* stays open unless the rule names axon. ; no rule, nothing else
   discovery: MemoryDiscovery::new() | StaticDiscovery::new(records)? | ConsulDiscovery::new(cfg)? (feature consul)
            | SeedDiscovery::start(SeedConfig::new(seeds, &transport) .timings).await?   seeds run SeedServer::bind(SeedServerConfig::new(addr, &transport) { tls, accept, timings }).await?
              SeedConfig::transport.connect_timeout   a seed dial's connect, 1 s from new ; across regions as the cluster's ; SeedDiscovery::start refuses a warm_up under it + 2 s

@@ -30,6 +30,13 @@ pub trait Authorizer {
     fn authorize(&self, peer: &PeerId, key: &StreamKey, access: Access) -> bool;
 }
 
+/// The access as a rule table takes it: `axon_cluster::Allow::stream`.
+impl From<Access> for u8 {
+    fn from(access: Access) -> u8 {
+        access as u8
+    }
+}
+
 /// A trusted-process policy. It is not authentication.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AllowAll;

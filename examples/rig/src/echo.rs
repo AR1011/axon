@@ -7,8 +7,8 @@
 //! actors end after `TMP_IDLE` without a message, logging `tmp_up` and `tmp_stop`. All to echo.jsonl.
 //!
 //! The authorizer: every 250 ms the node reads the `authz` file fault.sh writes (`AUTHZ`, which run.sh sets to the
-//! node's fault state; `/run/rig-fault/authz` without it), node ids to refuse, and on a change sets an authorizer
-//! refusing those peers' calls to `echo*` and spawns of `tmp`, then logs `authz` with them. check.py holds it to that:
+//! node's fault state; `/run/rig-fault/authz` without it), node ids to refuse, and on a change sets `Rules` that
+//! let those peers do all but call `echo*` and spawn `tmp`, then logs `authz` with them. check.py holds it to that:
 //! no `ran` from a refused peer after the line.
 
 use std::collections::BTreeSet;
@@ -18,8 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::Duration;
 
 use axon::{Actor, Context, StopReason};
-use axon_cluster::{Action, ActorProtocol, Authorizer, CallError, Cluster, Rejection, Reply, WireProtocol};
-use axon_net::Peer;
+use axon_cluster::{ActorProtocol, Allow, Authorizer, CallError, Cluster, Rejection, Reply, Rules, WireProtocol};
 use bytes::Bytes;
 use serde_json::json;
 use tokio::time::MissedTickBehavior;
@@ -109,17 +108,20 @@ impl Actor for Echo {
     }
 }
 
-struct Refuse(BTreeSet<String>);
-
-impl Authorizer for Refuse {
-    fn authorize(&self, peer: &Peer, action: Action<'_>) -> bool {
-        let guarded = match action {
-            Action::Call { name } => name.starts_with("echo"),
-            Action::Spawn { kind } => kind == TMP,
-            Action::Watch { .. } => false,
-        };
-        !guarded || !self.0.contains(&peer.identity.node_id)
-    }
+/// Each node's grants: everything, or for one in `refuse` every name and kind the rig serves but `echo*` and `tmp`.
+/// `Rules` grants and never denies, so a workload that serves a new name or kind adds it here.
+fn rules(ids: &[String], refuse: &BTreeSet<String>) -> Rules {
+    let refused = || {
+        let mut grants = Allow::watch("*").call("bulk").call("blob").call(format!("{TMP}/"));
+        for kind in [crate::account::KIND, crate::eager::KIND, crate::idle::KIND] {
+            grants = grants.call(format!("{kind}/")).spawn(kind);
+        }
+        grants
+    };
+    ids.iter().fold(Rules::new(), |rules, id| {
+        let grants = if refuse.contains(id) { refused() } else { Allow::call("").spawn("*").watch("*") };
+        rules.allow(id.as_str(), grants)
+    })
 }
 
 pub async fn start(cx: &crate::Ctx<'_>) -> Result<crate::Tick, Box<dyn std::error::Error>> {
@@ -127,7 +129,8 @@ pub async fn start(cx: &crate::Ctx<'_>) -> Result<crate::Tick, Box<dyn std::erro
     let log = Arc::new(Log::create(&cx.log_dir.join("echo.jsonl"))?);
     // Before the names and the kind are served: a restart under the fault refuses from its first call.
     let (path, mut last) = (PathBuf::from(crate::env("AUTHZ", "/run/rig-fault/authz")), BTreeSet::new());
-    authz(cluster, &log, &path, &mut last);
+    let ids = cx.ids();
+    authz(cluster, &log, &path, &ids, &mut last);
     let handle = system.spawn(Echo { me: me.clone(), log: log.clone(), tmp: None }).start()?;
     cluster.publish::<EchoApi>(&handle, &format!("echo-{me}"))?;
     cluster.publish::<EchoApi>(&handle, "echo")?;
@@ -145,7 +148,7 @@ pub async fn start(cx: &crate::Ctx<'_>) -> Result<crate::Tick, Box<dyn std::erro
         loop {
             every.tick().await;
             let Some(c) = weak.upgrade() else { return };
-            authz(&c, &l, &path, &mut last);
+            authz(&c, &l, &path, &ids, &mut last);
         }
     });
     tokio::spawn(calls(cluster.downgrade(), log.clone(), me.clone(), others.clone(), tick.clone()));
@@ -208,14 +211,14 @@ async fn spawns(cluster: axon_cluster::WeakCluster, log: Arc<Log>, me: String, o
 }
 
 /// Sets the authorizer the file asks for, when it changed since `last`.
-fn authz(cluster: &Cluster, log: &Log, path: &Path, last: &mut BTreeSet<String>) {
+fn authz(cluster: &Cluster, log: &Log, path: &Path, ids: &[String], last: &mut BTreeSet<String>) {
     let text = std::fs::read_to_string(path).unwrap_or_default();
     let refuse: BTreeSet<String> = text.split([',', ' ', '\n']).filter(|s| !s.is_empty()).map(Into::into).collect();
     if refuse == *last {
         return;
     }
     let authorizer: Option<Arc<dyn Authorizer>> =
-        if refuse.is_empty() { None } else { Some(Arc::new(Refuse(refuse.clone()))) };
+        if refuse.is_empty() { None } else { Some(Arc::new(rules(ids, &refuse))) };
     cluster.set_authorizer(authorizer);
     log.line("authz", json!({"refuse": refuse}));
     *last = refuse;

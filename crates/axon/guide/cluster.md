@@ -1671,6 +1671,32 @@ async fn start(system: &ActorSystem, server: Arc<ServerConfig>, client: Arc<Clie
   `axon.stream.live` and `axon.stream.bulk`), and a stream node drops a child it has not heard from for `StreamNodeConfig::downstream_expiry` (10 s), so nothing published after that
   reaches it; granted access again, it reads on from its cursor while its parent still holds what it missed, and its
   followers are reset otherwise ([streams § Tree](streams.md#tree)).
+- To let deployables in by name, use `Rules`, which judge a peer by its principal: its node id after the first DNS
+  label, `axon_cluster::principal("n3.svc-a.example") == "svc-a.example"`. Issue one wildcard certificate per
+  deployable (`*.svc-a.example`) and every node of it, `n1.svc-a.example`, `n2.svc-a.example`, proves that
+  principal; a wildcard matches one label, so `x.n1.svc-a.example` fails the handshake. Under `SharedSecret` the id
+  is a claim, and so is its principal.
+
+  ```rust
+  use std::sync::Arc;
+
+  use axon_cluster::{Allow, ClusterConfig, Rules};
+  use axon_stream::{Access, StreamNodeConfig};
+
+  fn rules(cfg: &mut ClusterConfig, streams: &mut StreamNodeConfig) {
+      let rules = Rules::new()
+          .allow("svc-a.example", Allow::call("jobs.").spawn("session").watch("session"))
+          .allow("svc-b.example", Allow::stream("events", [Access::Publish]))
+          .allow("ops.example", Allow::call("axon.").stream("*", [Access::Subscribe, Access::Replay]));
+      cfg.authorizer = Some(Arc::new(rules.clone())); // calls, spawns, watches
+      streams.authorizer = Arc::new(rules); // streams
+  }
+  ```
+
+  A call matches by name prefix, a kind and a stream namespace by name, `*` for any. Every member may call the
+  cluster's own `axon.*` endpoints unless its principal's rule names `axon.` (as `ops.example`'s does), so the cluster
+  keeps working under any table; a principal with no rule may do nothing else. A stream rule is asked of the peer
+  that publishes to, follows or replays from this node; this process, `local:<node>`, may do anything to its own hub.
 - Compression is per frame and only kept when it saves bytes (`compression_threshold` 512, `compression_min_savings`
   32).
 - Inbound connections are capped: 3072 connections, 64 handshakes in flight, 16 per IP (`ClusterConfig::accept`), as a

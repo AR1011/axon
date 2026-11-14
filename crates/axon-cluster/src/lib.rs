@@ -20,6 +20,7 @@ mod paxos;
 mod placement;
 mod quota;
 mod remote;
+mod rules;
 mod seed;
 mod spawn;
 mod wire;
@@ -43,6 +44,7 @@ pub use paxos::{PaxosConfig, PaxosLeases};
 pub use placement::{Placement, Strategy, rendezvous};
 pub use quota::{Denied, Permit, Permits, QuotaConfig, QuotaStats, Quotas, Rate};
 pub use remote::{KeyedRef, KeyedRefs, NamedRef, RemoteRef};
+pub use rules::{Allow, Grants, Rules, principal};
 pub use seed::{
     SeedConfig, SeedDiscovery, SeedLinkStats, SeedServer, SeedServerConfig, SeedServerStats, SeedStats, SeedTimings,
 };

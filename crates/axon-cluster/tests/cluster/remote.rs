@@ -787,3 +787,30 @@ async fn a_body_its_codec_cannot_read_is_rejected_invalid_message_and_a_bad_repl
         n.system.shutdown().await.unwrap();
     }
 }
+
+/// `Rules` judge each peer by its principal. The cluster's own `axon.*` endpoints (here `axon.spawn`) stay open to a
+/// member whose rule does not name `axon.`; once its rule names one, only what it names is let through.
+#[tokio::test(flavor = "multi_thread")]
+async fn rules_let_every_member_call_axon_endpoints_unless_a_rule_names_them() {
+    let discovery = MemoryDiscovery::new();
+    let (a, b) = (node("a", &discovery).await, node("b", &discovery).await);
+    counter_kind(&a).await;
+    publish_counter(&a, 3, "open");
+    let open = b.cluster.resolve_on::<CounterApi>("a", "open").await.unwrap();
+    let forbidden = |e: &CallError| matches!(e, CallError::Rejected(Rejection::Forbidden));
+    let b_may = || Allow::spawn("counter").call("open");
+
+    a.cluster.set_authorizer(Some(Arc::new(Rules::new().allow("b", b_may()))));
+    assert_eq!(number(open.request(Op::Get).await.unwrap()), 3);
+    let spawned = b.cluster.spawn_on::<CounterApi>("a", "counter", seed(0)).await;
+    assert!(spawned.is_ok(), "{spawned:?}");
+
+    a.cluster.set_authorizer(Some(Arc::new(Rules::new().allow("b", b_may().call("axon.watch")))));
+    assert_eq!(number(open.request(Op::Get).await.unwrap()), 3);
+    let spawned = b.cluster.spawn_on::<CounterApi>("a", "counter", seed(0)).await;
+    assert!(matches!(spawned, Err(ClusterError::Call(ref e)) if forbidden(e)), "{spawned:?}");
+
+    // A principal with no rule calls only axon.* endpoints.
+    a.cluster.set_authorizer(Some(Arc::new(Rules::new())));
+    assert!(open.request(Op::Get).await.is_err_and(|e| forbidden(&e)));
+}

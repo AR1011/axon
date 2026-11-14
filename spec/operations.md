@@ -36,27 +36,29 @@ assert themselves (`node.rs:191-199`).
   stream_cfg.authorizer = Arc::new(rules);                              // streams
   ```
 
-  A call matches by name prefix, a kind and a stream namespace by name (`*` for any). Every authenticated member may
+  `Allow`'s starters each return a `Grants`, whose methods of the same names add the rest: Rust has no associated
+  function and method of one name on one type. A call matches by name prefix, a kind and a stream namespace by name
+  (`*` for any). Every authenticated member may
   call `axon.*` unless a rule for its principal names `axon.` itself, so the cluster keeps working under any table. A
   principal with no rule may do nothing else. `Rules` implements the cluster's `Authorizer` and, in axon-stream with
   its `cluster` feature, the stream one. `Cluster::set_authorizer` swaps it at run time, as today.
-- **Who may be an origin.** A relay or leaf checks `Access::Publish` for the origin a parent's path names (the path's
-  first entry: `path_through`, `crates/axon-stream/src/core.rs:490-492`, carried on the wire as today) and refuses that
-  parent `Forbidden` when it is denied. A node that may not publish a namespace can then advertise a parent's labels
-  and still feed nobody. The path is what each hop reports; a member that lies about it is a member the rules already
-  let relay.
+- **Who may be an origin: not built.** The design asked a relay or leaf to check `Access::Publish` for the path's
+  first entry and refuse that parent `Forbidden` when it is denied. The first entry is not always the origin: a relay
+  with no parent yet, at its start or after losing one, tells its children the path `[itself]`
+  (`path_through`, `crates/axon-stream/src/core.rs:490-492`), the same as an origin does, so under `Rules` every
+  such relay would be refused, with a backoff that grows on each refusal. The check also runs when the path arrives, and a
+  parent's first pushes on another lane can arrive before it. See Open.
 
-**Wire.** None: the path already carries the origin, and a refusal is today's `Forbidden`.
+**Wire.** None.
 
-**API.** `axon_cluster::{principal, Rules, Allow}`; `impl axon_stream::Authorizer for Rules`.
+**API.** `axon_cluster::{principal, Rules, Allow, Grants}`; `impl axon_stream::Authorizer for Rules`, under which a
+`local:` peer, the node's own process, may do anything.
 
 **Tests.**
 
 - `crates/axon-cluster/tests/cluster/tls.rs::two_nodes_under_one_wildcard_certificate_share_a_principal_and_a_third_deployable_is_forbidden`
 - `crates/axon-cluster/tests/cluster/tls.rs::a_name_two_labels_under_the_wildcard_fails_the_handshake`
 - `crates/axon-cluster/tests/cluster/remote.rs::rules_let_every_member_call_axon_endpoints_unless_a_rule_names_them`
-- `crates/axon-stream/tests/relay.rs::a_parent_whose_origin_may_not_publish_the_namespace_feeds_no_follower`
-  (fails today: its records reach the follower)
 - The rig's `authz` fault (`examples/rig`) builds its policy from `Rules`.
 
 ## 2. The ops program
@@ -96,6 +98,10 @@ nothing; the test below holds that with counts.
 
 ## Open
 
+- §1, who may be an origin: a path that says whether its first entry originates the stream (an origin flag in the
+  answer and the `Path` item, a stream wire change), and pushes from a link held until its path is checked. Its test,
+  `crates/axon-stream/tests/relay.rs::a_parent_whose_origin_may_not_publish_the_namespace_feeds_no_follower`, fails
+  today (its records reach the follower), and would need a relay that loses its parent to keep its followers.
 - §1: a principal from the verified certificate itself, carried as `Peer::principal` (an `Authenticator` API change),
   for certificates with URI names rather than wildcards. Not chosen: the node-id suffix needs no new plumbing.
 - §2: a join that clears no route cache when the member registers no name and no kind. Add it if the churn test shows
