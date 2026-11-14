@@ -239,11 +239,13 @@ async fn metrics_are_off_until_served_and_show_the_nodes_latest_sample_escaped_i
     system.shutdown().await.unwrap();
 }
 
-/// While actors work, a supervised one fails and restarts every 50 messages, and others of its type come and go past
-/// 2000 idle ones, no counter or histogram goes back, and no series leaves once shown, changed or not.
+/// While actors work, a supervised one fails and restarts every 50 messages, others of its type come and go past 2000
+/// idle ones, and a peer reads samples and is replaced halfway, which cuts its sessions, no counter or histogram goes
+/// back, and no series leaves once shown, changed or not. The `connection.*` series are a session's, and leave with it.
 #[tokio::test(flavor = "multi_thread")]
 async fn counters_and_histograms_never_go_backwards_across_scrapes_while_the_node_works() {
-    let (system, cluster) = node_in("a", MemoryDiscovery::new()).await;
+    let discovery = MemoryDiscovery::new();
+    let (system, cluster) = node_in("a", discovery.clone()).await;
     let cfg = TelemetryConfig {
         // Sampled every 20 ms, so the scrapes below see many samples.
         sample_interval: Duration::from_millis(20),
@@ -277,6 +279,17 @@ async fn counters_and_histograms_never_go_backwards_across_scrapes_while_the_nod
         }
     });
 
+    let reader = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (peer, peer_cluster) = node_in("b", discovery.clone()).await;
+            let until = Instant::now() + Duration::from_millis(600);
+            while Instant::now() < until {
+                let _ = fetch_samples(&peer_cluster, "a", None).await;
+            }
+            peer.shutdown().await.unwrap();
+        }
+    });
+
     let rising = |kind: &str, name: &str| {
         kind == "counter" || (kind == "histogram" && (name.ends_with("_bucket") || name.ends_with("_count")))
     };
@@ -289,7 +302,7 @@ async fn counters_and_histograms_never_go_backwards_across_scrapes_while_the_nod
         }
         for ((name, labels), value) in &exposed.series {
             let family = exposed.kinds.keys().rev().find(|f| name.starts_with(f.as_str())).unwrap();
-            if !rising(&exposed.kinds[family], name) {
+            if !rising(&exposed.kinds[family], name) || name.starts_with("axon_connection_") {
                 continue;
             }
             if let Some(before) = last.insert((name.clone(), labels.clone()), *value) {
@@ -301,10 +314,80 @@ async fn counters_and_histograms_never_go_backwards_across_scrapes_while_the_nod
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     busy.abort();
+    reader.await.unwrap();
     assert!(scrapes >= 20 && changed >= 20, "{scrapes} scrapes, {changed} rises");
+    let read = exposed.get(
+        "axon_link_wire_bytes_total",
+        &[("src_region", ""), ("dst_region", ""), ("lane", "live"), ("direction", "sent")],
+    );
+    assert!(read > Some(0.0), "the samples went out on the peer's sessions, both boots': {read:?}");
     let restarts = exposed.get("axon_actor_restarts_total", &[("actor_type", std::any::type_name::<Brief<1>>())]);
     assert!(restarts >= Some(3.0), "the family restarted while scraped: {restarts:?}");
     drop(idle);
+    system.shutdown().await.unwrap();
+}
+
+/// With one connection's series stored, the link counters still cover every peer: three in two regions, each pair of
+/// regions a series each way, which counts the samples a read of each peer brought back.
+#[tokio::test(flavor = "multi_thread")]
+async fn link_counters_cover_every_peer_past_the_busiest() {
+    let discovery = MemoryDiscovery::new();
+    let in_region = |id, region: &'static str| {
+        let tweak = move |cfg: &mut axon_cluster::ClusterConfig| {
+            cfg.labels.insert("region".into(), region.into());
+        };
+        common::loopback(id, discovery.clone(), ActorSystem::builder(), tweak)
+    };
+    let (system, cluster) = in_region("a", "west").await;
+    let peers = [in_region("b", "west").await, in_region("c", "east").await, in_region("d", "east").await];
+    eventually("membership converges", || async { cluster.view().members.len() == 4 }).await;
+    let cfg = |sample_connections| TelemetryConfig {
+        // Sampled every 20 ms, so the scrape follows the reads.
+        sample_interval: Duration::from_millis(20),
+        sample_connections,
+        access: AccessPolicy::Cluster,
+        ..Default::default()
+    };
+    let telemetry = Telemetry::start(&system, &cluster, cfg(1)).await.unwrap();
+    let health = Health::start(&system, &cluster, "127.0.0.1:0".parse().unwrap()).await.unwrap();
+    health.serve_metrics(&telemetry);
+    let mut started = Vec::new();
+    for (peer, peer_cluster) in &peers {
+        started.push(Telemetry::start(peer, peer_cluster, cfg(32)).await.unwrap());
+    }
+
+    eventually("each pair of regions is a series each way, and one peer has connection series", || async {
+        for id in ["b", "c", "d"] {
+            fetch_samples(&cluster, id, None).await.unwrap();
+        }
+        let exposed = parse(&scrape(health.address()).await.unwrap());
+        let link = |family: &str, src, dst, direction| {
+            let labels = [("src_region", src), ("dst_region", dst), ("lane", "live"), ("direction", direction)];
+            exposed.get(family, &labels).is_some_and(|n| n > 0.0)
+        };
+        let peers: BTreeSet<_> = (exposed.series.keys())
+            .filter(|(name, _)| name == "axon_connection_sent_bytes_total")
+            .map(|(_, labels)| labels["peer"].clone())
+            .collect();
+        let pairs = [("west", "west"), ("west", "east")];
+        pairs.iter().all(|&(here, there)| {
+            link("axon_link_wire_bytes_total", here, there, "sent")
+                && link("axon_link_wire_bytes_total", there, here, "received")
+        }) && peers.len() == 1
+    })
+    .await;
+    let exposed = parse(&scrape(health.address()).await.unwrap());
+    let frames = |dst| {
+        let protocols = exposed.series.iter().filter(|((name, labels), _)| {
+            name == "axon_link_frames_total" && labels["dst_region"] == dst && labels["direction"] == "sent"
+        });
+        protocols.map(|((_, labels), n)| (labels["lane"].clone(), labels["protocol"].clone(), *n)).collect::<Vec<_>>()
+    };
+    assert!(!frames("east").is_empty() && !frames("west").is_empty(), "{:?} {:?}", frames("east"), frames("west"));
+    drop(started);
+    for (peer, _) in peers {
+        peer.shutdown().await.unwrap();
+    }
     system.shutdown().await.unwrap();
 }
 

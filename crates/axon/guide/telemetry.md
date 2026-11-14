@@ -21,6 +21,18 @@ Telemetry omits reason-labelled counters and empty histograms until they have a 
 last sample, so their number does not grow with the cluster; `cluster.connections` counts them all. A connection is
 one lane of one peer, so a peer has up to three; a lane that is down is a row of the snapshot (`down_ms`) but has no
 series.
+`link.*` series are stored for every link, not only the busiest: what crossed between this node's region and each
+peer's, on each lane, since the node started. A region is the `region` label, `""` for none; a link counts from the
+moment the view names its peer, all of it, and a link that closes leaves its bytes in its region's, so these counters
+never go back while the node runs (`ClusterStats.links`). `link.wire_bytes` is the sessions' own count after compression,
+above TLS, without the handshake. `link.frames` and `link.frame_bytes` split the same frames by protocol: the header
+(32 bytes) and the payload before compression, exact for what was sent and an upper bound on what crossed when
+compressed. A protocol is its id in 16 hex digits, `axon.control` for the system endpoints, and `0000000000000000` where
+the node does not know the protocol: for an endpoint it does not have, a reply or part whose call it no longer knows,
+and at a tell's sender the verdict that its endpoint has gone. A message to an endpoint the node withdrew,
+such as a tell to an actor that has gone, still counts under its protocol while the node holds it: the last endpoint
+withdrawn in each of 256 slots by id. At most regions² × 3 lanes × 2 directions × (1 + 2 × protocols)
+series a node.
 
 A batch carries a series when its value changed, and again `rewrite_unchanged` (30 s) after it was last carried, so a
 live series is stored at least once a minute (`HELD_MS`) however still it stands. The wait is timed on the batches'
@@ -70,7 +82,7 @@ store knows how far each node has reached even when nothing else moved.
 | `stream.disk_streams` · `.disk_bytes` · `.disk_unwritten` (bytes admitted and not synced yet) · `.disk_failing` (1 from a failed write until one succeeds, publishes refused meanwhile) | gauge | with a `StreamNodeConfig::disk` ([streams § History on disk](streams.md#history-on-disk)) |
 | `stream.disk_writes` | counter | `outcome` = ok, failed |
 | `stream.disk_refused` (publishes refused with a `DiskError`) · `.disk_truncated` (segments found cut short or corrupt when read back, each cut at its last whole record) | counter | |
-| `trace.spans`, spans this node recorded ([tracing](tracing.md)) | counter | |
+| `trace.spans`, spans this node recorded ([tracing](tracing.md)) · `.spans_evicted`, spans its ring let go of to make room | counter | |
 | `telemetry.samples_skipped`, unchanged samples left out of a batch | counter | |
 | `listener.accepted` · `.accept_errors` | counter | |
 | `listener.rejected` | counter | `reason` = busy, per_ip |
@@ -80,6 +92,8 @@ store knows how far each node has reached even when nothing else moved.
 | `connection.rejected_frames`, sends refused locally; admitted frames are never dropped | counter | `peer`, `direction`, `lane`, `reason` (`full`, `closed`, `deadline`, `oversized`) |
 | `connection.queued_bytes` · `.queued_frames` · `.inbound_queued_bytes` · `.inbound_queued_frames` · `.pending_requests` · `.rtt` · `.tcp.rtt` · `.tcp.cwnd` (kernel `TCP_INFO`, sampled at each keepalive) | gauge | `peer`, `direction`, `lane` |
 | `connection.queue` · `.encode` · `.write` · `.decode` · `.rtt_distribution` · `.request_rtt` | histogram | `peer`, `direction`, `lane` |
+| `link.wire_bytes`, the sessions' bytes after compression | counter | `src_region`, `dst_region`, `lane`, `direction` (`sent`, `received`) |
+| `link.frames` · `.frame_bytes`, the header and the payload before compression | counter | `src_region`, `dst_region`, `lane`, `direction`, `protocol` |
 | `process.rss_bytes` · `.virtual_bytes` · `.cpu_percent` | gauge | |
 | `process.read_bytes` · `.written_bytes` | counter | |
 | `host.total_memory_bytes` · `.available_memory_bytes` · `.cpu_percent` | gauge | |
@@ -167,7 +181,7 @@ bounds, never below the true value and at most 12.5 % above it up to about 17 mi
 and per-node percentiles must not be averaged into a cluster percentile: merge the histograms instead.
 
 The collector stores its own health as `collector.cycles`, `.stored_batches`,
-`.rejected_batches`, `.gaps`, `.source_resets`, `.write_errors`, `.dropped_events` (counters),
+`.rejected_batches`, `.gaps`, `.source_resets`, `.write_errors`, `.dropped_events`, `.dropped_spans` (counters),
 `.cycle_duration`, `.node_errors` and `.failing_sinks` (gauges).
 
 `max_points` bounds the known values of the series read, in `(node, incarnation, labels)` order, before any sum: a
@@ -194,7 +208,8 @@ Each node also keeps its own: `ActorSystem::events()`, an `EventLog` of the newe
 `Cluster` (`cluster.events()`) and its stream node. Recording takes a short lock and never waits, so no actor turn
 does. The collector pages it with `Request::Events{incarnation, after, limit}` behind a cursor, as it does spans and
 dead letters, and stores each once under the id `{node}:{incarnation}:e{seq}`. Events the ring let go of before the
-collector asked are added to `dropped_events` once the rest of that page is stored; a node's new boot is read from
+collector asked are added to `dropped_events` once the rest of that page is stored, and spans the same way to
+`dropped_spans`; a node's new boot is read from
 its first. A subject or a detail longer than 1024 bytes is cut when it is recorded.
 
 | Kind | Subject | Detail | When |

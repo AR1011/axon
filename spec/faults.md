@@ -321,7 +321,7 @@ fault into that feature.
 | crash | `crates/axon/tests/system.rs::messages_discarded_at_exit_become_dead_letters` |
 | restart | `crates/axon/tests/system.rs::a_generation_that_fails_and_restarts_leaves_its_queue_as_dead_letters` |
 | pause | n/a: a trace context lives in the message that carries it |
-| partition | n/a: the context rides its message; the transport rows cover the message |
+| partition | `crates/axon-cluster/tests/cluster/trace.rs::a_failed_call_span_names_its_error_kind` |
 | one-way cut | n/a: the context rides its message; the transport rows cover the message |
 | loss | n/a: the context rides its message; the transport rows cover the message |
 | duplication | n/a: the context rides its message; the transport rows cover the message |
@@ -335,7 +335,7 @@ fault into that feature.
 | fd exhaustion | n/a: no descriptors |
 | panic | `crates/axon/tests/faults.rs::a_panic_at_any_callback_never_unwinds_a_turn_or_leaks_accounting`, `crates/axon/tests/trace.rs::a_subscriber_that_panics_loses_its_event_and_nothing_else` |
 | overload | `crates/axon-cluster/tests/cluster/trace.rs::a_body_that_fills_the_frame_is_sent_without_its_trace_rather_than_refused` |
-| hostile input | `crates/axon-cluster/tests/cluster/trace.rs::a_call_with_a_short_or_zero_trace_context_is_refused_unrun`, `crates/axon-stream/src/wire/tests.rs::frames_round_trip_and_every_truncation_is_refused`, `fuzz/fuzz_targets/stream_wire.rs::fuzz_target` |
+| hostile input | `crates/axon-cluster/tests/cluster/trace.rs::a_call_with_a_short_or_zero_trace_context_is_refused_unrun`, `crates/axon/tests/trace.rs::traceparent_text_round_trips_and_a_malformed_one_is_refused`, `crates/axon-stream/src/wire/tests.rs::frames_round_trip_and_every_truncation_is_refused`, `fuzz/fuzz_targets/stream_wire.rs::fuzz_target` |
 
 ## transport
 
@@ -1063,6 +1063,35 @@ fault into that feature.
 | panic | n/a: no user code |
 | overload | `crates/axon-obs/tests/telemetry.rs::a_dropped_batch_is_not_counted_as_stored` |
 | hostile input | `crates/axon-obs/tests/telemetry.rs::a_node_is_inspectable_from_an_allowed_peer` |
+
+### observability: link meters
+
+Every link's frames and bytes by region pair, lane and protocol, never reset ([lanes.md §8.1](lanes.md#81-link-meters-wire-v8)).
+The session counters under `wire_bytes` are checked never to go back in each run of the transport's fault loops.
+Gaps: no test fills a session to show that a refused send is not counted (overload), and none sends a frame to an
+endpoint the node never had, which counts under protocol 0 (hostile input). One to an endpoint it withdrew counts
+under that endpoint's protocol: `crates/axon-cluster/tests/cluster/lanes.rs::a_tell_to_an_endpoint_that_has_gone_counts_under_its_protocol`.
+
+| Fault | Covered by |
+|---|---|
+| crash | `crates/axon-obs/tests/prometheus.rs::counters_and_histograms_never_go_backwards_across_scrapes_while_the_node_works`, `crates/axon-net/tests/faults.rs::an_io_fault_at_any_operation_ends_both_sides_cleanly` |
+| restart | `crates/axon-obs/tests/prometheus.rs::counters_and_histograms_never_go_backwards_across_scrapes_while_the_node_works`, `crates/axon-cluster/tests/cluster/lanes.rs::a_links_meters_take_in_the_sessions_it_closed` |
+| pause | `crates/axon-net/tests/faults.rs::a_stream_that_stalls_or_is_cut_one_way_at_any_operation_ends_both_sides_on_their_timers` |
+| partition | `crates/axon-stream/tests/world_wan.rs::each_region_pairs_meter_matches_what_its_sessions_moved_across_cuts` |
+| one-way cut | `crates/axon-net/tests/faults.rs::a_stream_that_stalls_or_is_cut_one_way_at_any_operation_ends_both_sides_on_their_timers` |
+| loss | `crates/axon-net/tests/faults.rs::an_io_fault_at_any_operation_ends_both_sides_cleanly` |
+| duplication | n/a: a meter counts the frames the engine hands the session and reads from it; a call sent again is another frame |
+| reordering | n/a: each count is a sum of adds, the same in any order |
+| latency | `crates/axon-stream/tests/world_wan.rs::each_region_pairs_meter_matches_what_its_sessions_moved_across_cuts`, `crates/axon-net/tests/faults.rs::a_slow_stream_or_a_starved_runtime_loses_nothing` |
+| clock skew or step | n/a: counts, no clock |
+| CPU starvation | `crates/axon-net/tests/faults.rs::a_slow_stream_or_a_starved_runtime_loses_nothing` |
+| memory limit | `crates/axon-obs/tests/prometheus.rs::link_counters_cover_every_peer_past_the_busiest` |
+| disk full | n/a: no disk |
+| disk error | n/a: no disk |
+| fd exhaustion | n/a: no descriptors of its own |
+| panic | n/a: no user code |
+| overload | gap |
+| hostile input | gap |
 
 ### observability: metrics collection
 

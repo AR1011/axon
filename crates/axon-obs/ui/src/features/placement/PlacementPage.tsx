@@ -11,7 +11,7 @@ import { Icon } from "../../components/Icon";
 import { Search } from "../../components/Search";
 import { Select } from "../../components/Select";
 import { useAccent, useEscape, useNow, useTheme, useUrlState } from "../../hooks";
-import { ago, count, natural, sum } from "../../model/format";
+import { ago, count, natural, NO_REGION, sum } from "../../model/format";
 import { acceptorRows, readiness } from "../../model/rollout";
 import { useLive } from "../../store";
 import { clampZoom, zoomAt, type Camera } from "../topology/useCamera";
@@ -21,7 +21,6 @@ const HANDOFF = 1;
 const MOVED = 4;
 const DANGER: Record<number, string> = { 1: "failed", 2: "lost their lease", 3: "stopped in isolation" };
 const GHOST_MS = 120_000;
-const NO_REGION = "no region";
 /** The source of keys whose node left before its loss was counted. */
 const LOST = "?";
 

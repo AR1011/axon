@@ -3,6 +3,7 @@ import type { NodeView, Overview } from "./api";
 import { apiUrl, getJson, signedOut, validOverview } from "./api";
 import { natural } from "./model/format";
 import { clusterTotals, ConnSeries, departures, NodeBuffer, type Totals } from "./model/live";
+import { regionEdges, type RegionEdge } from "./model/regions";
 import type { P } from "./model/series";
 
 export type Mode = "connecting" | "stream" | "polling";
@@ -18,9 +19,11 @@ export interface Live {
   rollback: boolean;
   /** Nodes that recently left, with the last thing they reported: usually what the operator is looking for. */
   departed: NodeView[];
+  /** The bytes per second between regions, over the last two overviews. */
+  regions: RegionEdge[];
 }
 
-export const useLive = create<Live>(() => ({ overview: null, version: 0, receivedAt: 0, mode: "connecting", error: null, rollback: false, departed: [] }));
+export const useLive = create<Live>(() => ({ overview: null, version: 0, receivedAt: 0, mode: "connecting", error: null, rollback: false, departed: [], regions: [] }));
 
 /** Said in place of any empty state, or a count, until the first overview: until then the console knows nothing, not that there is nothing. */
 export const pending = (s: Pick<Live, "overview" | "error">) => (s.overview ? null : (s.error ?? "Connecting"));
@@ -58,6 +61,7 @@ function accept(value: unknown, mode?: Mode) {
   useLive.setState((s) => ({
     overview: value,
     departed: departures(s.departed, s.overview?.nodes ?? [], value),
+    regions: regionEdges(value),
     version: s.version + 1,
     receivedAt: Date.now(),
     mode: mode ?? s.mode,

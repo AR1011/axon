@@ -157,6 +157,34 @@ impl CallError {
         }
     }
 
+    /// Its name on a call's span: `rejected.<name>` as in [`REJECTION_NAMES`](crate::REJECTION_NAMES), and
+    /// `not_sent.<reason>` as in [`axon_net::SUBMIT_REASONS`].
+    pub fn kind(&self) -> &'static str {
+        use axon_net::SubmitReason as Submit;
+        match self {
+            Self::Closed => "closed",
+            Self::Busy => "busy",
+            Self::NoRoute => "no_route",
+            Self::StaleNode => "stale_node",
+            Self::Unreachable(_) => "unreachable",
+            Self::NotSent(Submit::Full) => "not_sent.full",
+            Self::NotSent(Submit::Closed) => "not_sent.closed",
+            Self::NotSent(Submit::Deadline) => "not_sent.deadline",
+            Self::NotSent(Submit::Oversized) => "not_sent.oversized",
+            Self::Rejected(Rejection::UnknownActor) => "rejected.unknown_actor",
+            Self::Rejected(Rejection::SchemaMismatch) => "rejected.schema_mismatch",
+            Self::Rejected(Rejection::Full) => "rejected.full",
+            Self::Rejected(Rejection::Forbidden) => "rejected.forbidden",
+            Self::Rejected(Rejection::InvalidMessage) => "rejected.invalid_message",
+            Self::Rejected(Rejection::Stopped) => "rejected.stopped",
+            Self::Rejected(Rejection::ProtocolMismatch) => "rejected.protocol_mismatch",
+            Self::Timeout => "timeout",
+            Self::OutcomeUnknown => "outcome_unknown",
+            Self::NoReply => "no_reply",
+            Self::Codec(_) => "codec",
+        }
+    }
+
     pub fn retry(&self) -> Retry {
         use axon_net::SubmitReason as Submit;
         match self {
@@ -240,3 +268,16 @@ macro_rules! from {
     )*};
 }
 from!(CallError => Call, DiscoveryError => Discovery, OwnershipError => Ownership, axon_net::Error => Transport, axon::SystemError => System);
+
+#[test]
+fn a_kind_names_its_rejection_and_submit_reason_as_their_tables_do() {
+    use Rejection::*;
+    use axon_net::SubmitReason as Submit;
+    for rejection in [UnknownActor, SchemaMismatch, Full, Forbidden, InvalidMessage, Stopped, ProtocolMismatch] {
+        let name = crate::REJECTION_NAMES[rejection as usize - 2];
+        assert_eq!(CallError::Rejected(rejection).kind(), format!("rejected.{name}"));
+    }
+    for (i, reason) in [Submit::Full, Submit::Closed, Submit::Deadline, Submit::Oversized].into_iter().enumerate() {
+        assert_eq!(CallError::NotSent(reason).kind(), format!("not_sent.{}", axon_net::SUBMIT_REASONS[i]));
+    }
+}

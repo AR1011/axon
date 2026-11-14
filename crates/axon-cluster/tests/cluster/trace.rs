@@ -23,17 +23,32 @@ async fn a_trace_crosses_nodes_and_untraced_calls_carry_nothing() {
     // A handle span is recorded when the handler returns, after the reply it sent.
     let handles = || a.system.tracer().since(0, 100).into_iter().filter(|s| s.kind == SpanKind::Handle).count();
     eventually("three handle spans", || async { handles() >= 3 }).await;
-    let (calls, local_calls) = (b.system.tracer().trace(root.trace.get()), a.system.tracer().since(0, 100));
+    let (calls, local_calls) = (b.system.tracer().trace(root.trace), a.system.tracer().since(0, 100));
     assert_eq!(
         calls.iter().map(|s| (&*s.name, s.parent, s.peer.as_deref())).collect::<Vec<_>>(),
         [("tell", 0, Some("a")), ("request", 0, Some("a"))]
     );
-    assert!(calls.iter().all(|s| s.kind == SpanKind::Call && !s.failed));
+    assert!(calls.iter().all(|s| s.kind == SpanKind::Call && s.error.is_none()));
     let handled: HashSet<u64> = local_calls.iter().filter(|s| s.kind == SpanKind::Handle).map(|s| s.parent).collect();
     let sent = local_calls.iter().find(|s| s.kind == SpanKind::Call).expect("the local send");
     assert_eq!(handled, HashSet::from([calls[0].span, sent.span, calls[1].span]));
     assert_eq!(local_calls.len(), 4, "the untraced send left no span");
-    assert!(local_calls.iter().all(|s| s.trace == root.trace.get()));
+    assert!(local_calls.iter().all(|s| s.trace == root.trace));
+
+    // A context begun outside, with both halves of its id and flags of its own, reads back whole on the far node.
+    let echo = |_: &axon_net::Identity, _: Bytes, reply: Option<axon_cluster::Reply>| {
+        let here = TraceContext::current().expect("the call carried its trace");
+        reply.expect("a request").send(Bytes::copy_from_slice(&here.to_bytes())).map_err(|_| Rejection::Stopped)
+    };
+    a.cluster.serve("echo", 0xE1, 1, echo).unwrap();
+    let id = axon::TraceId::new(0xfedc_ba98_7654_3210_0123_4567_89ab_cdef).unwrap();
+    let outside = TraceContext::new(id, 0x1234, 0x02);
+    let answer = outside.scope(b.cluster.request("a", "echo", 0xE1, 1, Bytes::new())).await.unwrap();
+    let far = TraceContext::from_bytes(answer[..].try_into().unwrap()).unwrap();
+    assert_eq!((far.trace, far.flags), (id, 0x02));
+    let calls = b.system.tracer().trace(id);
+    let call = calls.iter().find(|s| s.span == far.span).expect("the far end is a call's child");
+    assert_eq!((call.kind, call.parent), (SpanKind::Call, outside.span));
 }
 
 /// Keeps the fields of every `axon::trace` event in `CAPTURED`.
@@ -74,7 +89,7 @@ async fn the_tracing_bridge_joins_a_call_to_the_handler_it_reached_on_the_other_
 
     let root = TraceContext::root();
     root.scope(async { remote.request(Op::Get).await.unwrap() }).await;
-    let trace = format!("{:016x}", root.trace);
+    let trace = root.trace.to_string();
     let spans = || -> Vec<_> {
         let captured = CAPTURED.lock().unwrap();
         captured.iter().filter(|f| f.get("trace") == Some(&trace) && f.contains_key("span")).cloned().collect()
@@ -125,10 +140,11 @@ async fn a_call_with_a_short_or_zero_trace_context_is_refused_unrun() {
         axon_net::connect(a.cluster.local_addr(), axon_net::Lane::Control, None, &transport("z")).await.unwrap();
     // REQUEST with TRACED, from the call frame's pinned bytes; the answer is END with the rejection's code.
     let (traced_request, end) = (0x8003, 5);
-    // A call's body starts with its contract's id, so the trace context comes after it.
+    // A call's body starts with its contract's id, so the trace context comes after it: 20 bytes are short of a
+    // context's 25.
     let contract = 0xE2u64.to_be_bytes();
-    let short = [&contract[..], &[7; 10][..]].concat();
-    let zero = [&contract[..], &[0; 16][..], b"hi"].concat();
+    let short = [&contract[..], &[7; 20][..]].concat();
+    let zero = [&contract[..], &[0; TraceContext::WIRE_LEN][..], b"hi"].concat();
     for (id, body) in [(1, short), (2, zero)] {
         let frame = axon_net::Frame {
             kind: traced_request,
@@ -145,4 +161,39 @@ async fn a_call_with_a_short_or_zero_trace_context_is_refused_unrun() {
         assert_eq!((answer.kind, answer.id, &answer.payload[..]), (end, id, &refused[..]), "call {id}");
     }
     assert_eq!(ran.load(SeqCst), 0, "nothing ran");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_call_span_names_its_error_kind() {
+    let discovery = MemoryDiscovery::new();
+    let a = node("a", &discovery).await;
+    // Short, so that a call nobody answers times out within the test.
+    let b = node_with("b", discovery.clone(), |cfg| cfg.request_timeout = Duration::from_secs(1)).await;
+    sees(&b, 2).await;
+    let held = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let h = held.clone();
+    let silent = move |_: &axon_net::Identity, _: Bytes, reply: Option<axon_cluster::Reply>| {
+        h.lock().unwrap().push(reply);
+        Ok(())
+    };
+    a.cluster.serve("silent", 0xE3, 1, silent).unwrap();
+    a.cluster.serve("full", 0xE4, 1, |_: &axon_net::Identity, _, _| Err(Rejection::Full)).unwrap();
+
+    let root = TraceContext::root();
+    let ask = |name, protocol| root.scope(b.cluster.request("a", name, protocol, 1, Bytes::new()));
+    assert!(matches!(ask("silent", 0xE3).await, Err(ClusterError::Call(CallError::Timeout))));
+    assert!(matches!(ask("full", 0xE4).await, Err(ClusterError::Call(CallError::Rejected(Rejection::Full)))));
+    // A call the far node holds when it crashes: its session is cut, and nobody knows whether it ran.
+    let crash = async {
+        eventually("the call is with the far node", || async { held.lock().unwrap().len() == 2 }).await;
+        drop(a);
+    };
+    let (cut, ()) = tokio::join!(ask("silent", 0xE3), crash);
+    assert!(matches!(cut, Err(ClusterError::Call(CallError::OutcomeUnknown))), "{cut:?}");
+
+    let spans = b.system.tracer().trace(root.trace);
+    // Each call's lookup of its endpoint is a call of its own, which succeeded.
+    let errors: Vec<_> = spans.iter().filter(|s| s.error.is_some()).map(|s| (s.kind, s.error)).collect();
+    let call = |error| (SpanKind::Call, Some(error));
+    assert_eq!(errors, [call("timeout"), call("rejected.full"), call("outcome_unknown")]);
 }

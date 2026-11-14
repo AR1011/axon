@@ -343,6 +343,8 @@ export interface Snapshot {
       /** The lowest and highest wire version the node speaks; absent from a node that predates it. */
       versions?: [number, number];
     };
+    /** What crossed the node's links, by region pair, lane and protocol, since it started; absent from a node that predates it. */
+    links?: LinkMeter[];
     members: number;
     unreachable: number;
     joined: number;
@@ -397,6 +399,18 @@ export interface NodeView {
   leaveReason?: string | null;
 }
 
+/** One row of `ClusterStats.links` (telemetry.md, `link.*`): `wire_bytes` on the row without a protocol, `frames` and `frame_bytes` on the others. */
+export interface LinkMeter {
+  src_region: string;
+  dst_region: string;
+  lane: Lane;
+  direction: "sent" | "received";
+  protocol: string | null;
+  frames: number;
+  frame_bytes: number;
+  wire_bytes: number;
+}
+
 export interface ClusterEvent {
   id: string;
   time_ms: number;
@@ -423,6 +437,8 @@ export interface HistorySource {
     source_resets: number;
     write_errors: number;
     dropped_events: number;
+    /** Spans a node's ring let go of before the collector read them; absent from a collector that predates it. */
+    dropped_spans?: number;
     pending_events: number;
     sink_errors: Record<string, string>;
     node_errors: Record<string, string>;
@@ -526,7 +542,8 @@ export interface SpanRecord {
   span: string;
   /** Empty on the first span of a trace. */
   parent: string;
-  kind: "handle" | "call" | "stream";
+  /** `app` is a step the application recorded with `Tracer::app`. */
+  kind: "handle" | "call" | "stream" | "app";
   name: string;
   node_id: string;
   /** `runtime:slot:generation`, or empty. */
@@ -539,6 +556,10 @@ export interface SpanRecord {
   wait_ns: number;
   busy_ns: number;
   failed: boolean;
+  /** Why a failed span failed (`timeout`, `rejected.full`, `panic`, `dead_letter` for a message dropped unrun, ...); empty when it did not, or when a store kept it before error kinds. */
+  error?: string;
+  /** An app span's attributes, and a dropped message's `reason`. */
+  attrs?: Record<string, string>;
 }
 
 export interface TraceSummary {

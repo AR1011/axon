@@ -351,6 +351,9 @@ pub struct ClusterStats {
     pub ownership: Option<ProviderInfo>,
     /// `None` without [`Quotas`](crate::Quotas).
     pub quotas: Option<crate::QuotaStats>,
+    /// What crossed this node's links, by region pair, lane, direction and protocol, for its life: every link, up or
+    /// down or closed.
+    pub links: Vec<crate::LinkMeter>,
 }
 
 pub(crate) struct Inner {
@@ -1006,6 +1009,8 @@ impl Cluster {
     pub fn stats(&self) -> ClusterStats {
         let (inner, view) = (&self.0, self.view());
         let (churn, c) = (&inner.engine.membership.churn, &inner.counters);
+        // Copied out, so the record's lock is not held across the read of every link.
+        let region = inner.record.lock().label("region").unwrap_or("").to_owned();
         ClusterStats {
             engine: inner.engine.stats(),
             members: view.members.len(),
@@ -1035,6 +1040,7 @@ impl Cluster {
             discovery: inner.discovery.describe(),
             ownership: inner.ownership.as_ref().map(|o| o.describe()),
             quotas: inner.quotas.get().map(|q| q.stats()),
+            links: inner.engine.meters.read(&region),
         }
     }
 }

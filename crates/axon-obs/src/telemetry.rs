@@ -348,7 +348,8 @@ impl Inner {
             Request::Spans { incarnation: asked, after, limit } => {
                 let after = self.after(&asked, after);
                 let spans = self.spans(|tracer| tracer.since(after, limit.min(MAX_TRACE_LIMIT)))?;
-                page(spans, after, max, |next, spans| SpanPage { incarnation: incarnation(), next, spans })?
+                let missed = self.missed(&asked, after, spans.first().map(|(seq, _)| *seq));
+                page(spans, after, max, |next, spans| SpanPage { incarnation: incarnation(), next, missed, spans })?
             }
             Request::Traces { limit } => {
                 let spans = self.spans(|tracer| tracer.since(0, usize::MAX))?;
@@ -380,9 +381,9 @@ impl Inner {
             Request::Events { incarnation: asked, after, limit } => {
                 let system = self.system.upgrade().ok_or("system stopped")?;
                 let node = &self.cluster.identity().node_id;
-                let (same, after) = (asked == self.incarnation, self.after(&asked, after));
+                let after = self.after(&asked, after);
                 let events = system.events().since(after, limit.min(MAX_TRACE_LIMIT));
-                let missed = if same { events.first().map_or(0, |e| e.seq - after - 1) } else { 0 };
+                let missed = self.missed(&asked, after, events.first().map(|e| e.seq));
                 let events = events.iter().map(|e| (e.seq, event(e, node, &self.incarnation))).collect();
                 page(events, after, max, |next, events| EventPage { incarnation: incarnation(), next, missed, events })?
             }
@@ -418,6 +419,12 @@ impl Inner {
     /// Where a page asked for boot `asked` starts: after `after` in this one, from the first in another.
     fn after(&self, asked: &str, after: u64) -> u64 {
         if asked == self.incarnation { after } else { 0 }
+    }
+
+    /// What a ring let go of between a page asked for boot `asked` after `after` and `first`, the oldest it still
+    /// held: none for another boot's cursor, whose page starts at the first.
+    fn missed(&self, asked: &str, after: u64, first: Option<u64>) -> u64 {
+        if asked == self.incarnation { first.map_or(0, |first| first - after - 1) } else { 0 }
     }
 
     fn spans(&self, pick: impl FnOnce(&axon::Tracer) -> Vec<axon::Span>) -> Result<Vec<(u64, SpanRecord)>, String> {
@@ -595,6 +602,7 @@ impl Inner {
 
         out.gauge("runtime.actors", "actors", &[], runtime.actors as f64);
         out.counter("trace.spans", "spans", &[], system.tracer().recorded());
+        out.counter("trace.spans_evicted", "spans", &[], system.tracer().evicted());
         out.counter("runtime.actors_started", "actors", &[], stats.started);
         out.counter("runtime.actors_stopped", "actors", &[], stats.stopped);
         out.counter("runtime.actors_failed", "actors", &[], stats.failed);
@@ -992,6 +1000,20 @@ impl Out {
         // A down lane is a row with no session, so no series.
         let sessions = e.peers.iter().filter(|p| p.down_ms.is_none());
         sessions.take(connections).for_each(|p| self.connection(p));
+        // Every link, past the busiest: what crossed between two regions, never reset.
+        for link in &c.links {
+            let src = ("src_region", link.src_region.as_str());
+            let dst = ("dst_region", link.dst_region.as_str());
+            let (lane, direction) = (("lane", link.lane.name()), ("direction", link.direction));
+            match &link.protocol {
+                None => self.counter("link.wire_bytes", "bytes", &[src, dst, lane, direction], link.wire_bytes),
+                Some(protocol) => {
+                    let labels = [src, dst, lane, direction, ("protocol", protocol.as_str())];
+                    self.counter("link.frames", "frames", &labels, link.frames);
+                    self.counter("link.frame_bytes", "bytes", &labels, link.frame_bytes);
+                }
+            }
+        }
     }
 
     fn connection(&mut self, p: &PeerStats) {

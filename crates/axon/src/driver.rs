@@ -39,14 +39,28 @@ impl OpenSpan {
         Self { span, began, outer }
     }
 
-    fn finish<M: Send + 'static>(mut self, mailbox: &Mailbox<M>, actor_type: &'static str, failed: bool) {
+    fn finish<M: Send + 'static>(
+        mut self,
+        mailbox: &Mailbox<M>,
+        actor_type: &'static str,
+        error: Option<&'static str>,
+    ) {
         trace::replace_current(self.outer);
         if let Some(tracer) = &mailbox.tracer {
             self.span.actor = Some((mailbox.incarnation(), actor_type));
             self.span.busy = mailbox.clock.now().saturating_sub(self.began);
-            self.span.failed = failed;
+            self.span.error = error;
             tracer.record(self.span);
         }
+    }
+}
+
+/// A handler span's error: `panic` when the handler panicked, `error` when it returned one.
+fn failure(outcome: &Result<(), StopReason>) -> Option<&'static str> {
+    match outcome {
+        Ok(()) => None,
+        Err(StopReason::Panicked) => Some("panic"),
+        Err(_) => Some("error"),
     }
 }
 
@@ -71,12 +85,12 @@ impl<M: Send + 'static> MailboxBatch<'_, M> {
 
     /// Ends the message handed out last: its timing sample and its span.
     #[inline]
-    fn close(&mut self, failed: bool) {
+    fn close(&mut self, error: Option<&'static str>) {
         if self.open.is_some() {
             self.close_sample();
         }
         if self.span.is_some() {
-            self.close_span(failed);
+            self.close_span(error);
         }
     }
 
@@ -88,9 +102,9 @@ impl<M: Send + 'static> MailboxBatch<'_, M> {
     }
 
     #[cold]
-    fn close_span(&mut self, failed: bool) {
+    fn close_span(&mut self, error: Option<&'static str>) {
         if let Some(span) = self.span.take() {
-            span.finish(self.mailbox, self.actor_type, failed);
+            span.finish(self.mailbox, self.actor_type, error);
         }
     }
 
@@ -113,7 +127,7 @@ impl<M: Send + 'static> Iterator for MailboxBatch<'_, M> {
     type Item = M;
 
     fn next(&mut self) -> Option<M> {
-        self.close(false);
+        self.close(None);
         if self.mailbox.stop_requested.load(Ordering::Relaxed)
             || self.mailbox.paused.load(Ordering::Relaxed)
             || self.mailbox.unstashed.load(Ordering::Relaxed)
@@ -248,7 +262,7 @@ impl<A: Actor> Driver<A> {
         let label = catch_unwind(AssertUnwindSafe(|| A::label(&msg))).unwrap_or("");
         let open = OpenSpan::begin(&mb, parent, label, None);
         let outcome = self.call(|a, cx| a.on_message(msg, cx));
-        open.finish(&mb, std::any::type_name::<A>(), outcome.is_err());
+        open.finish(&mb, std::any::type_name::<A>(), failure(&outcome));
         outcome
     }
 
@@ -439,7 +453,7 @@ impl<A: Actor> Driver<A> {
             overrun: false,
         };
         let outcome = if view.is_empty() { Ok(()) } else { self.call(|a, cx| a.on_batch(&mut view, cx)) };
-        view.close(outcome.is_err());
+        view.close(failure(&outcome));
         let (slots, bytes, overrun) = (view.slots, view.bytes, view.overrun);
         // The batch hands out at least one message unless a stop, a pause or a replay is pending, so an `on_batch` that
         // took none would be handed the same batch for ever.

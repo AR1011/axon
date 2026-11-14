@@ -174,7 +174,7 @@ generation it is never given a record twice, a record past the next one ends it 
 parents again after the position it was at when its stream closed, so a generation resumed from disk goes on where it
 was.
 
-A batch published inside a trace carries it to every live subscriber (`SequencedBatch::trace_context`), and each
+A batch published inside a trace carries it to every live subscriber (`SequencedBatch::trace`), and each
 node it crosses records a span ([tracing](tracing.md)).
 
 Guarantee: within a generation a subscriber gets every record once, in order, or an explicit reset. Never a

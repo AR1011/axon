@@ -1,4 +1,6 @@
 //! Lanes on real sockets: which lane a typed protocol, a raw endpoint, a reply in parts and an upload's body take.
+use std::collections::BTreeMap;
+
 use axon::Lane;
 
 use super::parts::{Ask, How, Pieces, joined, pattern, read_all, settled, two};
@@ -230,4 +232,104 @@ async fn a_third_session_of_one_peer_on_one_lane_closes_the_first() {
         assert!(new.sender.is_active(), "{lane:?}: the new boot's is served");
     }
     a.system.shutdown().await.unwrap();
+}
+
+/// A row of a node's link meters: its region pair, lane, direction and protocol.
+type Row = (String, String, Lane, &'static str, Option<String>);
+
+/// Each node's rows: frames, frame bytes and wire bytes.
+fn meters(node: &Node) -> BTreeMap<Row, [u64; 3]> {
+    let rows = node.cluster.stats().links.into_iter();
+    rows.map(|l| {
+        ((l.src_region, l.dst_region, l.lane, l.direction, l.protocol), [l.frames, l.frame_bytes, l.wire_bytes])
+    })
+    .collect()
+}
+
+/// A link's meters keep what its closed sessions moved: the `Live` session closes idle and the next call dials it
+/// again, and no row of either node drops, while the frames count the calls on both sessions.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_links_meters_take_in_the_sessions_it_closed() {
+    let discovery = MemoryDiscovery::new();
+    let a = node("a", &discovery).await;
+    // Closed after 300 ms unused rather than the shipped 5 min, so the test waits less.
+    let b = node_with("b", discovery.clone(), |cfg| cfg.idle_link_timeout = Duration::from_millis(300)).await;
+    sees(&b, 2).await;
+    a.cluster.endpoint("echo", 7, 1).serve(echo).unwrap();
+    let mut seen = [BTreeMap::new(), BTreeMap::new()];
+    let mut never_drop = |what: &str| {
+        for (node, seen) in [&a, &b].into_iter().zip(&mut seen) {
+            let now = meters(node);
+            for (row, before) in seen.iter() {
+                let after = now.get(row).unwrap_or_else(|| panic!("{what}: {row:?} left"));
+                assert!(after.iter().zip(before).all(|(after, before)| after >= before), "{what}: {row:?} dropped");
+            }
+            *seen = now;
+        }
+    };
+    let calls = async |n| {
+        for _ in 0..n {
+            b.cluster.request("a", "echo", 7, 1, Bytes::from(vec![1; 100])).await.unwrap();
+        }
+    };
+    calls(5).await;
+    never_drop("after the first session's calls");
+    eventually("the idle links are closed", async || {
+        never_drop("while they close");
+        b.cluster.stats().engine.peers.is_empty() && a.cluster.stats().engine.peers.is_empty()
+    })
+    .await;
+    never_drop("once closed");
+    calls(5).await;
+    never_drop("after the second session's calls");
+    assert_eq!(b.cluster.stats().engine.connects, 4, "Control and Live, twice");
+
+    let echoes = Some("0000000000000007".to_owned());
+    let row = |direction| (String::new(), String::new(), Lane::Live, direction, echoes.clone());
+    let wire = |direction| (String::new(), String::new(), Lane::Live, direction, None);
+    let (at_a, at_b) = (meters(&a), meters(&b));
+    assert_eq!(at_b[&row("sent")][0], 10, "b's requests");
+    assert_eq!(at_b[&row("received")], [10, 10 * (32 + 100), 0], "b's replies");
+    assert_eq!(at_a[&row("received")][0], 10, "a's requests");
+    assert_eq!(at_a[&row("sent")], [10, 10 * (32 + 100), 0], "a's replies");
+    for (node, meters) in [("a", &at_a), ("b", &at_b)] {
+        let (sent, received) = (meters[&wire("sent")][2], meters[&wire("received")][2]);
+        assert!(sent > 10 * 132 && received > 10 * 132, "{node}'s Live sessions moved {sent} and {received} bytes");
+    }
+    settled(&b).await;
+}
+
+/// A tell to an endpoint that has gone, and the verdict that says so, count under its protocol at the node that
+/// withdrew it, not under 0. The sender keeps nothing of a tell it sent, so the verdict counts under 0 there.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tell_to_an_endpoint_that_has_gone_counts_under_its_protocol() {
+    let discovery = MemoryDiscovery::new();
+    let (a, b) = (node("a", &discovery).await, node("b", &discovery).await);
+    sees(&a, 2).await;
+    sees(&b, 2).await;
+    let actor = a.system.spawn(Counter { total: 0, tag: "a".into() }).start().unwrap();
+    let published = a.cluster.publish::<CounterApi>(&actor, "counter").unwrap();
+    let remote = b.cluster.resolve::<CounterApi>("counter").await.unwrap();
+    a.cluster.unpublish(&published);
+    remote.tell(Op::Add(1)).await.unwrap();
+    // Counts by direction and protocol, over every lane.
+    let counts = |node: &Node| {
+        let mut counts = BTreeMap::new();
+        for ((.., direction, protocol), [n, ..]) in meters(node) {
+            if let Some(protocol) = protocol {
+                *counts.entry((direction, protocol)).or_insert(0) += n;
+            }
+        }
+        counts
+    };
+    let (counter, zero) = ("00000000000000c0".to_owned(), "0000000000000000".to_owned());
+    let verdict = ("received", zero.clone());
+    eventually("b hears that the endpoint has gone", async || counts(&b).contains_key(&verdict)).await;
+    let (at_a, at_b) = (counts(&a), counts(&b));
+    let at =
+        |counts: &BTreeMap<_, u64>, direction, protocol: &String| counts.get(&(direction, protocol.clone())).copied();
+    assert_eq!((at(&at_a, "received", &counter), at(&at_a, "sent", &counter)), (Some(1), Some(1)), "{at_a:?}");
+    assert!(at_a.keys().all(|(_, protocol)| *protocol != zero), "{at_a:?}");
+    assert_eq!((at(&at_b, "sent", &counter), at(&at_b, "received", &zero)), (Some(1), Some(1)), "{at_b:?}");
+    settled(&b).await;
 }

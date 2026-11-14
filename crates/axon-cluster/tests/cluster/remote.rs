@@ -41,10 +41,12 @@ async fn publish_resolve_call() {
         let letters = a.system.dead_letters().recent(10);
         let lost =
             letters.iter().any(|l| (l.reason, l.label, l.peer.as_deref()) == ("unknown_actor", "tell", Some("b")));
-        let spans = a.system.tracer().trace(root.trace.get());
-        lost && spans
-            .iter()
-            .any(|s| (s.kind, &*s.name, s.failed, s.peer.as_deref()) == (SpanKind::Handle, "tell", true, Some("b")))
+        let spans = a.system.tracer().trace(root.trace);
+        let reason = [("reason", axon::Attr::from("unknown_actor"))];
+        lost && spans.iter().any(|s| {
+            (s.kind, &*s.name, s.error, s.attrs.as_deref(), s.peer.as_deref())
+                == (SpanKind::Handle, "tell", Some("dead_letter"), Some(&reason[..]), Some("b"))
+        })
     })
     .await;
     twin.lifecycle.stop();

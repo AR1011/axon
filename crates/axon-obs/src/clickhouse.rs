@@ -11,10 +11,10 @@ use tokio::time::Instant;
 use crate::metrics::OWN_SEQUENCE;
 use crate::model::{HELD_MS, SampleBatch, Value};
 use crate::provider::*;
-use crate::traces::{DeadLetterRecord, SpanRecord, TraceQuery, TraceSummary, hex};
+use crate::traces::{DeadLetterRecord, SpanRecord, TraceQuery, TraceSummary, stored_ids};
 
-const SPAN_COLUMNS: &str =
-    "trace, span, parent, kind, name, node_id, actor, actor_name, actor_type, peer, start_us, wait_ns, busy_ns, failed";
+const SPAN_COLUMNS: &str = "trace, span, parent, kind, name, node_id, actor, actor_name, actor_type, peer, start_us, wait_ns, busy_ns, failed, \
+     error, attrs";
 const LETTER_COLUMNS: &str = "node_id, seq, at_us, reason, label, actor, actor_type, target, peer, trace, count";
 const MAX_RESPONSE: usize = 16 << 20;
 const USAGE_EVERY: Duration = Duration::from_secs(60);
@@ -150,6 +150,10 @@ impl ClickHouseProvider {
                  busy_ns UInt64, failed Bool) ENGINE = ReplacingMergeTree \
                  PARTITION BY intDiv(start_us, 86400000000) ORDER BY (trace, span) \
                  TTL toDateTime(intDiv(start_us, 1000000)) + INTERVAL {days} DAY"
+            ),
+            format!("ALTER TABLE `{db}`.spans ADD COLUMN IF NOT EXISTS error LowCardinality(String) AFTER failed"),
+            format!(
+                "ALTER TABLE `{db}`.spans ADD COLUMN IF NOT EXISTS attrs Map(LowCardinality(String), String) AFTER error"
             ),
             format!(
                 "CREATE TABLE IF NOT EXISTS `{db}`.dead_letters (node_id LowCardinality(String), seq UInt64, \
@@ -543,6 +547,12 @@ impl MetricsSink for ClickHouseProvider {
             }
             [s.start_us, s.wait_ns, s.busy_ns].into_iter().for_each(|n| row.u64(n));
             row.0.push(s.failed as u8);
+            row.str(&s.error);
+            row.len(s.attrs.len());
+            for (key, value) in &s.attrs {
+                row.str(key);
+                row.str(value);
+            }
         }
         Box::pin(async move { self.insert("spans", SPAN_COLUMNS, row.0).await })
     }
@@ -734,14 +744,15 @@ impl MetricsQuery for ClickHouseProvider {
         })
     }
 
-    fn trace(&self, trace: u64) -> MetricsFuture<'_, Vec<SpanRecord>> {
+    fn trace(&self, trace: axon::TraceId) -> MetricsFuture<'_, Vec<SpanRecord>> {
         Box::pin(async move {
             let sql = format!(
-                "SELECT {SPAN_COLUMNS} FROM `{}`.spans FINAL WHERE trace = {{trace:String}} \
+                "SELECT {SPAN_COLUMNS} FROM `{}`.spans FINAL WHERE trace IN ({{id:String}}, {{old:String}}) \
                  ORDER BY start_us, span LIMIT 10000 {LIMITS}",
                 self.database
             );
-            lines(&self.run(&sql, &[("trace".to_owned(), hex(trace))], Vec::new()).await?)
+            let [id, old] = stored_ids(trace);
+            lines(&self.run(&sql, &[("id".to_owned(), id), ("old".to_owned(), old)], Vec::new()).await?)
         })
     }
 }

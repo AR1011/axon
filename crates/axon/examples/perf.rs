@@ -1,5 +1,6 @@
-//! cargo run --release -p axon-actors --example perf -- <embedded|hosted|traced|contended|fanout|ask|asks|start|route|topic> [n]
-//! `traced` is `hosted` with every message starting a trace and recording a span.
+//! cargo run --release -p axon-actors --example perf -- <embedded|hosted|traced|contended|fanout|ask|asks|start|route|topic|trace_drain> [n]
+//! `traced` is `hosted` with every message starting a trace and recording a span. `trace_drain` reads `n` pages of a
+//! full 65 536-span ring, idle and then while 8 threads record, and prints how long each page's read took.
 #![expect(clippy::disallowed_methods, reason = "a benchmark measures real time")]
 
 use std::hint::black_box;
@@ -217,6 +218,14 @@ fn main() {
         return;
     }
 
+    if mode == "trace_drain" {
+        let n = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(100_000);
+        for recorders in [0, 8] {
+            trace_drain(n, recorders);
+        }
+        return;
+    }
+
     let (producers, actor_count, workers) = match mode {
         "contended" => (4, 1, 1),
         "fanout" => (1, 64, 4),
@@ -270,6 +279,71 @@ fn main() {
         }
     });
     rt.shutdown(Duration::from_secs(5));
+}
+
+/// Reads `n` full pages from a full ring while `recorders` threads record into it, timing each read. A read's time
+/// bounds its hold of the lock from above: it also waits for the lock.
+fn trace_drain(n: usize, recorders: u64) {
+    const SPANS: u64 = 65_536;
+    let tracer = Tracer::new(SPANS as usize, 0);
+    let root = TraceContext::root();
+    let span = |id: u64| Span::begin(root, id, SpanKind::Handle, "work");
+    (0..SPANS).for_each(|id| tracer.record(span(id)));
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let mut took = Vec::with_capacity(n);
+    let mut waits = Vec::new();
+    std::thread::scope(|scope| {
+        let recording: Vec<_> = (0..recorders)
+            .map(|t| {
+                let (tracer, stop) = (&tracer, &stop);
+                scope.spawn(move || {
+                    // How long one record in 64 took, which is mostly the wait for the reader's hold.
+                    let (mut id, mut waits) = (t << 48, Vec::new());
+                    while !stop.load(Ordering::Relaxed) {
+                        if id % 64 == 0 {
+                            let began = Instant::now();
+                            tracer.record(span(id));
+                            waits.push(began.elapsed());
+                        } else {
+                            tracer.record(span(id));
+                        }
+                        id += 1;
+                    }
+                    waits
+                })
+            })
+            .collect();
+        let mut after = 0;
+        while took.len() < n {
+            let began = Instant::now();
+            let page = tracer.since(after, Tracer::PAGE);
+            let elapsed = began.elapsed();
+            if page.len() == Tracer::PAGE {
+                after = page[Tracer::PAGE - 1].seq;
+                took.push(elapsed);
+            } else {
+                after = 0; // caught up with the writers: start again from the oldest span
+            }
+            black_box(page);
+        }
+        stop.store(true, Ordering::Relaxed);
+        waits = recording.into_iter().flat_map(|r| r.join().unwrap()).collect();
+    });
+    let at = |took: &mut Vec<Duration>, permille: usize| {
+        took.sort_unstable();
+        took.get(took.len().saturating_sub(1) * permille / 1000).copied().unwrap_or_default()
+    };
+    let recorded = tracer.recorded() - SPANS;
+    println!(
+        "trace_drain recorders={recorders}: pages={n} p50={:?} p99={:?} max={:?}; record p50={:?} p99={:?} \
+         p99.9={:?} over {recorded} spans",
+        at(&mut took, 500),
+        at(&mut took, 990),
+        at(&mut took, 1000),
+        at(&mut waits, 500),
+        at(&mut waits, 990),
+        at(&mut waits, 999),
+    );
 }
 
 struct Unpark(std::thread::Thread);

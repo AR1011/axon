@@ -457,6 +457,18 @@ async fn main() {
             scratch.join().await;
         }
     });
+    // A step the application records itself, with attributes, under which it tells a relay.
+    let (tracer, local) = (running[0].0.tracer().clone(), running[0].2[1].address.clone());
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            TraceContext::root().enter(|| {
+                let mut step = tracer.app("compact").expect("inside a trace");
+                step.attr("segments", 3u64).attr("bytes", 49_152u64).attr("tier", "warm");
+                step.enter(|| drop(local.try_tell(Msg::Tick)));
+            });
+        }
+    });
     if let Ok(flaky) = running[0].0.supervise(|| Flaky).name("flaky").start_supervised() {
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(3)).await;

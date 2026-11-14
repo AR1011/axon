@@ -51,6 +51,73 @@ What this establishes: with the feature compiled in and nobody listening, neithe
 does not measure a listening subscriber. That cost is the subscriber's own, paid on the recording thread for each
 span.
 
+### Tracing in wire v8
+
+[spec/tracing.md](../../../spec/tracing.md) left two choices to these runs: the trace id's type (§1) and whether the
+ring needs `Arc` segments (§3). Measured on an AMD Ryzen 7 5800X (16 threads, Linux 6.8), shared, so not quiet: load
+5–24 by `uptime` across the runs below. Before is spec/v8, after is lane/tracing, built from the same tree and run
+back to back, three rounds each; the table gives the range. `perf trace_drain` is new: a 65 536-span ring, one
+reader taking `since(after, PAGE)` 100 000 times, with 0 or 8 threads recording meanwhile, each timing one record
+in 64. "Hold" is the lock held per page, timed inside `read` in an instrumented copy that is not committed.
+
+| `perf`, ns/msg | before | after |
+|---|---|---|
+| hosted, untraced | 16.8–20.4 | 21.5–26.0 |
+| traced, every message | 133.6–143.4 | 134.4–146.4 |
+
+| Trace id, ns/msg | hosted | traced |
+|---|---|---|
+| before (`u64`) | 16.8–19.4 | 138–142 |
+| `NonZeroU128` | 21.5–23.8 | 139–142 |
+| `[u64; 2]` | 22.3–23.5 | 149–152 |
+| `(u64, NonZeroU64)` | 20.0–20.9 | 150–160 |
+
+| `perf trace_drain` | before | `Vec<Span>` copied under the lock | segments |
+|---|---|---|---|
+| page read, p50, idle | 1.44–1.51 µs | 4.5 µs; 2.34 µs once `attrs` is an `Arc` | 3.31–3.56 µs |
+| hold, p50 / p99, idle | — | 2.27 / 3.03 µs | 70–80 / 120–180 ns |
+| hold, p50 / p99, 8 recording | — | 2.51 / 3.47 µs | 180–220 / 440–510 ns |
+| record, p99 / p99.9, 8 recording | 38–54 / 66–132 µs | — | 14.3–17.1 / 26.9–32.7 µs |
+
+- **Trace id.** `NonZeroU128` stays. `[u64; 2]` is no cheaper hosted and 10 ns dearer traced; `(u64, NonZeroU64)`
+  is 11 ns dearer traced and cannot hold an id whose low half is zero.
+- **Attributes.** `Span.attrs` as a `Vec` made a page 2.2 µs dearer to clone, empty or not; `Option<Arc<[_]>>` costs
+  0.2 µs. A `Span` is 208 bytes against 160 before.
+- **Segments.** A page held the lock 2.3 µs, above the spec's 2 µs, so the ring is segments of 32 spans that a
+  reader clones under the lock and copies after it. Sealing a segment by copying it into an `Arc<[Span]>` cost a
+  traced message 23 ns (161.4–172.7); swapping the open `Arc<Vec<Span>>` for an empty one costs nothing measurable.
+- **Full size at the start.** The list of segments is allocated for a full ring when the tracer is made, so a
+  recorder never waits on it growing under the lock; before, it grew while the ring first filled, a copy of one
+  pointer a segment. In `perf trace_drain` (load 5–7, three rounds each) record is unchanged: p50 280–290 ns against
+  290–310, p99.9 29.2–29.7 µs against 28.2–29.5. Readers already take a page of 256 a hold, so no read holds the lock
+  for the whole ring.
+
+What this establishes: a reader never holds a recording thread up for more than a few hundred nanoseconds, and a
+traced message costs what it did. What it costs: the untraced hosted path is 4–7 ns a message dearer, because a
+mailbox entry carries the 25-byte context in 32 bytes (`Option<TraceContext>`) and grew from 56 to 80 bytes; and the
+reader takes 3.4 µs a page rather than 1.5, outside the lock. It does not establish anything on a quiet box.
+
+### Link meters in wire v8
+
+[spec/lanes.md §8.1](../../../spec/lanes.md#81-link-meters-wire-v8) adds, on each frame the engine sends or reads, a
+relaxed add to two counts of its protocol's meter; a call sent, and a request read, find that meter first: a read
+lock on the link's meters, and for a request read a look-up of its endpoint. `perf route` and
+`remote_calls 2000000 5000000` (pinned to cores 0–11) before (b325213, tracing in wire v8) and after (link meters), on the same Ryzen 7 5800X, back to back,
+three rounds each; the range is given. The box was busy with other work: load 19–23 by `uptime` throughout.
+
+| | before | after |
+|---|---|---|
+| `perf route` direct, ns/msg | 101.5–161.1 | 102.7–163.3 |
+| `perf route` hash, ns/msg | 135.2–199.1 | 142.4–225.0 |
+| `remote_calls` sequential request, p50 | 83.0–99.6 µs | 26.3–97.7 µs |
+| `remote_calls` 256 concurrent requests, req/s | 145 657–937 436 | 126 691–863 691 |
+| `remote_calls` tells sent, msg/s | 1.29–2.82 M | 1.19–2.40 M |
+
+What this establishes: with this box's load, no difference shows; the noise is up to a factor of 6 between rounds of
+one build. `perf route` routes in one process and does not run the changed code, so its rows are a measure of that
+noise. It does not establish the cost of the adds, which is below what these runs can see; a quiet box and
+`scripts/bench.sh remote_calls` would.
+
 ## The gate (`scripts/bench.sh`)
 
 `scripts/bench.sh` runs the harnesses below on a bench box and judges each row against the baseline committed for its

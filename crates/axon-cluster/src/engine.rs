@@ -40,7 +40,10 @@ use crate::membership::Membership;
 use crate::wire::*;
 use crate::{CallError, Rejection};
 
+mod meter;
 mod parts;
+pub use meter::LinkMeter;
+use meter::{LinkMeters, Meter, Meters};
 use parts::{Body, Flow, Grants};
 pub use parts::{Parts, Upload};
 
@@ -141,14 +144,22 @@ pub(crate) struct Registry {
     by_name: HashMap<Arc<str>, Vec<u64>>,
     /// Here, under the lock every admission already takes, so that swapping it costs a call nothing.
     authorizer: Option<Arc<dyn Authorizer>>,
+    /// The id and protocol of the endpoint withdrawn last in each of `RETIRED` slots, by `id % RETIRED`: what still
+    /// comes for one counts under its protocol.
+    retired: HashMap<u64, (u64, u64)>,
 }
+
+/// Slots of `Registry::retired`. Dynamic ids are handed out in turn, so an endpoint is remembered until one withdrawn
+/// after it lands in its slot.
+const RETIRED: u64 = 256;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Target {
     pub node: Arc<str>,
     pub incarnation: u128,
     pub endpoint: u64,
-    /// The caller's contract, which the serving node compares with the endpoint's.
+    /// The caller's contract, which the serving node compares with the endpoint's, and what the call's frames are
+    /// metered under: `CONTROL_PROTOCOL` for the system endpoints.
     pub protocol: u64,
     pub schema: u16,
     pub lane: Lane,
@@ -186,6 +197,7 @@ enum Sink {
     /// `parts` for a reply in parts: the credit the caller has granted.
     Remote {
         link: Arc<Link>,
+        meter: Arc<Meter>,
         id: u64,
         tokio: Handle,
         wait: Duration,
@@ -301,7 +313,7 @@ impl ReplyCore {
             },
             // A caller that stopped its reply in parts hears nothing more.
             Sink::Remote { parts: Some(flow), .. } if flow.stopped() => {}
-            Sink::Remote { link, id, tokio, wait, parts } => {
+            Sink::Remote { link, meter, id, tokio, wait, parts } => {
                 let compress = self.compress.load(Relaxed);
                 let (kind, last) = if parts.is_some() { (PART, Some(end(*id, ADMITTED))) } else { (REPLY, None) };
                 let frames = match outcome {
@@ -312,17 +324,18 @@ impl ReplyCore {
                 };
                 let mut frames = frames.into_iter().flatten();
                 while let Some(frame) = frames.next() {
-                    let Err(e) = link.sender.try_submit(frame) else { continue };
+                    let Err(e) = meter.try_submit(&link.sender, frame) else { continue };
                     // A full outbox costs this one reply a bounded wait, never the session. It waits holding a slot
                     // again, so what waits stays bounded; with none free it is dropped, and its caller times out.
                     if e.reason == SubmitReason::Full
                         && let Some(permit) = slot.take().and_then(|slot| slot.try_acquire_owned().ok())
                     {
-                        let (sender, at) = (link.sender.clone(), Instant::now() + *wait);
+                        // The link, not only its sender: its meters take what this sends before they close.
+                        let (link, meter, at) = (link.clone(), meter.clone(), Instant::now() + *wait);
                         let rest: Vec<_> = std::iter::once(e.frame).chain(frames).collect();
                         tokio.spawn(async move {
                             for frame in rest {
-                                if sender.submit(frame, Some(at)).await.is_err() {
+                                if meter.submit(&link.sender, frame, Some(at)).await.is_err() {
                                     break;
                                 }
                             }
@@ -456,18 +469,24 @@ enum Waiter {
     Parts(Arc<Flow>),
 }
 
+/// A flow on a link and the meter of its call's protocol.
+type Metered = (Arc<Flow>, Arc<Meter>);
+
 pub(crate) struct Link {
     pub sender: Sender,
     pub outgoing: bool,
     /// Runs `ClusterConfig::near`'s timings.
     near: bool,
-    pending: Mutex<HashMap<u64, Waiter>>,
+    /// Each with the meter of its call's protocol, as the flows below.
+    pending: Mutex<HashMap<u64, (Waiter, Arc<Meter>)>>,
     /// The peer's requests answered in parts, by its call id: where its credit goes.
-    producing: Mutex<BTreeMap<u64, Arc<Flow>>>,
+    producing: Mutex<BTreeMap<u64, Metered>>,
     /// The bodies of the peer's requests in parts, by its call id, while their handlers read them.
-    bodies: Mutex<BTreeMap<u64, Arc<Flow>>>,
+    bodies: Mutex<BTreeMap<u64, Metered>>,
     /// The bodies of this node's requests in parts, by call id: where the peer's credit goes.
-    uploading: Mutex<BTreeMap<u64, Arc<Flow>>>,
+    uploading: Mutex<BTreeMap<u64, Metered>>,
+    /// Its protocols' and its session's, taken into its region's when it is dropped.
+    meters: Arc<LinkMeters>,
     next_id: AtomicU64,
     calls: AtomicU64,
     rtt: AtomicHistogram,
@@ -477,7 +496,7 @@ pub(crate) struct Link {
 }
 
 impl Link {
-    fn new(sender: Sender, outgoing: bool, near: bool) -> Arc<Self> {
+    fn new(sender: Sender, outgoing: bool, near: bool, meters: Arc<LinkMeters>) -> Arc<Self> {
         Arc::new(Self {
             sender,
             outgoing,
@@ -486,6 +505,7 @@ impl Link {
             producing: Mutex::default(),
             bodies: Mutex::default(),
             uploading: Mutex::default(),
+            meters,
             next_id: AtomicU64::new(1),
             calls: AtomicU64::new(0),
             rtt: AtomicHistogram::default(),
@@ -493,12 +513,21 @@ impl Link {
         })
     }
 
+    /// Counts a frame in on its call's meter, or on 0's when the call has gone.
+    fn received(&self, meter: Option<&Meter>, frame: &Frame) {
+        match meter {
+            Some(meter) => meter.received(frame),
+            None => self.meters.meter(0).received(frame),
+        }
+    }
+
     fn is_gone(&self, endpoint: u64) -> bool {
         self.gone[endpoint as usize % 256].load(Relaxed) == endpoint
     }
 
     fn complete(&self, frame: Frame) {
-        let Some(waiter) = self.pending.lock().remove(&frame.id) else {
+        let Some((waiter, meter)) = self.pending.lock().remove(&frame.id) else {
+            self.received(None, &frame);
             // Nobody waits on a tell: its END only ever names an endpoint that is gone. The system endpoints never are.
             if frame.kind == END
                 && frame.payload[..] == [Rejection::UnknownActor as u8]
@@ -508,6 +537,7 @@ impl Link {
             }
             return;
         };
+        meter.received(&frame);
         let outcome = match frame.kind {
             REPLY => Outcome::Reply(frame.payload),
             _ => Outcome::End(frame.payload.first().copied().unwrap_or(Rejection::InvalidMessage as u8)),
@@ -527,11 +557,17 @@ impl Link {
     /// body that has ended is dropped: its reader stopped it.
     fn part(&self, frame: Frame) {
         let fits = if frame.kind & BODY != 0 {
-            self.bodies.lock().get(&frame.id).is_none_or(|flow| flow.push(frame.payload))
+            let bodies = self.bodies.lock();
+            let body = bodies.get(&frame.id);
+            self.received(body.map(|b| &*b.1), &frame);
+            body.is_none_or(|(flow, _)| flow.push(frame.payload))
         } else {
-            match self.pending.lock().get(&frame.id) {
-                Some(Waiter::Parts(flow)) => flow.push(frame.payload),
-                Some(Waiter::One(_)) => false,
+            let pending = self.pending.lock();
+            let call = pending.get(&frame.id);
+            self.received(call.map(|c| &*c.1), &frame);
+            match call {
+                Some((Waiter::Parts(flow), _)) => flow.push(frame.payload),
+                Some((Waiter::One(_), _)) => false,
                 None => true,
             }
         };
@@ -542,26 +578,43 @@ impl Link {
 
     /// The end of a body: one byte, `ADMITTED` or `NO_REPLY`.
     fn body_end(&self, frame: Frame) {
+        let flow = {
+            let bodies = self.bodies.lock();
+            let body = bodies.get(&frame.id);
+            self.received(body.map(|b| &*b.1), &frame);
+            body.map(|(flow, _)| flow.clone())
+        };
         let code = match frame.payload[..] {
             [code @ (ADMITTED | NO_REPLY)] => code,
             _ => return self.sender.close(),
         };
-        if let Some(flow) = self.bodies.lock().get(&frame.id) {
+        if let Some(flow) = flow {
             flow.end(ended(code));
         }
     }
 
     fn credit(&self, frame: Frame) {
+        let flows = if frame.kind & BODY != 0 { &self.uploading } else { &self.producing };
+        let flow = {
+            let flows = flows.lock();
+            let entry = flows.get(&frame.id);
+            self.received(entry.map(|e| &*e.1), &frame);
+            entry.map(|(flow, _)| flow.clone())
+        };
         let Ok(credit) = <[u8; 4]>::try_from(&frame.payload[..]).map(u32::from_be_bytes) else {
             return self.sender.close();
         };
-        let flows = if frame.kind & BODY != 0 { &self.uploading } else { &self.producing };
-        let flow = flows.lock().get(&frame.id).cloned();
         match flow {
             Some(flow) if credit == 0 => _ = flow.stop(),
             Some(flow) => flow.grant(credit),
             None => {}
         }
+    }
+}
+
+impl Drop for Link {
+    fn drop(&mut self) {
+        self.meters.close();
     }
 }
 
@@ -662,7 +715,7 @@ impl<E: Deref<Target = Engine>> Counted<E> {
     fn end<T>(mut self, result: Result<T, CallError>) -> Result<T, CallError> {
         if let Some((mut span, started)) = self.span.take() {
             span.busy = started.elapsed();
-            span.failed = result.is_err();
+            span.error = result.as_ref().err().map(CallError::kind);
             self.engine.cfg.tracer.record(span);
         }
         let c = &self.engine.counters;
@@ -809,6 +862,8 @@ pub(crate) struct Engine {
     tls: Option<(ServerTls, Mutex<Arc<ClientConfig>>)>,
     pub tokio: Handle,
     counters: Counters,
+    /// What every link has carried, by the peer's region and lane, for the node's life.
+    pub meters: Arc<Meters>,
 }
 
 impl Engine {
@@ -838,6 +893,7 @@ impl Engine {
             membership,
             open: AtomicBool::new(true),
             stale_routes: AtomicU64::new(0),
+            meters: Arc::default(),
             registry: RwLock::new(Registry { authorizer, ..Registry::default() }),
             next_endpoint: AtomicU64::new(FIRST_DYNAMIC),
             peers: Mutex::default(),
@@ -936,9 +992,9 @@ impl Engine {
     /// A fence: once this returns, no admission through `id` is running or can start.
     pub fn unregister(&self, id: u64) {
         let mut registry = self.registry.write();
-        if let Some(entry) = registry.by_id.remove(&id)
-            && let Some(ids) = registry.by_name.get_mut(&entry.name)
-        {
+        let Some(entry) = registry.by_id.remove(&id) else { return };
+        registry.retired.insert(id % RETIRED, (id, entry.protocol));
+        if let Some(ids) = registry.by_name.get_mut(&entry.name) {
             ids.retain(|i| *i != id);
             if ids.is_empty() {
                 registry.by_name.remove(&entry.name);
@@ -1018,6 +1074,8 @@ impl Engine {
     fn inbound(self: &Arc<Self>, link: &Arc<Link>, frame: Frame) {
         self.counters.inbound.fetch_add(1, Relaxed);
         let (kind, id, peer) = (frame.kind & !(TRACED | DEADLINE | PARTS | BODY), frame.id, link.sender.peer());
+        let meter = link.meters.meter(self.protocol_of(frame.protocol));
+        meter.received(&frame);
         let mut payload = frame.payload;
         let protocol = payload.try_get_u64().ok();
         let trace = (frame.kind & TRACED != 0 && payload.len() >= TraceContext::WIRE_LEN)
@@ -1051,7 +1109,7 @@ impl Engine {
             REQUEST => {
                 let refuse = || {
                     self.counters.refuse(Rejection::Full);
-                    drop(link.sender.try_submit(end(id, Rejection::Full as u8)));
+                    drop(meter.try_submit(&link.sender, end(id, Rejection::Full as u8)));
                 };
                 let Ok(permit) = self.replies.clone().try_acquire_owned() else { return refuse() };
                 let flow = parts.then(|| Flow::new(window));
@@ -1069,14 +1127,16 @@ impl Engine {
                         drop((producing, bodies));
                         return link.sender.close();
                     }
-                    producing.extend(flow.iter().map(|flow| (id, flow.clone())));
-                    bodies.extend(body.iter().map(|body| (id, body.clone())));
+                    producing.extend(flow.iter().map(|flow| (id, (flow.clone(), meter.clone()))));
+                    bodies.extend(body.iter().map(|body| (id, (body.clone(), meter.clone()))));
                 }
                 let wait = self.cfg.transport.write_timeout;
-                let sink = Sink::Remote { link: link.clone(), id, tokio: self.tokio.clone(), wait, parts: flow };
+                let tokio = self.tokio.clone();
+                let sink = Sink::Remote { link: link.clone(), meter: meter.clone(), id, tokio, wait, parts: flow };
                 let core = ReplyCore::new(sink, deadline, peer.max_frame, Some(permit));
                 if let Some(body) = body {
-                    let grants = Grants { link: link.clone(), id, tokio: self.tokio.clone(), wait, body: true };
+                    let (link, meter, tokio) = (link.clone(), meter.clone(), self.tokio.clone());
+                    let grants = Grants { link, meter, id, tokio, wait, body: true };
                     *core.body.lock() = Some(Upload::new(body, Some(grants), self.cfg.request_timeout));
                 }
                 Some(core)
@@ -1090,7 +1150,7 @@ impl Engine {
             enter(trace, || self.dispatch(kind, peer, to, payload, core.as_ref()))
         };
         let admitted = match admitted {
-            Ok(Some(wait)) => return self.wait(&link.sender, id, core, deadline, Scoped::new(trace, wait)),
+            Ok(Some(wait)) => return self.wait(link, meter, id, core, deadline, Scoped::new(trace, wait)),
             admitted => admitted.map(drop),
         };
         match kind {
@@ -1100,7 +1160,7 @@ impl Engine {
                 if let Err(rejection) = admitted {
                     if rejection == Rejection::UnknownActor && frame.protocol >= FIRST_DYNAMIC {
                         let verdict = Frame { protocol: frame.protocol, ..end(id, rejection as u8) };
-                        drop(link.sender.try_submit(verdict));
+                        drop(meter.try_submit(&link.sender, verdict));
                     }
                     self.counters.refuse(rejection);
                     let target = self.registry.read().by_id.get(&frame.protocol).map(|e| e.name.clone());
@@ -1112,24 +1172,44 @@ impl Engine {
                         actor: None,
                         target: target.or_else(|| Some(format!("endpoint {:x}", frame.protocol).into())),
                         peer: Some(peer.identity.node_id.as_str().into()),
-                        trace: 0,
+                        trace: None,
                         count: 1,
                     };
                     self.cfg.dead.record(letter, trace);
                 }
             }
-            _ => self.answer(&link.sender, id, core.as_deref(), admitted),
+            _ => self.answer(&link.sender, &meter, id, core.as_deref(), admitted),
+        }
+    }
+
+    /// The meter a call to `endpoint` counts under, whichever lane it came on: a withdrawn endpoint's protocol while
+    /// `Registry::retired` holds it, else 0 for an endpoint that is not here.
+    fn protocol_of(&self, endpoint: u64) -> u64 {
+        if endpoint < FIRST_DYNAMIC {
+            return CONTROL_PROTOCOL;
+        }
+        let registry = self.registry.read();
+        match registry.by_id.get(&endpoint) {
+            Some(entry) => entry.protocol,
+            None => registry.retired.get(&(endpoint % RETIRED)).filter(|(id, _)| *id == endpoint).map_or(0, |r| r.1),
         }
     }
 
     /// The verdict on a send or a request. If the outbox is full a send's is dropped and the caller times out.
-    fn answer(&self, sender: &Sender, id: u64, core: Option<&ReplyCore>, admitted: Result<(), Rejection>) {
+    fn answer(
+        &self,
+        sender: &Sender,
+        meter: &Meter,
+        id: u64,
+        core: Option<&ReplyCore>,
+        admitted: Result<(), Rejection>,
+    ) {
         if let Err(rejection) = admitted {
             self.counters.refuse(rejection);
         }
         match core {
             Some(core) => core.settle(admitted),
-            None => drop(sender.try_submit(end(id, admitted.map_or_else(|r| r as u8, |()| ADMITTED)))),
+            None => drop(meter.try_submit(sender, end(id, admitted.map_or_else(|r| r as u8, |()| ADMITTED)))),
         }
     }
 
@@ -1138,7 +1218,8 @@ impl Engine {
     /// unanswered, as if it had come in past it.
     fn wait(
         self: &Arc<Self>,
-        sender: &Sender,
+        link: &Arc<Link>,
+        meter: Arc<Meter>,
         id: u64,
         core: Option<Arc<ReplyCore>>,
         deadline: Option<Instant>,
@@ -1148,10 +1229,11 @@ impl Engine {
             Some(_) => None,
             None => match self.replies.clone().try_acquire_owned() {
                 Ok(permit) => Some(permit),
-                Err(_) => return self.answer(sender, id, None, Err(Rejection::Full)),
+                Err(_) => return self.answer(&link.sender, &meter, id, None, Err(Rejection::Full)),
             },
         };
-        let (engine, sender) = (self.clone(), sender.clone());
+        // The link, not only its sender: its meters take the answer before they close.
+        let (engine, link) = (self.clone(), link.clone());
         self.tokio.spawn(async move {
             let admitted = match deadline {
                 Some(at) => match timeout_at(at, wait).await {
@@ -1167,8 +1249,13 @@ impl Engine {
             };
             // A send's slot is free before its answer can reach the caller; a request's frees in `finish`.
             drop(permit);
-            engine.answer(&sender, id, core.as_deref(), admitted);
+            engine.answer(&link.sender, &meter, id, core.as_deref(), admitted);
         });
+    }
+
+    /// A link on `sender`'s session, metered under the peer's `region` label.
+    fn new_link(&self, sender: &Sender, outgoing: bool, near: bool) -> Arc<Link> {
+        Link::new(sender.clone(), outgoing, near, self.meters.open(sender, &self.membership))
     }
 
     async fn serve(self: &Arc<Self>, link: &Arc<Link>, mut receiver: Receiver) -> Error {
@@ -1198,19 +1285,19 @@ impl Engine {
         )]
         let mut pending: Vec<_> = link.pending.lock().drain().collect();
         pending.sort_unstable_by_key(|(id, _)| *id);
-        for (_, waiter) in pending {
+        for (_, (waiter, _)) in pending {
             // A dropped sender tells its caller the same.
             if let Waiter::Parts(flow) = waiter {
                 flow.end(Err(CallError::OutcomeUnknown));
             }
         }
         let bodies = std::mem::take(&mut *link.bodies.lock());
-        for flow in bodies.values() {
+        for (flow, _) in bodies.values() {
             flow.end(Err(CallError::OutcomeUnknown));
         }
         let producing = std::mem::take(&mut *link.producing.lock());
         let uploading = std::mem::take(&mut *link.uploading.lock());
-        for flow in producing.values().chain(uploading.values()) {
+        for (flow, _) in producing.values().chain(uploading.values()) {
             flow.stop();
         }
         error
@@ -1233,7 +1320,7 @@ impl Engine {
             if let Some((near, _)) = near {
                 session.set_timings(near.timings).expect("validated at start");
             }
-            let link = Link::new(session.sender.clone(), false, near.is_some());
+            let link = self.new_link(&session.sender, false, near.is_some());
             let key = (identity.node_id.as_str().into(), lane);
             // A peer dials a lane again while the session it let go idle still carries replies to its calls: that one
             // stays, until its peer closes it or a third comes. Sessions of another boot are gone.
@@ -1330,7 +1417,7 @@ impl Engine {
                 Ok(session) if named(&session.peer().identity) => {
                     self.counters.connects.fetch_add(1, Relaxed);
                     let near = dial.as_ref().is_some_and(|(dialled, _)| self.is_near(dialled));
-                    let link = Link::new(session.sender.clone(), true, near);
+                    let link = self.new_link(&session.sender, true, near);
                     // The boot the handshake answered for, at the address dialled.
                     slot.state.send_replace(LinkState::Up(link.clone(), (dialled.0, record.incarnation)));
                     self.membership.set_reachable(&node, record.incarnation, true);
@@ -1430,7 +1517,7 @@ impl Engine {
                         && session.peer().identity.incarnation == incarnation =>
                 {
                     self.counters.connects.fetch_add(1, Relaxed);
-                    let link = Link::new(session.sender.clone(), true, near);
+                    let link = self.new_link(&session.sender, true, near);
                     if slot.down_since.lock().take().is_some() {
                         self.cfg.events.record("lane_up", &*node, format!("{lane:?}"));
                     }
@@ -1768,8 +1855,8 @@ impl Engine {
         Ok(Admitted { rx, entry: None })
     }
 
-    /// The session to `target` and the call's frame. `DEADLINE` in `kind` sends the time left before `deadline`, and
-    /// `PARTS` the window.
+    /// The session to `target`, the meter of its protocol there and the call's frame. `DEADLINE` in `kind` sends the
+    /// time left before `deadline`, and `PARTS` the window.
     async fn prepare(
         self: &Arc<Self>,
         target: &Target,
@@ -1778,7 +1865,7 @@ impl Engine {
         compress: bool,
         deadline: Instant,
         trace: Option<TraceContext>,
-    ) -> Result<(Arc<Link>, Frame), CallError> {
+    ) -> Result<(Arc<Link>, Arc<Meter>, Frame), CallError> {
         let link = self.link(&target.node, target.lane, deadline).await?;
         if link.sender.peer().identity.incarnation != target.incarnation {
             return Err(CallError::StaleNode);
@@ -1805,7 +1892,8 @@ impl Engine {
             prefix,
             ..Frame::default()
         };
-        Ok((link, frame))
+        let meter = link.meters.meter(target.protocol);
+        Ok((link, meter, frame))
     }
 
     /// A frame the session to `target` refused. One closed under a call because its node left the view is `NoRoute`,
@@ -1833,8 +1921,8 @@ impl Engine {
     ) -> Result<Outcome, CallError> {
         let _permit = self.pending.try_acquire().map_err(|_| CallError::Busy)?;
         if kind & !DEADLINE == TELL {
-            let (link, frame) = self.prepare(target, kind, payload, compress, deadline, trace).await?;
-            link.sender.submit(frame, Some(deadline)).await.map_err(|e| self.not_sent(target, e.reason))?;
+            let (link, meter, frame) = self.prepare(target, kind, payload, compress, deadline, trace).await?;
+            meter.submit(&link.sender, frame, Some(deadline)).await.map_err(|e| self.not_sent(target, e.reason))?;
             return Ok(Outcome::End(ADMITTED));
         }
         let admitted = self.send_request(target, kind, payload, compress, deadline, trace).await?;
@@ -1851,16 +1939,16 @@ impl Engine {
         deadline: Instant,
         trace: Option<TraceContext>,
     ) -> Result<Admitted, CallError> {
-        let (link, frame) = self.prepare(target, kind, payload, compress, deadline, trace).await?;
+        let (link, meter, frame) = self.prepare(target, kind, payload, compress, deadline, trace).await?;
         let ((tx, rx), id) = (oneshot::channel(), frame.id);
-        link.pending.lock().insert(id, Waiter::One(tx));
+        link.pending.lock().insert(id, (Waiter::One(tx), meter.clone()));
         let every = self.cfg.transport.timing_sample_every as u64;
         // A watch is held open by design: its wait is not a round trip.
         let timed = every != 0 && id.is_multiple_of(every) && target.endpoint != WATCH;
         let admitted = Admitted { rx, entry: Some((link, id, timed.then(Instant::now))) };
         // Sent through the entry, which a refusal or a drop here takes back.
         if let Some((link, ..)) = &admitted.entry {
-            link.sender.submit(frame, Some(deadline)).await.map_err(|e| self.not_sent(target, e.reason))?;
+            meter.submit(&link.sender, frame, Some(deadline)).await.map_err(|e| self.not_sent(target, e.reason))?;
         }
         Ok(admitted)
     }
@@ -1941,13 +2029,13 @@ impl Engine {
                 parts
             } else {
                 let kind = REQUEST | PARTS | if within.is_some() { DEADLINE } else { 0 };
-                let (link, frame) = self.prepare(target, kind, body, false, deadline, here).await?;
+                let (link, meter, frame) = self.prepare(target, kind, body, false, deadline, here).await?;
                 let (id, sender) = (frame.id, link.sender.clone());
-                link.pending.lock().insert(id, Waiter::Parts(flow.clone()));
+                link.pending.lock().insert(id, (Waiter::Parts(flow.clone()), meter.clone()));
                 let (tokio, wait) = (self.tokio.clone(), self.cfg.transport.write_timeout);
-                let grants = Grants { link, id, tokio, wait, body: false };
+                let grants = Grants { link, meter: meter.clone(), id, tokio, wait, body: false };
                 let mut parts = Parts::new(flow, Some(grants), permit, idle, deadline);
-                if let Err(e) = sender.submit(frame, Some(deadline)).await {
+                if let Err(e) = meter.submit(&sender, frame, Some(deadline)).await {
                     parts.finish();
                     return Err(self.not_sent(target, e.reason));
                 }
@@ -2036,17 +2124,18 @@ impl Engine {
             return Ok(body);
         }
         let kind = REQUEST | BODY | if reply.is_some() { PARTS } else { 0 };
-        let (link, frame) = self.prepare(target, kind, head, false, deadline, here).await?;
+        let (link, meter, frame) = self.prepare(target, kind, head, false, deadline, here).await?;
         let (id, sender, tokio, wait) =
             (frame.id, link.sender.clone(), self.tokio.clone(), self.cfg.transport.write_timeout);
         let one = matches!(waiter, Waiter::One(_));
-        link.pending.lock().insert(id, waiter);
-        link.uploading.lock().insert(id, flow.clone());
+        link.pending.lock().insert(id, (waiter, meter.clone()));
+        link.uploading.lock().insert(id, (flow.clone(), meter.clone()));
         if let Some(reply) = reply {
-            reply.grants(Grants { link: link.clone(), id, tokio: tokio.clone(), wait, body: false });
+            let (link, meter, tokio) = (link.clone(), meter.clone(), tokio.clone());
+            reply.grants(Grants { link, meter, id, tokio, wait, body: false });
         }
-        let mut body = Body::new(flow, Some(Grants { link, id, tokio, wait, body: true }), one);
-        if let Err(e) = sender.submit(frame, Some(deadline)).await {
+        let mut body = Body::new(flow, Some(Grants { link, meter: meter.clone(), id, tokio, wait, body: true }), one);
+        if let Err(e) = meter.submit(&sender, frame, Some(deadline)).await {
             // The head never went: there is no body to end.
             body.end(false);
             return Err(self.not_sent(target, e.reason));

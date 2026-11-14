@@ -2,19 +2,20 @@
 
 use std::collections::BTreeMap;
 
-use axon::{Span, SpanKind};
+use axon::{Span, SpanKind, TraceId};
 use serde::{Deserialize, Serialize};
 
 pub const MAX_TRACE_LIMIT: usize = 1000;
 
-/// Ids are 16 hex digits: a `u64` does not survive JSON in a browser.
+/// Ids are hex, 32 digits for a trace and 16 for a span: neither survives JSON in a browser as a number. A trace
+/// stored before wire v8 has 16.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpanRecord {
     pub trace: String,
     pub span: String,
     /// Empty on the first span of a trace.
     pub parent: String,
-    /// `handle`, `call` or `stream`.
+    /// `handle`, `call`, `stream` or `app`.
     pub kind: String,
     pub name: String,
     pub node_id: String,
@@ -28,7 +29,14 @@ pub struct SpanRecord {
     pub start_us: u64,
     pub wait_ns: u64,
     pub busy_ns: u64,
+    /// Whether `error` is set; a span stored before there were error kinds has it alone.
     pub failed: bool,
+    /// What it failed with ([`axon::Span::error`]), or empty.
+    #[serde(default)]
+    pub error: String,
+    /// An `app` span's attributes, and a dropped message's `reason`.
+    #[serde(default)]
+    pub attrs: BTreeMap<String, String>,
 }
 
 /// A message a node accepted and never handled, or a group of the same within a second.
@@ -64,7 +72,7 @@ impl DeadLetterRecord {
             actor_type: letter.actor.map(|(_, kind)| kind.to_owned()).unwrap_or_default(),
             target: letter.target.as_deref().unwrap_or_default().into(),
             peer: letter.peer.as_deref().unwrap_or_default().into(),
-            trace: if letter.trace == 0 { String::new() } else { hex(letter.trace) },
+            trace: letter.trace.map(|t| t.to_string()).unwrap_or_default(),
             count: letter.count,
         }
     }
@@ -83,20 +91,31 @@ pub fn hex(id: u64) -> String {
     format!("{id:016x}")
 }
 
-pub fn parse_id(text: &str) -> Result<u64, String> {
-    u64::from_str_radix(text, 16).ok().filter(|id| *id != 0 && text.len() == 16).ok_or("not a trace id".to_owned())
+/// 32 hex digits, or 16 for an id stored before wire v8, whose high half is 0.
+pub fn parse_id(text: &str) -> Result<TraceId, String> {
+    let digits = matches!(text.len(), 16 | 32) && text.bytes().all(|c| c.is_ascii_hexdigit());
+    let id = digits.then(|| u128::from_str_radix(text, 16).ok()).flatten();
+    id.and_then(TraceId::new).ok_or("not a trace id".to_owned())
+}
+
+/// The forms `trace` may be stored in: its 32 digits, and the 16 it had before wire v8 when its high half is 0 (else
+/// the 32 again).
+pub fn stored_ids(trace: TraceId) -> [String; 2] {
+    let old = if trace.get() >> 64 == 0 { hex(trace.get() as u64) } else { trace.to_string() };
+    [trace.to_string(), old]
 }
 
 impl SpanRecord {
     pub fn new(span: &Span, node_id: &str, actor_name: &str) -> Self {
         Self {
-            trace: hex(span.trace),
+            trace: span.trace.to_string(),
             span: hex(span.span),
             parent: if span.parent == 0 { String::new() } else { hex(span.parent) },
             kind: match span.kind {
                 SpanKind::Handle => "handle",
                 SpanKind::Call => "call",
                 SpanKind::Stream => "stream",
+                SpanKind::App => "app",
             }
             .into(),
             name: span.name.to_string(),
@@ -108,7 +127,14 @@ impl SpanRecord {
             start_us: span.start_us,
             wait_ns: span.wait.as_nanos() as u64,
             busy_ns: span.busy.as_nanos() as u64,
-            failed: span.failed,
+            failed: span.error.is_some(),
+            error: span.error.unwrap_or_default().into(),
+            attrs: span
+                .attrs
+                .iter()
+                .flat_map(|attrs| attrs.iter())
+                .map(|(k, v)| ((*k).into(), v.to_string()))
+                .collect(),
         }
     }
 
@@ -123,6 +149,9 @@ pub struct SpanPage {
     pub incarnation: String,
     /// The position to ask after next time.
     pub next: u64,
+    /// Spans the ring let go of after the position asked for and before this page: lost before collection.
+    #[serde(default)]
+    pub missed: u64,
     pub spans: Vec<SpanRecord>,
 }
 
@@ -283,6 +312,12 @@ fn partial_summaries_add_up_and_the_query_filters_them() {
     assert_eq!(only(TraceQuery { from_ms: 5, ..query.clone() }), ["t2"]);
     assert_eq!(only(TraceQuery { limit: 1, ..query.clone() }), ["t2"]);
     assert!(TraceQuery { limit: 0, ..query }.validate().is_err());
-    assert_eq!(parse_id(&hex(255)), Ok(255));
-    assert!(parse_id("ff").is_err() && parse_id("000000000000000g").is_err());
+    assert_eq!(parse_id(&hex(255)).map(TraceId::get), Ok(255), "16 digits, as stored before wire v8");
+    let id = TraceId::new(0xab << 64 | 255).unwrap();
+    assert_eq!(parse_id(&id.to_string()), Ok(id));
+    assert_eq!(stored_ids(id), [id.to_string(), id.to_string()]);
+    assert_eq!(stored_ids(TraceId::new(255).unwrap()), [format!("{:032x}", 255), hex(255)]);
+    for bad in ["ff", "000000000000000g", "+00000000000000f", &"0".repeat(32), &format!("0{id}")] {
+        assert!(parse_id(bad).is_err(), "{bad}");
+    }
 }

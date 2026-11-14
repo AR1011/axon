@@ -264,14 +264,16 @@ mod tests {
     fn call_frame_bytes_are_pinned() {
         const ID: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 0xc0];
         let with_id = |rest: &[u8]| [&ID[..], rest].concat();
-        let trace = TraceContext::from_bytes([0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 9]);
+        let mut context = [0; TraceContext::WIRE_LEN];
+        (context[0], context[15], context[23], context[24]) = (0x4b, 7, 9, 1);
+        let trace = TraceContext::from_bytes(context);
         // The frame sends the prefix as the body's first bytes.
         let stamp = |kind, trace, left, window| {
             let (kind, prefix): (u16, Prefix) = stamp(kind, 0xc0, trace, left, window);
             (kind, [prefix.as_slice(), &b"hi"[..]].concat())
         };
         let (kind, both) = stamp(REQUEST, trace, Some(Duration::from_micros(1500)), None);
-        let mut pinned = with_id(&[0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 9]);
+        let mut pinned = with_id(&[0x4b, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 9, 1]);
         pinned.extend([0, 0, 0, 0, 0, 0, 0x05, 0xdc, b'h', b'i']);
         assert_eq!((kind, &both[..]), (0xc003, &pinned[..]));
         let (kind, left) = stamp(REQUEST, None, Some(Duration::from_millis(2)), None);
@@ -281,7 +283,7 @@ mod tests {
         let (kind, window) = stamp(REQUEST, None, None, Some(4 << 20));
         assert_eq!((kind, &window[..]), (0x2003, &with_id(&[0, 0x40, 0, 0, b'h', b'i'])[..]));
         let (kind, all) = stamp(REQUEST, trace, Some(Duration::from_micros(1500)), Some(4 << 20));
-        pinned.splice(32..32, [0, 0x40, 0, 0]);
+        pinned.splice(41..41, [0, 0x40, 0, 0]);
         assert_eq!((kind, &all[..]), (0xe003, &pinned[..]));
         assert_eq!((PART, CREDIT), (6, 7));
         let (kind, upload) = stamp(REQUEST | BODY, None, None, Some(4 << 20));

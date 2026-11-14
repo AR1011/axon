@@ -571,6 +571,70 @@ async fn each_lane_of_a_peer_is_a_row_and_a_series_of_its_own() {
     b_system.shutdown().await.unwrap();
 }
 
+/// A link's meters are series by region pair, lane, direction and protocol, each side counting what it sent and
+/// received: seven 100-byte echoes on `Live` are seven frames each way under protocol 7, and seven replies of the
+/// 32-byte header and the body; the route's lookup is the system's, on `Control`.
+#[tokio::test(flavor = "multi_thread")]
+async fn link_series_are_per_region_pair_lane_and_protocol() {
+    let discovery = MemoryDiscovery::new();
+    let in_region = |region: &'static str| {
+        move |cfg: &mut ClusterConfig| {
+            cfg.labels.insert("region".into(), region.into());
+        }
+    };
+    let system = ActorSystem::builder;
+    let (a_system, a) = common::loopback("a", discovery.clone(), system(), in_region("west")).await;
+    let (b_system, b) = common::loopback("b", discovery.clone(), system(), in_region("east")).await;
+    eventually("membership converges", || async { a.view().members.len() == 2 && b.view().members.len() == 2 }).await;
+    let echo = |_: &axon_net::Identity, body: Bytes, reply: Option<Reply>| {
+        drop(reply.map(|reply| reply.send(body)));
+        Ok(())
+    };
+    b.endpoint("echo", 7, 1).serve(echo).unwrap();
+    let cfg = TelemetryConfig {
+        // Sampled every 50 ms, so samples come within the test.
+        sample_interval: Duration::from_millis(50),
+        // Every sample written, changed or not.
+        rewrite_unchanged: Duration::ZERO,
+        access: AccessPolicy::Cluster,
+        ..Default::default()
+    };
+    let _a = Telemetry::start(&a_system, &a, cfg.clone()).await.unwrap();
+    let _b = Telemetry::start(&b_system, &b, cfg).await.unwrap();
+    for _ in 0..7 {
+        a.request("b", "echo", 7, 1, Bytes::from(vec![1; 100])).await.unwrap();
+    }
+
+    let link = |src, dst, lane, direction, protocol| {
+        [("src_region", src), ("dst_region", dst), ("lane", lane), ("direction", direction), ("protocol", protocol)]
+    };
+    let echoes = "0000000000000007";
+    eventually("the caller's meters", || async {
+        let page = fetch_samples(&b, "a", None).await.unwrap();
+        let batch = page.batches.last().unwrap();
+        let wire = [("src_region", "west"), ("dst_region", "east"), ("lane", "live"), ("direction", "sent")];
+        sample(batch, "link.frames", &link("west", "east", "live", "sent", echoes)) == Some(&Value::Counter(7))
+            && sample(batch, "link.frames", &link("east", "west", "live", "received", echoes))
+                == Some(&Value::Counter(7))
+            && sample(batch, "link.frame_bytes", &link("east", "west", "live", "received", echoes))
+                == Some(&Value::Counter(7 * (32 + 100)))
+            && matches!(sample(batch, "link.frames", &link("west", "east", "control", "sent", "axon.control")),
+                Some(Value::Counter(n)) if *n > 0)
+            && matches!(sample(batch, "link.wire_bytes", &wire), Some(Value::Counter(n)) if *n > 7 * 100)
+    })
+    .await;
+    eventually("the server's meters", || async {
+        let page = fetch_samples(&a, "b", None).await.unwrap();
+        let batch = page.batches.last().unwrap();
+        sample(batch, "link.frames", &link("west", "east", "live", "received", echoes)) == Some(&Value::Counter(7))
+            && sample(batch, "link.frame_bytes", &link("east", "west", "live", "sent", echoes))
+                == Some(&Value::Counter(7 * (32 + 100)))
+    })
+    .await;
+    a_system.shutdown().await.unwrap();
+    b_system.shutdown().await.unwrap();
+}
+
 /// A refusal at a namespace's limit is sampled under the limit it met.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_refusal_at_a_namespace_limit_is_sampled_by_its_limit() {

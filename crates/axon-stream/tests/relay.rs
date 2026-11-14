@@ -243,7 +243,7 @@ async fn a_traced_publish_is_a_span_on_every_hop_and_reaches_the_subscriber() {
         let mut seen = Vec::new();
         while seen.len() < 2 {
             match subscription.next().await.expect("subscription open") {
-                StreamEvent::Batch(batch) => seen.push(batch.trace_context()),
+                StreamEvent::Batch(batch) => seen.push(batch.trace()),
                 event => assert!(!event.is_terminal(), "{event:?} after {seen:?}"),
             }
         }
@@ -261,7 +261,7 @@ async fn a_traced_publish_is_a_span_on_every_hop_and_reaches_the_subscriber() {
         (&*hop_2[0].name, hop_2[0].peer.as_deref(), hop_2[0].kind),
         ("md/btc", Some("relay-a"), axon::SpanKind::Stream)
     );
-    assert_eq!(seen, [None, Some(axon::TraceContext { trace: root.trace, span: hop_2[0].span })]);
+    assert_eq!(seen, [None, Some(axon::TraceContext { span: hop_2[0].span, ..root })]);
 }
 
 #[tokio::test(flavor = "multi_thread")]

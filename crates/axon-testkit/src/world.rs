@@ -831,6 +831,13 @@ impl<N: Clone + 'static> World<N> {
         lock(&self.net).tail(n)
     }
 
+    /// Every connection made so far, open or closed, and what each end wrote to it.
+    pub fn carried(&self) -> Vec<Carried> {
+        let net = lock(&self.net);
+        let carried = net.carried.iter().map(|(conn, c)| Carried { open: net.conns.contains_key(conn), ..c.clone() });
+        carried.collect()
+    }
+
     /// A hash of every chunk delivered, every fault and every `log` line so far.
     pub fn digest(&self) -> u64 {
         lock(&self.net).hasher.finish()
@@ -1127,6 +1134,23 @@ struct Net {
     hasher: DefaultHasher,
     /// The hash after each quantum.
     digests: Vec<u64>,
+    /// What each connection carried; `open` is filled in when read.
+    carried: BTreeMap<u64, Carried>,
+}
+
+/// What one connection carried as its two ends wrote it: the handshake and every byte after, as TCP's payload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Carried {
+    /// The node that dialled.
+    pub from: String,
+    /// The node that accepted, and the port it accepted on.
+    pub to: String,
+    pub port: u16,
+    pub lane: Lane,
+    /// Written by `from`, then by `to`.
+    pub bytes: [u64; 2],
+    /// Whether either end is still open.
+    pub open: bool,
 }
 
 type Accepted = io::Result<(Box<dyn Io>, SocketAddr)>;
@@ -1253,6 +1277,7 @@ impl Net {
             trace: VecDeque::new(),
             hasher: DefaultHasher::new(),
             digests: Vec::new(),
+            carried: BTreeMap::new(),
         }
     }
 
@@ -1462,6 +1487,10 @@ impl Net {
                 }
                 self.record(line);
                 self.conns.insert(conn, Conn { ends: [End::new(from), End::new(t)], lane });
+                let (from_name, to_name) = (self.hosts[from].name.clone(), self.hosts[t].name.clone());
+                let carried =
+                    Carried { from: from_name, to: to_name, port: to.port(), lane, bytes: [0; 2], open: true };
+                self.carried.insert(conn, carried);
                 let port = 32_768 + (conn % 28_000) as u16;
                 let pipe = Box::new(Pipe { net: net.clone(), conn, end: 1 });
                 effects.accept.push((backlog, Ok((pipe, SocketAddr::new(self.hosts[from].ip, port)))));
@@ -1710,6 +1739,9 @@ impl AsyncWrite for Pipe {
         end.unacked += n;
         if n > 0 {
             net.send(self.conn, self.end, What::Data(data[..n].to_vec()));
+            if let Some(carried) = net.carried.get_mut(&self.conn) {
+                carried.bytes[self.end] += n as u64;
+            }
         }
         Poll::Ready(Ok(n))
     }

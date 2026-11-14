@@ -188,7 +188,8 @@ Nanoseconds are given in seconds. A histogram is `_bucket`, `_sum` and `_count`,
 ns to 275 s (15 ns, 63 ns, 255 ns, …) and `+Inf`: 19 bounds its buckets hold exactly, so `histogram_quantile` lands in
 the right factor of four and `_sum / _count` is exact. Labels are those of the table: per actor type and message label,
 never per actor except the at most 64 names in `persist_actors`, and per connection only the `sample_connections`
-busiest, one per peer and direction, so the count of series does not grow with the actors or the cluster. A persisted
+busiest, one per peer and direction, so the count of series does not grow with the actors or the cluster; the `link.*`
+counters cover every link, by region pair, lane and protocol, and grow with the regions and protocols only. A persisted
 actor's series are a family of their own, `axon_persisted_actor_processed_total{actor="pinned"}`, since its type's
 `axon_actor_processed_total` already counts it: a `sum` over either family counts each message once. A type's counters
 take in its exited actors and every generation of a supervised one, so they never go back while the node runs, and
@@ -258,8 +259,10 @@ The same data is served as JSON over HTTP by the dashboard (`api/overview`, `api
 
 A trace follows a message through every actor, node and stream it causes. Start one with `TraceContext::root()`, or
 sample them with `ActorSystem::builder().tracing(spans, sample_every)`; the collector stores the spans, and the
-console's traces page shows each trace as a waterfall. How the context travels, what each span records and how to
-read one back: [tracing](tracing.md).
+console's traces page shows each trace as a waterfall. A trace id is 128 bits, as a W3C `traceparent` has it, so a
+trace started by an HTTP request outside axon keeps its id; a failed span names why (`timeout`, `rejected.full`,
+`panic`, ...), and `Tracer::app` adds the application's own steps, with attributes. How the context travels, what each
+span records and how to read one back: [tracing](tracing.md).
 
 ## Dead letters
 
@@ -307,3 +310,4 @@ What else counts, the ring each node keeps and how repeats share a row, and wher
 [telemetry § Dead letters](telemetry.md#dead-letters). The console lists them with a link to the trace when there is
 one. A traced message dropped before any handler ran it leaves one failed handle span of zero length in the tracer,
 named by its label, under the span that sent it, so the link opens the trace at the place the message ended.
+Its error is `dead_letter`, and its `reason` attribute is the letter's reason.

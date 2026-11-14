@@ -6,6 +6,7 @@ import { deadLetters, pending } from "../store";
 import { attention } from "./attention";
 import { aggregate } from "./kpi";
 import { busiest, graphLinks } from "./links";
+import { regionEdges } from "./regions";
 import { ActorTrends, ConnSeries, connectionKey, departures, growth, NodeBuffer, nodeRow, type NodeRow } from "./live";
 import { reasons } from "./format";
 import { flatten, historyStep, joinPoints, ratePoints, rates } from "./series";
@@ -157,6 +158,33 @@ describe("graph links", () => {
     const links = graphLinks(at(2000), series, 2500);
     expect(links.map((l) => [l.id, l.lanes.map((p) => p.lane)])).toEqual([["a@i-a>b@i-b", ["control", "live"]]]);
     expect(links[0]).toMatchObject({ rate: 5000, frames: 50, frameBytes: 100, rtt: 4e6, carried: 10_000 });
+  });
+});
+
+describe("region edges", () => {
+  const sent = (src: string, dst: string, lane: Lane, wire_bytes: number) => ({ src_region: src, dst_region: dst, lane, direction: "sent", protocol: null, frames: 0, frame_bytes: 0, wire_bytes });
+  const at = (id: string, t: number, links: object[], incarnation = `i-${id}`) => {
+    const v = view(id, t, [], incarnation);
+    (v.snapshot!.cluster as { links?: object[] }).links = [
+      ...links,
+      { ...sent("x", "y", "control", 1e9), direction: "received" },
+      { ...sent("x", "y", "control", 1e9), protocol: "axon.control", wire_bytes: 0, frames: 9, frame_bytes: 999 },
+    ];
+    return v;
+  };
+
+  it("add each node's sent bytes over the lanes, a pair once whichever way, and leave a region to itself out", () => {
+    regionEdges(overview([at("ra", 1000, [sent("west", "east", "control", 100), sent("west", "east", "live", 1000), sent("west", "west", "live", 50)]), at("rb", 1000, [sent("east", "west", "live", 0)])]));
+    const now = overview([at("ra", 3000, [sent("west", "east", "control", 300), sent("west", "east", "live", 5000), sent("west", "west", "live", 9000)]), at("rb", 3000, [sent("east", "west", "live", 600)])]);
+    expect(regionEdges(now)).toEqual([{ id: "east\nwest", a: "east", b: "west", ab: 300, ba: 2100 }]);
+  });
+
+  it("start a node at 0 on its first snapshot and after a restart, and keep its rate on one that has not moved on", () => {
+    const edge = (ba: number) => [{ id: "east\nwest", a: "east", b: "west", ab: 0, ba }];
+    expect(regionEdges(overview([at("rc", 1000, [sent("west", "east", "live", 100)])]))).toEqual(edge(0));
+    expect(regionEdges(overview([at("rc", 2000, [sent("west", "east", "live", 1100)])]))).toEqual(edge(1000));
+    expect(regionEdges(overview([at("rc", 2000, [sent("west", "east", "live", 1100)])]))).toEqual(edge(1000));
+    expect(regionEdges(overview([at("rc", 3000, [sent("west", "east", "live", 50)], "i-rc2")]))).toEqual(edge(0));
   });
 });
 

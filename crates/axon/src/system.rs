@@ -330,7 +330,7 @@ impl ActorSystemBuilder {
             });
         }
         let runtime = Runtime::start(self.runtime).map_err(SystemError::Spawn)?;
-        let tracer = Tracer::new(self.trace.0, self.trace.1);
+        let tracer = Tracer::clocked(self.trace.0, self.trace.1, runtime.clock().clone());
         if let Some(pump) = runtime.pump() {
             tokio.spawn(run(pump, origin));
         }

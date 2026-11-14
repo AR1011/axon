@@ -1,6 +1,8 @@
 # Design — tracing in wire v8
 
-Status: designed, not built. Five changes to trace context and spans (OB-9 in
+Status: built, but for `axon_net::VERSIONS`, which moves to 8 with the rest of wire v8.
+
+Five changes to trace context and spans (OB-9 in
 [00-overview-and-requirements.md](00-overview-and-requirements.md); the user's view is the
 [tracing guide](../crates/axon/guide/tracing.md)): a W3C-sized context (§1), spans an application records itself
 (§2), a ring read in pages (§3), the error a span ended with (§4), and a count of spans lost before collection (§5).
@@ -21,7 +23,8 @@ decoded at `:312-319`), with `ITEM_FIXED = 45` exact for a traced batch (`:219`)
 - `TraceContext { trace: TraceId, span: u64, flags: u8 }`, `WIRE_LEN = 25`: trace id 16 bytes, span id 8, flags 1,
   big-endian, in `traceparent` order. `root()` draws 128 bits and sets flags `0x01` (sampled); `child()` keeps the
   trace and the flags; `TraceContext::new(trace, span, flags)` takes one from outside, and `traceparent()` /
-  `from_traceparent(&str)` convert the W3C text form.
+  `from_traceparent(&str)` convert the W3C text form. `traceparent()` is `None` at a root: its span is 0, which W3C
+  forbids, and `from_traceparent` refuses.
 - `TraceId` is `NonZeroU128` by default. The alternative, `[u64; 2]` with its own niche, keeps an
   `Option<TraceContext>` at 8-byte alignment: with `NonZeroU128` it is 16-byte aligned, so the context in each mailbox
   entry goes from 16 to 32 bytes. `perf hosted` and `perf traced` decide
@@ -59,8 +62,11 @@ ring and lose the parent links.
 
 **Design.**
 
-- `SpanKind::App`, and `Span.attrs: Vec<(&'static str, Attr)>`, `enum Attr { U64(u64), I64(i64), Str(Cow<'static, str>) }`.
-  An empty `Vec` does not allocate, so axon's own spans cost nothing more.
+- `SpanKind::App`, and `Span.attrs: Option<Arc<[(&'static str, Attr)]>>`, `enum Attr { U64(u64), I64(i64),
+  Str(Cow<'static, str>) }`; `None` on axon's own spans but a dropped message's (§4). Not a `Vec`, as first designed: an empty `Vec` allocates
+  nothing, but cloning a span that holds one cost 2.2 µs more a page of 256 (`perf trace_drain`,
+  [benchmarks](../crates/axon/guide/benchmarks.md)); an `Option<Arc<_>>` that is `None` costs 0.2 µs. `AppSpan` keeps
+  a `Vec` while it runs and shares it when it records.
 - `Tracer::app(name) -> Option<AppSpan>`: `None` outside a trace. `AppSpan::attr(key, value)`, `error(kind)` (§4) and
   `enter(f)`, under which what `f` sends is its child; dropped, it records itself with its `busy` time.
 - `SpanRecord.attrs: BTreeMap<String, String>`; ClickHouse `attrs Map(LowCardinality(String), String)` by
@@ -91,14 +97,20 @@ span the ring has, while every traced handler on the node waits to record.
   it got. `Request::Traces` and `Tracer::trace` read the ring through it.
 - The writer is unchanged: one push under the lock.
 - If `perf trace_drain` shows a hold of a page above 2 µs, the ring becomes segments of `Arc<[Span]>` that a reader
-  clones under the lock and reads outside it. Not before.
+  clones under the lock and reads outside it. Not before. It showed 2.3 µs idle and 2.5 µs with 8 threads recording
+  (Ryzen 7 5800X), so the ring is segments of 32 spans, `Arc<Vec<Span>>`, the newest one open. A writer pushes onto
+  the open segment, copying it first if a reader still holds it, and a full one is sealed by swapping in an empty one.
+  A hold is 80 ns idle and 220 ns with 8 threads recording. Sealing by copying the open spans into an `Arc<[Span]>`
+  cost a traced message 23 ns; the swap costs nothing measurable. The oldest segment goes once the newer ones hold
+  `capacity` spans, and readers skip the spans before the newest `capacity`, so the ring keeps exactly `capacity`
+  and holds up to 2 segments more in memory.
 
 **Wire.** None.
 
 **Tests.**
 
-- `crates/axon/tests/trace.rs::reading_the_whole_ring_holds_its_lock_for_one_page_at_most`: a `#[doc(hidden)]` count of
-  the most spans copied in one hold is 256 after `Request::Traces` on a 65 536-span ring (65 536 today).
+- `crates/axon/src/trace.rs::reading_the_whole_ring_holds_its_lock_for_one_page_at_most`: a test-only count of the
+  most spans copied in one hold is 256 after `Request::Traces` on a 65 536-span ring (65 536 today).
 - A bench row `perf trace_drain` in `crates/axon/guide/benchmarks.md`: the hold for one page, recording on 8 threads.
 
 ## 4. Error kinds
@@ -112,8 +124,10 @@ with a failed call does not say whether it timed out, was refused as full or los
 - `Span.error: Option<&'static str>` in place of `failed`. `CallError::kind(&self) -> &'static str` names it: `timeout`,
   `outcome_unknown`, `no_route`, `unreachable`, `stale_node`, `closed`, `busy`, `no_reply`, `codec`, `rejected.<name>`
   from `REJECTION_NAMES` (`engine.rs:713-714`) and `not_sent.<reason>` from `SUBMIT_REASONS`
-  (`crates/axon-net/src/session.rs:90`). A handler's span gives `error` or `panic`, a dead letter its reason, a stream
-  span its `StreamError`'s name.
+  (`crates/axon-net/src/session.rs:90`). A handler's span gives `error` or `panic`, a dead letter `dead_letter` with its
+  reason in the attribute `reason`, a stream span its `StreamError`'s name. A kind of its own, not the reason itself,
+  so that a reader tells a drop from a handler's failure by the kind alone: an application records letters with
+  reasons of its own.
 - `SpanRecord` keeps `failed`, now derived (`error.is_some()`), so stored rows and the console's filter keep working,
   and gains `error`; ClickHouse `error LowCardinality(String)` by `ALTER`. The console's "The call failed" names the
   kind.
@@ -125,6 +139,9 @@ with a failed call does not say whether it timed out, was refused as full or los
 - `crates/axon-cluster/tests/cluster/trace.rs::a_failed_call_span_names_its_error_kind`: a timeout, `rejected.full`, and
   `outcome_unknown` after a session cut (the partition row of [faults.md § actors: tracing](faults.md#actors-tracing)).
 - `crates/axon-obs/tests/metrics.rs::a_stored_span_keeps_failed_beside_its_error`
+- `crates/axon/tests/system.rs::messages_discarded_at_exit_become_dead_letters` and
+  `crates/axon-cluster/tests/cluster/remote.rs::publish_resolve_call`: a drop's span is `dead_letter` with its `reason`;
+  `crates/axon-obs/ui/tests/dashboard.spec.ts`: the console names the drop from the kind.
 
 ## 5. Dropped spans
 
@@ -150,5 +167,8 @@ its own gap as `first.seq - after - 1`; the guide says so.
 
 ## Open
 
-- §1: `NonZeroU128` against `[u64; 2]`, left to the bench, with `NonZeroU128` the default.
-- §3: `Arc` segments, left to `perf trace_drain`, paging the default.
+- §1: `NonZeroU128` against `[u64; 2]`, left to the bench, with `NonZeroU128` the default. Decided: `NonZeroU128`. On
+  `perf traced`, `[u64; 2]` cost 10 ns a message more and `(u64, NonZeroU64)` 11 ns more, and the second cannot hold
+  an id whose low half is zero; on `perf hosted` none of the three is cheaper than the others
+  ([benchmarks](../crates/axon/guide/benchmarks.md)).
+- §3: `Arc` segments, left to `perf trace_drain`, paging the default. Decided: segments (§3).

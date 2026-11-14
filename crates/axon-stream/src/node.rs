@@ -39,7 +39,7 @@ const ENDPOINT: &str = "axon.stream";
 const LIVE: &str = "axon.stream.live";
 const BULK: &str = "axon.stream.bulk";
 const PROTOCOL: u64 = 0x4158_4f4e_5354_524d;
-pub(crate) const SCHEMA: u16 = 7;
+pub(crate) const SCHEMA: u16 = 8;
 
 const RECORDS_NAME: &str = "axon.stream.records";
 const RECORDS: Rate = Rate::new(RECORDS_NAME, 0, Duration::from_secs(1));
@@ -199,11 +199,11 @@ fn take_spans(push: &mut Push, from: &str) -> Vec<(u16, Span)> {
     let mut spans = Vec::new();
     for (index, (key, _, item)) in push.items.iter_mut().enumerate() {
         let Item::Batch(batch) = item else { continue };
-        let Some(parent) = batch.trace_context() else { continue };
+        let Some(parent) = batch.trace() else { continue };
         let here = parent.child();
         let mut span = Span::begin(parent, here.span, SpanKind::Stream, key.to_string());
         span.peer = Some(from.into());
-        *batch = batch.clone().traced(Some((here.trace.get(), here.span)));
+        *batch = batch.clone().traced(Some(here));
         spans.push((index as u16, span));
     }
     spans
@@ -771,9 +771,9 @@ impl StreamNode {
         let Some(parent) = TraceContext::current() else { return publish(records, None) };
         let (here, started) = (parent.child(), Instant::now());
         let mut span = Span::begin(parent, here.span, SpanKind::Stream, key.to_string());
-        let published = publish(records, Some((here.trace.get(), here.span)));
+        let published = publish(records, Some(here));
         span.busy = started.elapsed();
-        span.failed = published.is_err();
+        span.error = published.as_ref().err().map(|e| e.error.kind());
         self.0.cluster.tracer().record(span);
         published
     }

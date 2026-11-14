@@ -217,7 +217,7 @@ pub fn decode_answers(body: &mut Bytes) -> Option<Vec<Answer>> {
 pub const PUSH_HEADER: usize = 21;
 
 /// Bytes of a push item besides its key's names, its payload and each record's length.
-pub const ITEM_FIXED: usize = 45;
+pub const ITEM_FIXED: usize = 54;
 
 /// An upper bound on one encoded push item carrying `bytes` in `records`; exact for a traced batch.
 pub fn item_len(key: &StreamKey, bytes: usize, records: usize) -> usize {
@@ -241,10 +241,9 @@ pub fn encode_push(channel: u64, seq: u64, push: &Push) -> Bytes {
             }
             Item::Batch(batch) => {
                 match batch.trace() {
-                    Some((trace, span)) => {
+                    Some(trace) => {
                         out.put_u8(5);
-                        out.put_u64(trace);
-                        out.put_u64(span);
+                        out.put_slice(&trace.to_bytes());
                     }
                     None => out.put_u8(1),
                 }
@@ -311,11 +310,16 @@ pub fn decode_push(body: &mut Bytes) -> Option<(u64, u64, Push)> {
         let item = match kind {
             0 => Item::Ready(get_cursor(body)?),
             1 | 5 => {
-                need(body, if kind == 5 { 32 } else { 16 })?;
-                let trace = (kind == 5).then(|| (body.get_u64(), body.get_u64()));
-                if trace.is_some_and(|(trace, _)| trace == 0) {
-                    return None;
-                }
+                const CONTEXT: usize = axon::TraceContext::WIRE_LEN;
+                need(body, if kind == 5 { CONTEXT + 16 } else { 16 })?;
+                let trace = match kind {
+                    5 => {
+                        let mut context = [0; CONTEXT];
+                        body.copy_to_slice(&mut context);
+                        Some(axon::TraceContext::from_bytes(context)?)
+                    }
+                    _ => None,
+                };
                 let (generation, first) = (body.get_u64(), body.get_u64());
                 Item::Batch(SequencedBatch::new(generation, first, get_records(body)?).ok()?.traced(trace))
             }

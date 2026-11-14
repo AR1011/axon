@@ -371,7 +371,7 @@ async fn the_dashboard_serves_the_cluster_over_http() {
 
     let root = axon::TraceContext::root();
     root.enter(|| idle[0].tell(()).unwrap());
-    let id = format!("{:016x}", root.trace);
+    let id = root.trace.to_string();
     let path = format!("api/trace?id={id}");
     // `tell` returns before the actor has handled the message.
     eventually("the span is held", || async { body(path.clone()).await.1["spans"][0]["kind"] == "handle" }).await;
@@ -402,7 +402,7 @@ async fn the_dashboard_serves_the_cluster_over_http() {
         actor: None,
         target: Some("orders".into()),
         peer: Some("a".into()),
-        trace: root.trace.get(),
+        trace: Some(root.trace),
         count: 3,
     };
     b_system.dead_letters().record(letter, None);
@@ -1159,7 +1159,7 @@ async fn redaction_hides_actor_keys_and_span_names_in_every_reply() {
     let (handled, published) = (TraceContext::root(), TraceContext::root());
     handled.enter(|| orders.tell(()).unwrap());
     published.enter(|| streams.publish(&key, vec![bytes::Bytes::from_static(b"p")]).unwrap());
-    let traces = [format!("api/trace?id={:016x}", handled.trace), format!("api/trace?id={:016x}", published.trace)];
+    let traces = [format!("api/trace?id={}", handled.trace), format!("api/trace?id={}", published.trace)];
     eventually("the actors, a keyed placement, an event and both spans are listed, without the key", || async {
         let overview = get("api/overview").await;
         overview.contains("\"subject\":\"orders/…\"")
@@ -1178,7 +1178,7 @@ async fn redaction_hides_actor_keys_and_span_names_in_every_reply() {
         actor: None,
         target: Some("orders/cust-42".into()),
         peer: None,
-        trace: 0,
+        trace: None,
         count: 1,
     };
     system.dead_letters().record(letter, None);
@@ -1264,7 +1264,7 @@ async fn a_store_that_keeps_no_traces_is_not_asked_for_them_and_its_refusal_is_n
     let idle = system.spawn(Idle).start().unwrap();
     let root = TraceContext::root();
     root.enter(|| idle.tell(()).unwrap());
-    let id = format!("{:016x}", root.trace);
+    let id = root.trace.to_string();
     eventually("the nodes list the trace, with no store error", || async {
         // A refresh probes the stores.
         dashboard.overview().await;

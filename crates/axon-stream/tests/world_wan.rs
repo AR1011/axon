@@ -14,14 +14,14 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axon::ActorSystem;
+use axon::{ActorSystem, Lane, SpanKind, TraceContext, TraceId};
 use axon_cluster::{
     Cluster, ClusterConfig, KEYED_ENDS, PaxosConfig, PaxosLeases, Placement, SeedConfig, SeedDiscovery, SeedServer,
     SeedServerConfig, SeedTimings, SpawnContext,
 };
 use axon_net::SharedSecret;
 use axon_stream::{Cursor, DeliveryPolicy, RelayTimings, StreamEvent, StreamNode, StreamNodeConfig, SubscribeOptions};
-use axon_testkit::world::{Crash, Host, Wire, World, WorldConfig};
+use axon_testkit::world::{Carried, Crash, Host, Wire, World, WorldConfig};
 use axon_testkit::{check_seeds, seeds};
 use bytes::{Buf, Bytes};
 
@@ -131,7 +131,7 @@ fn the_values_are_the_guides() {
 
 #[derive(Clone)]
 struct Node {
-    _system: ActorSystem,
+    system: ActorSystem,
     cluster: Cluster,
     stream: StreamNode,
     discovery: SeedDiscovery,
@@ -168,6 +168,7 @@ async fn boot(host: Host, timings: Timings, standby: bool) -> Node {
     } else {
         "member"
     });
+    cfg.labels.insert("region".into(), region(host.name()).into());
     let mut paxos = PaxosConfig::new(SEEDS);
     paxos.store = Some(Arc::new(host.disk().dir("leases")));
     let mut streams = StreamNodeConfig::new(match (origin, standby && !is_standby) {
@@ -196,7 +197,7 @@ async fn boot(host: Host, timings: Timings, standby: bool) -> Node {
     if origin {
         stream.open_stream(&key(), u64::from(host.boot()), DeliveryPolicy::ReplayRequired).await.unwrap();
     }
-    Node { _system: system, cluster, stream, discovery, seed }
+    Node { system, cluster, stream, discovery, seed }
 }
 
 /// What a live follower read.
@@ -207,6 +208,8 @@ struct Follower {
     readies: u32,
     lost: u32,
     wrong: Option<String>,
+    /// The context of each traced batch, as the subscriber got it.
+    traced: Vec<TraceContext>,
 }
 
 #[derive(Default)]
@@ -281,6 +284,7 @@ fn follow(w: &mut World<Node>, seen: &Rc<Seen>, on: &'static str) {
                     Some(format!("generation {}", batch.generation()))
                 }
                 StreamEvent::Batch(batch) => batch.records().iter().find_map(|record| {
+                    f.traced.extend(batch.trace());
                     let got = (&record[..]).get_u64();
                     let gap = f.last.is_some_and(|last| got != last + 1);
                     let wrong = gap.then(|| format!("record {got} after {:?}", f.last));
@@ -553,6 +557,52 @@ fn every_call_and_a_live_follower_recover_from_each_fault_across_regions() {
     check_seeds(seeds(0..32), faults).unwrap();
 }
 
+fn traced_publish(seed: u64) {
+    let (mut w, seen) = start(seed, Timings::Wan);
+    seen.stop.set(true);
+    w.run_for(Duration::from_secs(2));
+    // An id from outside, with the high half set, as a W3C trace id takes all 128 bits.
+    let id = TraceId::new(0xfeed_0000_0000_0000_0000_0000_0000_0001).unwrap();
+    let root = TraceContext::new(id, 0x5eed, TraceContext::SAMPLED);
+    let next = seen.next.get();
+    let published = w.spawn_on(ORIGIN, move |n| async move {
+        root.enter(|| n.stream.publish(&key(), vec![Bytes::copy_from_slice(&next.to_be_bytes())])).is_ok()
+    });
+    assert!(w.join(published).unwrap(), "seed {seed}: the origin refused the record");
+    w.run_until("both followers read the traced record", Duration::from_secs(5), |_| {
+        FOLLOWERS.iter().all(|f| seen.last(f) == Some(next))
+    });
+    assert_followers_right(&w, &seen);
+
+    // Every stream span of the trace, on whichever node took the batch: (node, parent).
+    let mut spans = BTreeMap::new();
+    for name in NODES {
+        for span in w.read(name, |n| n.system.tracer().trace(id)).unwrap_or_default() {
+            assert_eq!((span.trace, span.kind), (id, SpanKind::Stream), "seed {seed} on {name}");
+            spans.insert(span.span, (name, span.parent));
+        }
+    }
+    for on in FOLLOWERS {
+        let got = seen.followers.borrow()[on].traced.clone();
+        assert_eq!(got.len(), 1, "seed {seed}: {on} got {got:?}");
+        assert_eq!((got[0].trace, got[0].flags), (id, TraceContext::SAMPLED), "seed {seed} on {on}");
+        // From the follower's own span, back through each node the batch crossed, to the origin's publish.
+        let (mut hops, mut at) = (vec![], got[0].span);
+        while at != root.span {
+            let (node, parent) = spans.get(&at).copied().unwrap_or_else(|| panic!("seed {seed}: {at:x} of {on}"));
+            hops.push(node);
+            at = parent;
+        }
+        assert_eq!((hops.first(), hops.last()), (Some(&on), Some(&ORIGIN)), "seed {seed}: {hops:?}");
+        println!("world digest wan_traced seed {seed}: {on} by {hops:?}: {:016x}", w.digest());
+    }
+}
+
+#[test]
+fn a_traced_publish_keeps_its_128_bit_trace_on_every_hop_across_regions() {
+    check_seeds(seeds(0..4), traced_publish).unwrap();
+}
+
 /// sin cut from the rest for 5 s, every SYN on its links and every answer to one lost once, and after the heal its
 /// connections to eu-b and us-b reset: how many times a node counted a peer unreachable.
 fn lost_syns(seed: u64, timings: Timings) -> u64 {
@@ -675,4 +725,73 @@ fn origin_moved(seed: u64) {
 #[test]
 fn an_origin_moved_to_another_region_keeps_every_cursor() {
     check_seeds(seeds(0..16), origin_moved).unwrap();
+}
+
+/// Sent by each region to each region on each lane: as the nodes' link meters count it, as the World carried it, and
+/// the connections it went on.
+type Pairs = BTreeMap<(String, String, Lane), (u64, u64, u64)>;
+
+fn pairs(w: &World<Node>) -> Pairs {
+    let mut pairs = Pairs::new();
+    for name in NODES {
+        let links = w.read(name, |n| n.cluster.stats().links).unwrap_or_default();
+        for link in links.into_iter().filter(|l| l.direction == "sent" && l.protocol.is_none()) {
+            pairs.entry((link.src_region, link.dst_region, link.lane)).or_default().0 += link.wire_bytes;
+        }
+    }
+    // The seed links are sessions of their own, not the cluster's.
+    for c in w.carried().into_iter().filter(|c| c.port != SEED_PORT) {
+        let (from, to) = (region(&c.from).to_owned(), region(&c.to).to_owned());
+        for (key, bytes) in [((from.clone(), to.clone(), c.lane), c.bytes[0]), ((to, from, c.lane), c.bytes[1])] {
+            let pair = pairs.entry(key).or_default();
+            (pair.1, pair.2) = (pair.1 + bytes, pair.2 + 1);
+        }
+    }
+    pairs
+}
+
+/// What each region's nodes metered as sent to each region on each lane is what the World carried there, less each
+/// connection's handshake, across a partition that closes sin's sessions and the dials after it, and no pair's count
+/// drops at any 100 ms: the closed sessions' bytes stay in.
+fn metered(seed: u64) {
+    /// A connection's handshake one way, at most: 110 bytes or so at wire v8.
+    const HANDSHAKE: u64 = 160;
+    let (mut w, seen) = start(seed, Timings::Wan);
+    let mut last = pairs(&w);
+    let mut never_drop = |w: &World<Node>| {
+        let now = pairs(w);
+        for (pair, (before, ..)) in &last {
+            let after = now.get(pair).map_or(0, |p| p.0);
+            assert!(after >= *before, "seed {seed}: {pair:?} went from {before} to {after} at {:?}", w.now());
+        }
+        last = now;
+    };
+    w.partition(&["sin"], &others("sin"));
+    // Past the 8 s idle timeout: every session to sin closes.
+    let until = w.now() + Duration::from_secs(20);
+    while w.now() < until {
+        run(&mut w, &seen, Duration::from_millis(100));
+        never_drop(&w);
+    }
+    w.heal();
+    let healed = w.now();
+    recovered(&mut w, &NODES, &FOLLOWERS, &seen, healed);
+    never_drop(&w);
+    seen.stop.set(true);
+    run(&mut w, &seen, Duration::from_secs(1));
+    never_drop(&w);
+    let carried = w.carried();
+    let to_sin = |c: &&Carried| c.port != SEED_PORT && (c.from == "sin" || c.to == "sin");
+    let closed = carried.iter().filter(to_sin).filter(|c| !c.open).count();
+    assert!(closed > 0, "seed {seed}: no session to sin closed");
+    for ((src, dst, lane), (metered, carried, connections)) in &last {
+        let what = format!("seed {seed}: {src} to {dst} on {lane:?}: metered {metered}, carried {carried}");
+        assert!(metered <= carried && carried - metered <= connections * HANDSHAKE, "{what} on {connections}");
+    }
+    println!("world digest wan_metered seed {seed}: {closed} of sin's sessions closed: {:016x}", w.digest());
+}
+
+#[test]
+fn each_region_pairs_meter_matches_what_its_sessions_moved_across_cuts() {
+    check_seeds(seeds(0..4), metered).unwrap();
 }
