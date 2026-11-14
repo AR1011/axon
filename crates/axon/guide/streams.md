@@ -162,6 +162,13 @@ was emitted, not applied. Admission is not delivery. History is a bounded in-mem
 `RecoverySource` the application supplies; an origin can also keep it [on disk](#history-on-disk) to resume after a
 crash.
 
+A `Live` subscription that follows the key keeps its own position: the last record it was given, or the position its
+last `Ready` showed. Whatever its node's stream does under it (a close, a reset, a repull from a parent), within a
+generation it is never given a record twice, a record past the next one ends it with
+`ResetRequired(HistoryUnavailable)`, and another generation reaches it after a `Ready` for it. Its relay asks its
+parents again after the position it was at when its stream closed, so a generation resumed from disk goes on where it
+was.
+
 A batch published inside a trace carries it to every live subscriber (`SequencedBatch::trace_context`), and each
 node it crosses records a span ([tracing](tracing.md)).
 

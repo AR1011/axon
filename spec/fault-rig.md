@@ -522,9 +522,6 @@ Each is axon's, not the rig's, and reproduces on one box with every workload
 
 | Finding | Invariant | Reproduce |
 |---|---|---|
-| A `Live` follower is sent its generation again from record 1 after the origin resumes that generation from disk | `stream-dup` | `SMOKE_MIX=0 smoke 51`, episode 1 (`acceptors-rolling`); its replay hit 1 of 3 |
-| A `Live` follower skips the last durable record when the origin resumes from disk | `stream-gap` | `chaos 62 5`, episode 4 (`splitdelay` then a kill of the origin); its replay hit 0 of 3 |
-| A `Live` follower skips records after `OriginLost`, with no `Ready` or reset, when its relay restarted or it lost the origin during a cut | `stream-gap` | `chaos 52 8`; `ONLY=roll,cfgdrift,scale,cold-restart,acceptors-restart,acceptors-rolling,leave-minority,leave-slowdisk smoke 7`, episode 3, some runs |
 | A late first use of a permit key can exceed [quotas.md § 5](quotas.md)'s new-key bound: 16 of 12 against 15 when every node took its fallback share at once and one took a second before releasing | `quota-permit-over` | `pairs 53 8`, before any fault |
 | An isolated node answered `/readyz` 200 through an `isolate` (once) | `readyz-isolated` (probe) | `chaos 47 8` |
 
@@ -532,6 +529,9 @@ Each is axon's, not the rig's, and reproduces on one box with every workload
 
 | Finding | Seen | Test that now holds it |
 |---|---|---|
+| A `Live` follower was sent its generation again from record 1 after the origin resumed that generation from disk: a follower now keeps its own position and is never given a record twice, and a relay whose stream closed asks again after the position it closed at ([streams.md § 3](streams.md#3-follower-positions)) | `SMOKE_MIX=0 smoke 51`, episode 1, `stream-dup` | `hub.rs::a_follower_never_sees_a_position_twice_or_moves_past_one_whatever_its_relay_adopts` (a), `core/tests.rs::a_relay_asks_again_after_the_position_its_stream_closed_at`, the `stream_core` fuzz oracle |
+| A `Live` follower skipped the last durable record when the origin resumed from disk: a position past the next one now ends a follower with `ResetRequired(HistoryUnavailable)`, and its relay asks after its own position first | `chaos 62 5`, episode 4, `stream-gap` | `hub.rs::a_follower_never_sees_a_position_twice_or_moves_past_one_whatever_its_relay_adopts` (b), `core/tests.rs::a_relay_asks_again_after_the_position_its_stream_closed_at`, the `stream_core` fuzz oracle |
+| A `Live` follower skipped records after `OriginLost`, with no `Ready` or reset: a batch past its position ends it with `ResetRequired(HistoryUnavailable)`, and a new generation reaches it after a `Ready` | `chaos 52 8`, `stream-gap` | `hub.rs::a_follower_never_sees_a_position_twice_or_moves_past_one_whatever_its_relay_adopts` (c), the `stream_core` fuzz oracle |
 | After a partition healed, a caller waited up to the redial backoff's 30 s cap to reach an owner; `ClusterConfig::backoff` now caps it at 2 s. Every World test had shortened the cap, hence `scripts/check.sh timing` | night 2609, `liveness-after` | `world_faults.rs::calls_resume_within_the_redial_cap_once_a_long_cut_heals`, the shipped timings in `crates/axon-stream/tests/world.rs` |
 | A node that took a paused owner's keys handed them back only at its next discovery resync: a stale view now asks for a snapshot on each heartbeat | smoke 501, `liveness-after` | `world_leases.rs::every_op_answers_within_two_leases_of_a_paused_owners_resume`, `tests/cluster/discovery.rs::a_stale_view_is_fresh_again_once_its_watched_provider_answers_and_a_hung_one_holds_no_heartbeat_back` |
 | A key started elsewhere while its owner restarted stayed where no caller looked | smoke 31, `liveness-after` | `world_leases.rs::a_key_started_elsewhere_while_its_owner_restarted_goes_back_to_it` |

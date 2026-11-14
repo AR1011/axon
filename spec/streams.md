@@ -137,7 +137,7 @@ by `would_skip` (`hub.rs:511-513`). A close, a `GenerationChanged` reset or a re
 position and `lost = None`; `repull` also asks the parent for record 1 (`fresh`, `core.rs:1062-1075`). The next position
 then comes from `adopt_relay_stream`, which queues `Ready { start }` for every follower (`hub.rs:977-1001`), or from
 `accept_batch`, which queues none (`hub.rs:1206-1208`). The rig shows all three outcomes
-([fault-rig.md § Open findings](fault-rig.md#open-findings)):
+([fault-rig.md § Findings fixed](fault-rig.md#findings-fixed)):
 
 | Seen | Rig invariant | Reproduce |
 |---|---|---|
@@ -161,7 +161,9 @@ position first in each seed is not pinned by reading; the fix below does not dep
   This deletes `lost`, `would_skip`'s mark and the branch that keeps it across resets (`hub.rs:1056-1064`).
   `FollowAfter` (§2) starts with `at = Some(cursor)`.
 - Core: `repull` keeps the stream's last position and asks `After(position)` first; on `GenerationMismatch` it falls
-  back to `First` (`fresh`). A reopen of the same generation, from disk or after a move, then goes on with no reset.
+  back to `First`, then to what is wanted: `fresh` and the position become one `Feed::first`, the start asked on
+  top of `wanted_from`, which each such refusal moves on. A reopen of the same generation, from disk or after a
+  move, then goes on with no reset.
 - The class, not the instance: the `stream_core` fuzz oracle (`fuzz/fuzz_targets/stream_core.rs`) checks that each
   follower's delivered positions are contiguous within a generation and that a generation change follows a `Ready`.
 
@@ -172,12 +174,23 @@ position first in each seed is not pinned by reading; the fix below does not dep
 - `crates/axon-stream/tests/hub.rs::a_follower_never_sees_a_position_twice_or_moves_past_one_whatever_its_relay_adopts`,
   table-driven: follow, take 1..5, then (a) close, reopen, adopt `(g, 0)`, take 1..8: only 6..8 are delivered; (b) reset
   `GenerationChanged`, adopt `(g, 8)`: `ResetRequired(HistoryUnavailable)`; (c) reset `GenerationChanged`, a batch at 9
-  with no adopt: the same reset. Each fails today.
+  with no adopt: the same reset. Each failed before the fix.
+- `crates/axon-stream/src/core/tests.rs::a_relay_asks_again_after_the_position_its_stream_closed_at`: a relay
+  follows, its parent closes the key, and the relay asks again `After` the position it closed at, not `First`. It
+  failed before the fix.
 - `crates/axon-stream/tests/sim.rs`: "the origin reopens the same generation" and "a relay sees a close" join the fault
-  mix, judged by the oracle of `tests/world.rs:159`.
+  mix, judged by the oracle of `tests/world.rs:159`. They land with §2: without a disk an origin that opens the same
+  generation again numbers it from record 1, and with one `close_stream` removes the files, so the only reopen of a
+  generation that goes on is an `open_stream_after` elsewhere.
 - `crates/axon-stream/tests/world_disk.rs::a_follower_two_relays_away_sees_each_record_once_when_the_origin_resumes_after_origin_lost`:
-  the origin down 3.5 to 8 s, two relays, a ring smaller than the run. Hunt a failing seed before the fix
-  (`SEEDS=0..512 scripts/check.sh sim world_disk`); until one is found, the three rig replays above are the evidence.
+  the origin down 3.5 to 8 s, two relays. No seed of 0..512 fails before the fix either: the relays keep their
+  positions through `OriginLost`, and nothing closes their streams. It stays as the guard of that path. A ring smaller
+  than the run is left out: a child refused at the backoff while its parent was orphaned came back more than 64
+  records behind and was rightly reset (`ResetRequired(HistoryUnavailable)`, seed 171). A close and a reopen of the
+  same generation at the origin is not the case either: `close_stream` removes the files, so the reopen numbers from
+  record 1 again, the reuse the guide forbids. A relay sees a close of a generation that goes on only when the origin
+  moves, so that case is §2's World test. Until then the evidence is the hub test above, red before the fix, and the
+  three rig replays.
 - The three rows move from Open findings to Findings fixed in [fault-rig.md](fault-rig.md), citing these tests.
 
 ## 4. Elsewhere

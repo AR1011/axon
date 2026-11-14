@@ -29,8 +29,8 @@ struct Node {
 /// With the timings of `world_relay.rs`. The origin keeps `md` on its disk and opens the key as generation 1 on every
 /// boot, which resumes what the disk holds. A `relaying` origin also pulls the key from the relay, as every node of
 /// the fault rig does, and on a boot that resumes it opens the key only once the relay has asked it for the key, so
-/// the open takes back a key it relays.
-async fn boot(host: Host, discovery: MemoryDiscovery, relaying: bool) -> Node {
+/// the open takes back a key it relays. With `relay2`, the leaf is fed by `relay2`, fed by `relay`.
+async fn boot(host: Host, discovery: MemoryDiscovery, relaying: bool, relay2: bool) -> Node {
     let role = host.name().to_owned();
     let mut cfg = ClusterConfig::new(host.addr(), host.transport(SharedSecret::new(SECRET).unwrap()), discovery);
     common::short_cluster(&mut cfg);
@@ -41,6 +41,7 @@ async fn boot(host: Host, discovery: MemoryDiscovery, relaying: bool) -> Node {
         "origin" if relaying => vec![labels(&[("role", "relay")])],
         "origin" => vec![],
         "relay" => vec![labels(&[("role", "origin")])],
+        "leaf" if relay2 => vec![labels(&[("role", "relay2")])],
         _ => vec![labels(&[("role", "relay")])],
     };
     let mut cfg = StreamNodeConfig::new(upstream);
@@ -67,13 +68,18 @@ async fn boot(host: Host, discovery: MemoryDiscovery, relaying: bool) -> Node {
 }
 
 fn world(seed: u64, relaying: bool) -> World<Node> {
+    world_of(seed, relaying, false)
+}
+
+fn world_of(seed: u64, relaying: bool, relay2: bool) -> World<Node> {
     let discovery = MemoryDiscovery::new();
     let mut w = World::new(WorldConfig { seed, ..WorldConfig::default() });
-    for name in ["origin", "relay", "leaf"] {
+    let names: &[&str] = if relay2 { &["origin", "relay", "relay2", "leaf"] } else { &["origin", "relay", "leaf"] };
+    for &name in names {
         let discovery = discovery.clone();
-        w.add(name, move |host| boot(host, discovery.clone(), relaying));
+        w.add(name, move |host| boot(host, discovery.clone(), relaying, relay2));
     }
-    w.run_until("every node booted", Duration::from_secs(30), |w| w.nodes().count() == 3);
+    w.run_until("every node booted", Duration::from_secs(30), |w| w.nodes().count() == names.len());
     w
 }
 
@@ -218,6 +224,51 @@ fn resumes(seed: u64, relaying: bool, label: &str, crashes: &[Crash], fault: imp
     let disk = stream(&w, "origin").stats().disk.expect("kept on disk");
     assert_eq!((disk.unwritten_bytes, disk.failing), (0, None), "seed {seed}");
     println!("world digest disk_{label}_{crashes:?} seed {seed}: {:016x}", w.digest());
+}
+
+/// The origin down past `upstream_timeout`, so both relays are orphaned and the leaf's follower is told the origin is
+/// lost, then back from its files: the follower, two relays away, sees each record once. It guards the path through
+/// `OriginLost`, which kept its positions before the fix too (spec/streams.md § 3).
+#[test]
+fn a_follower_two_relays_away_sees_each_record_once_when_the_origin_resumes_after_origin_lost() {
+    check_seeds(seeds(0..64), |seed| {
+        let mut w = world_of(seed, true, true);
+        let live = collect(&mut w, StartPosition::Live);
+        w.run_until("the leaf follows through both relays", Duration::from_secs(30), |w| {
+            stream(w, "leaf").parent_of(&key()).as_deref() == Some("relay2")
+                && stream(w, "leaf").cursor(&key()).is_some()
+        });
+        let published = Published::default();
+        let stop = Rc::new(Cell::new(false));
+        publisher(&mut w, 1, &published, &stop);
+        let up = Duration::from_millis(w.pick(200..800));
+        w.run_for(up);
+        w.crash("origin", Crash::Process);
+        let down = Duration::from_millis(w.pick(3500..8000));
+        w.run_for(down);
+        restart_origin(&mut w);
+        publisher(&mut w, 2, &published, &stop);
+        let more = Duration::from_millis(w.pick(300..1000));
+        w.run_for(more);
+        stop.set(true);
+        w.run_for(Duration::from_millis(20));
+        let through = published.records.borrow().keys().next_back().copied().unwrap_or(0);
+        w.run_until("the leaf read everything", Duration::from_secs(20), |_| {
+            last(&live) >= through || live.borrow().is_err()
+        });
+        let read = live.borrow().clone().unwrap_or_else(|wrong| panic!("seed {seed}: the follower read {wrong}"));
+        assert!(through > 400, "seed {seed}: {through} published");
+        let published = published.records.borrow();
+        let differs = published.iter().find(|(s, r)| read.get(s) != Some(r)).map(|(s, r)| (s, r, read.get(s)));
+        assert!(
+            read.len() == published.len() && differs.is_none(),
+            "seed {seed}: read {} of {}, first wrong {differs:?}",
+            read.len(),
+            published.len()
+        );
+        println!("world digest disk_two_relays seed {seed}: {:016x}", w.digest());
+    })
+    .unwrap();
 }
 
 /// Nothing a subscriber saw is lost, and nothing is seen twice: records are shown once they are synced, and the

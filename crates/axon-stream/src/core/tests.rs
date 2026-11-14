@@ -709,3 +709,25 @@ fn a_default_subscriber_holds_the_pushes_of_a_round_trip_applied_back_to_back() 
     assert!(peak > half, "never past half the branch in flight: {peak}");
     assert_eq!(seen, (1..=records as u64).collect::<Vec<_>>());
 }
+
+/// A relay whose stream closed asks its parent again after the position it closed at, so an open of the same
+/// generation goes on from there for its followers, and not from record 1.
+#[test]
+fn a_relay_asks_again_after_the_position_its_stream_closed_at() {
+    let now = Instant::now();
+    let (o, r) = (PeerId::new("o", 1), PeerId::new("r", 1));
+    let mut origin = origin(&scaled(), 1, 32);
+    let mut relay = RelayCore::new(&r, AllowAll, CoreConfig { relay: true, ..scaled() }).expect("a valid config");
+    let follower = relay.subscribe(&key(0), SubscribeOptions::default()).expect("follows");
+    ask(&mut origin, &o, &mut relay, &r, now);
+    origin.publish(&key(0), vec![Bytes::from_static(b"x")]).expect("publishes");
+    deliver(&mut origin, &o, &mut relay, &r, now);
+    assert_eq!(records(&mut relay, follower), vec![33]);
+    origin.close_stream(&key(0)).expect("closes");
+    deliver(&mut origin, &o, &mut relay, &r, now);
+    // Past any refusal backoff: the relay asks for the key again.
+    let later = now + Duration::from_secs(60);
+    let asked = relay.reconcile(std::slice::from_ref(&o), later);
+    let starts: Vec<_> = asked.iter().flat_map(|(_, i)| &i.wants).map(|w| w.start).collect();
+    assert_eq!(starts, vec![StartPosition::After(Cursor { generation: 1, sequence: 33 })]);
+}

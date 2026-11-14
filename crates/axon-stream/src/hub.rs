@@ -462,8 +462,9 @@ struct Sub {
     terminal: Option<StreamEvent>,
     /// Survives restarts and closes of the key: a `Ready` marks each one instead of a terminal event.
     follow: bool,
-    /// The position the relay gave up under this follower: another one in its generation would skip what was lost.
-    lost: Option<Cursor>,
+    /// The last position it was given, at a batch or a positioned `Ready`, or the cut its replay runs to: the
+    /// subscription's own, whatever position its stream takes.
+    at: Option<Cursor>,
     /// A branch waiting for the snapshot its relay asked its own parent for.
     awaits_state: bool,
     /// The state for a branch, queued once it has stopped replaying and has room for it, so it never holds back what
@@ -496,20 +497,51 @@ impl Sub {
         self.queue.insert(at, event);
     }
 
-    /// A new position. An unpolled one it replaces carried nothing the new one does not.
-    fn ready(&mut self, start: Option<Cursor>) {
-        if start.is_some() {
-            self.lost = None;
+    /// A control event after everything queued, held with the live tail while a replay runs.
+    fn push(&mut self, event: StreamEvent) {
+        self.queue.push_back(event);
+        if matches!(self.phase, Phase::Recovering { .. }) {
+            self.tail += 1;
         }
-        if self.tail == 0 && matches!(self.queue.back(), Some(StreamEvent::Ready { .. })) {
-            self.queue.pop_back();
-        }
-        self.queue.push_back(StreamEvent::Ready { start });
     }
 
-    /// Whether a relay's new position `at` would move this follower past records its node lost.
-    fn would_skip(&self, at: Cursor) -> bool {
-        self.lost.is_some_and(|lost| at.generation <= lost.generation && at != lost)
+    /// Whether the stream's new position `to` is news to this subscription: not when it is behind the subscription's
+    /// own in its generation, and a reset when it is past it, where it would skip records.
+    fn moves_to(&self, to: Cursor) -> Result<bool, StreamEvent> {
+        match self.at {
+            Some(at) if at.generation == to.generation && to.sequence > at.sequence => {
+                Err(StreamEvent::ResetRequired(ResetReason::HistoryUnavailable))
+            }
+            Some(at) if at.generation == to.generation => Ok(to.sequence == at.sequence),
+            _ => Ok(true),
+        }
+    }
+
+    /// A positioned `Ready`, unless the subscription is past it.
+    fn announce(&mut self, to: Cursor) -> Result<(), StreamEvent> {
+        if self.moves_to(to)? {
+            self.at = Some(to);
+            self.push(StreamEvent::Ready { start: Some(to) });
+        }
+        Ok(())
+    }
+
+    /// A follower's new position, or `None` while the stream has none. An unpolled one it replaces carried nothing the
+    /// new one does not.
+    fn ready(&mut self, start: Option<Cursor>) -> Result<(), StreamEvent> {
+        if let Some(to) = start
+            && !self.moves_to(to)?
+        {
+            return Ok(());
+        }
+        // Not a position for none: the generation it announced would go unannounced.
+        let replaced = |s: &Option<Cursor>| start.is_some() || s.is_none();
+        if self.tail == 0 && matches!(self.queue.back(), Some(StreamEvent::Ready { start: s }) if replaced(s)) {
+            self.queue.pop_back();
+        }
+        self.at = start.or(self.at);
+        self.push(StreamEvent::Ready { start });
+        Ok(())
     }
 
     /// The only place queue capacity is given back.
@@ -528,6 +560,7 @@ impl Sub {
         if let Phase::Waiting(Some(after)) = self.phase
             && at >= after.sequence
         {
+            self.at = Some(after);
             self.queue.push_back(StreamEvent::Ready { start: Some(after) });
             self.queue.push_back(StreamEvent::CaughtUp { through: after });
             self.phase = Phase::Live;
@@ -548,6 +581,7 @@ impl Sub {
     ) {
         self.queue.push_back(StreamEvent::Ready { start });
         let with_state = snapshot.is_some();
+        self.at = replay.as_ref().map_or(start, |(_, cut, _)| Some(*cut));
         if let Some(snapshot) = snapshot {
             self.enqueue(1, StreamEvent::Snapshot(snapshot), total);
         }
@@ -592,6 +626,23 @@ impl Sub {
                 None => Ok(()),
             };
         }
+        // Held to its own position: what it was given is dropped, a skip past it is a reset, and a new generation is
+        // announced.
+        let from = Cursor { generation: batch.generation(), sequence: batch.first() - 1 };
+        let trimmed;
+        let batch = match self.at {
+            Some(at) if !self.moves_to(from)? => {
+                let Some(rest) = batch.clone().after(at.sequence) else { return Ok(()) };
+                trimmed = rest;
+                &trimmed
+            }
+            Some(at) if at.generation != from.generation => {
+                self.push(StreamEvent::Ready { start: Some(from) });
+                batch
+            }
+            _ => batch,
+        };
+        self.at = Some(batch.cursor());
         let (branch, global) = self.fits(batch.bytes(), batch.len(), total, hub);
         if branch && global {
             let at = self.queue.len();
@@ -801,7 +852,10 @@ impl<A: Authorizer> StreamHub<A> {
         for id in ids {
             match self.subs.get_mut(&id) {
                 Some(sub) if sub.follow && !matches!(terminal, StreamEvent::End(_)) => {
-                    sub.ready(start);
+                    if let Err(reset) = sub.ready(start) {
+                        self.terminate(id, reset);
+                        continue;
+                    }
                     self.stats.count(&terminal);
                     self.streams.get_mut(key).expect("looked up above").subscribers.push(id);
                 }
@@ -950,8 +1004,9 @@ impl<A: Authorizer> StreamHub<A> {
             let Some(sub) = self.subs.get_mut(&id) else { continue };
             if sub.policy == SlowConsumerPolicy::CoalesceLatest && policy != DeliveryPolicy::ReplaceableState {
                 self.terminate(id, StreamEvent::End(EndReason::Unsubscribed));
+            } else if let Err(reset) = sub.ready(cursor) {
+                self.terminate(id, reset);
             } else {
-                sub.ready(cursor);
                 subscribers.push(id);
             }
         }
@@ -986,50 +1041,44 @@ impl<A: Authorizer> StreamHub<A> {
             return Ok(false);
         }
         stream.cursor = Some(cursor);
-        for id in &stream.subscribers {
-            if let Some(sub) = self
-                .subs
-                .get_mut(id)
-                .filter(|s| !matches!(s.phase, Phase::Waiting(_) | Phase::Snapshot(_)) && !s.would_skip(cursor))
-            {
-                sub.queue.push_back(StreamEvent::Ready { start: Some(cursor) });
-            }
-        }
-        self.position(key, cursor);
+        self.position(key, cursor, true);
         Ok(true)
     }
 
-    /// A relay stream took its first position: each start waiting on it goes live or is reset, and so is a follower
-    /// it would move past records lost to this node.
-    fn position(&mut self, key: &StreamKey, at: Cursor) {
+    /// A relay stream took its first position: each start waiting on it goes live or is reset, and, when `announced`,
+    /// each other subscription is told it, or reset where it would move past records it never had.
+    fn position(&mut self, key: &StreamKey, at: Cursor, announced: bool) {
         let Some(stream) = self.streams.get_mut(key) else { return };
         // Taken out while the reset are ended, so each end finds no list to search.
         let mut ids = std::mem::take(&mut stream.subscribers);
         let mut reset = Vec::new();
         ids.retain(|&id| {
             let Some(sub) = self.subs.get_mut(&id) else { return true };
-            let skips = sub.would_skip(at);
-            sub.lost = None;
-            let reason = if skips {
-                ResetReason::HistoryUnavailable
-            } else {
-                let Phase::Waiting(after) = sub.phase else { return true };
-                let after = after.unwrap_or(Cursor { sequence: 0, ..at });
-                if after.generation != at.generation {
-                    ResetReason::GenerationChanged
-                } else if after.sequence < at.sequence {
-                    ResetReason::HistoryUnavailable
-                } else {
-                    sub.phase = Phase::Waiting(Some(after));
-                    sub.reach(at.sequence);
-                    return true;
+            let terminal = match sub.phase {
+                Phase::Waiting(after) => {
+                    let after = after.unwrap_or(Cursor { sequence: 0, ..at });
+                    if after.generation != at.generation {
+                        StreamEvent::ResetRequired(ResetReason::GenerationChanged)
+                    } else if after.sequence < at.sequence {
+                        StreamEvent::ResetRequired(ResetReason::HistoryUnavailable)
+                    } else {
+                        sub.phase = Phase::Waiting(Some(after));
+                        sub.reach(at.sequence);
+                        return true;
+                    }
                 }
+                Phase::Snapshot(_) => return true,
+                _ if !announced => return true,
+                _ => match sub.announce(at) {
+                    Ok(()) => return true,
+                    Err(terminal) => terminal,
+                },
             };
-            reset.push((id, reason));
+            reset.push((id, terminal));
             false
         });
-        for (id, reason) in reset {
-            self.terminate(id, StreamEvent::ResetRequired(reason));
+        for (id, terminal) in reset {
+            self.terminate(id, terminal);
         }
         self.streams.get_mut(key).expect("looked up above").subscribers = ids;
     }
@@ -1042,8 +1091,7 @@ impl<A: Authorizer> StreamHub<A> {
     }
 
     /// Resets every subscriber and forgets a relay stream's position, so the next batch is adopted. A
-    /// follower sees the next position, unless the position was lost (`HistoryUnavailable`) and the next
-    /// is in its generation, past records it never had: then it is reset too.
+    /// follower keeps its own: the next position goes on from it, or resets it where it would move past records.
     pub fn reset_relay_stream(
         &mut self,
         publisher: &PeerId,
@@ -1051,17 +1099,8 @@ impl<A: Authorizer> StreamHub<A> {
         reason: ResetReason,
     ) -> Result<(), StreamError> {
         self.allowed(publisher, key, Access::Publish)?;
-        let stream = self.streams.get_mut(key).ok_or(StreamError::UnknownStream)?;
-        let lost = stream.cursor.take().filter(|_| reason == ResetReason::HistoryUnavailable);
+        self.streams.get_mut(key).ok_or(StreamError::UnknownStream)?.cursor = None;
         self.terminate_key(key, StreamEvent::ResetRequired(reason));
-        // A reset with no position left keeps the mark of the one before it.
-        if let Some(lost) = lost {
-            for id in self.streams.get(key).map(|s| s.subscribers.as_slice()).unwrap_or_default() {
-                if let Some(sub) = self.subs.get_mut(id) {
-                    sub.lost = Some(lost);
-                }
-            }
-        }
         Ok(())
     }
 
@@ -1212,7 +1251,7 @@ impl<A: Authorizer> StreamHub<A> {
             }
         };
         if self.cursor(key) == Ok(None) {
-            self.position(key, Cursor { generation: batch.generation(), sequence: published });
+            self.position(key, Cursor { generation: batch.generation(), sequence: published }, false);
         }
         let offered = batch.len();
         let fresh = batch.after(published);
@@ -1239,7 +1278,9 @@ impl<A: Authorizer> StreamHub<A> {
 
     /// A `Live` subscription that follows the key: a restart or a close of the stream is a new
     /// `Ready { start }` (`None` while the position is unknown), never a terminal event. Between a
-    /// close and the next open it holds the key's demand and receives nothing.
+    /// close and the next open it holds the key's demand and receives nothing. It keeps its own
+    /// position: within a generation it is never given a record twice, and a position past it is
+    /// `ResetRequired(HistoryUnavailable)`.
     pub fn follow(&mut self, peer: &PeerId, key: &StreamKey, options: SubscribeOptions) -> Result<u64, StreamError> {
         if options.start != StartPosition::Live {
             return Err(StreamError::InvalidOptions);
@@ -1303,7 +1344,7 @@ impl<A: Authorizer> StreamHub<A> {
             phase: Phase::Live,
             terminal: None,
             follow,
-            lost: None,
+            at: None,
             awaits_state: false,
             held: None,
         };

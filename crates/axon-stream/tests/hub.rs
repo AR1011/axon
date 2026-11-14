@@ -298,6 +298,59 @@ fn a_relay_that_lost_its_position_resets_a_follower_rather_than_move_it_within_t
     assert_eq!(drain(&mut hub, id, 8), (vec![4], None));
 }
 
+/// A follower holds its own position: whatever position its relay stream takes after a close or a reset, it is given
+/// each record once, or reset where it would move past one.
+#[test]
+fn a_follower_never_sees_a_position_twice_or_moves_past_one_whatever_its_relay_adopts() {
+    let at = |sequence| Cursor { generation: 7, sequence };
+    let reset = Some(StreamEvent::ResetRequired(ResetReason::HistoryUnavailable));
+    type Then = fn(&mut StreamHub, &Store);
+    type Drained = (Vec<u64>, Option<StreamEvent>);
+    let cases: [(&str, Then, Drained); 3] = [
+        (
+            "a close, a reopen from record 1",
+            |hub, store| {
+                hub.close_stream(&me(), &key(), EndReason::StreamClosed).unwrap();
+                hub.open_relay_stream(&me(), &key(), DeliveryPolicy::ReplayRequired).unwrap();
+                hub.adopt_relay_stream(&me(), &key(), Cursor { generation: 7, sequence: 0 }).unwrap();
+                store.lock().unwrap().remove(&key());
+                store.lock().unwrap().open(&key(), 7).unwrap();
+                accept(hub, store, 1, 8);
+            },
+            (vec![6, 7, 8], None),
+        ),
+        (
+            "a reset, a position past the follower's",
+            |hub, _| {
+                hub.reset_relay_stream(&me(), &key(), ResetReason::GenerationChanged).unwrap();
+                hub.adopt_relay_stream(&me(), &key(), Cursor { generation: 7, sequence: 8 }).unwrap();
+            },
+            (vec![], reset.clone()),
+        ),
+        (
+            "a reset, a batch past the follower's position",
+            |hub, _| {
+                hub.reset_relay_stream(&me(), &key(), ResetReason::GenerationChanged).unwrap();
+                hub.accept_batch(&me(), &key(), batch(7, 9, 2)).unwrap();
+            },
+            (vec![], reset),
+        ),
+    ];
+    let (mut want, mut got) = (Vec::new(), Vec::new());
+    for (case, then, wanted) in cases {
+        let (mut hub, store) = relay_hub();
+        let id = hub.follow(&me(), &key(), SubscribeOptions::default()).unwrap();
+        hub.adopt_relay_stream(&me(), &key(), at(0)).unwrap();
+        accept(&mut hub, &store, 1, 5);
+        assert_eq!(drain(&mut hub, id, 8).0, [1, 2, 3, 4, 5], "{case}");
+        then(&mut hub, &store);
+        let ended = wanted.1.is_some();
+        got.push((case, drain(&mut hub, id, 8), ended.then(|| (hub.stats().subscriptions, hub.total_queued()))));
+        want.push((case, wanted, ended.then_some((0, (0, 0)))));
+    }
+    assert_eq!(got, want);
+}
+
 /// The follower a lost position would skip ends alone, with what it had queued: the stream and a follower that came
 /// after the give-up carry on.
 #[test]

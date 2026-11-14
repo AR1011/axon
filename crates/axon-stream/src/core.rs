@@ -461,8 +461,10 @@ struct Feed {
     wanted_from: StartPosition,
     /// The start each subscription and branch on this node asked for, by id, while it had no position.
     wants: BTreeMap<u64, StartPosition>,
-    /// A new generation is asked from its record 1 on top of `wanted_from`, until a parent cannot give that.
-    fresh: bool,
+    /// A start asked on top of `wanted_from`, a best effort: `After` the position the stream closed at here, so a
+    /// reopen of its generation goes on from it, then `First`, so a new generation is taken from its record 1. A
+    /// parent that cannot give one moves it to the next.
+    first: Option<StartPosition>,
     /// This node gave up the key's history after taking a generation: a newer one is taken from its record 1 too.
     gave_up: bool,
     /// The newest generation this node took up. A parent that shows an older one is behind the origin.
@@ -893,6 +895,7 @@ impl<A: Authorizer> RelayCore<A> {
             }
         }
         let pulled = self.feeds.contains_key(key);
+        let last = self.cursor(key);
         if pulled {
             self.wake_key(key);
             // Not a close to the children: the same generation resumed from disk goes on where each was, and another
@@ -905,7 +908,7 @@ impl<A: Authorizer> RelayCore<A> {
         let opened = self.originate(key, generation, policy, read);
         if opened.is_err() && pulled {
             // A refused open leaves the key pulled for its followers, as a close does.
-            self.repull(key);
+            self.repull(key, last);
         }
         opened
     }
@@ -1050,16 +1053,18 @@ impl<A: Authorizer> RelayCore<A> {
     /// Closes the key's stream here, whether this node originated or pulled it.
     fn end_stream(&mut self, key: &StreamKey) -> Result<(), StreamError> {
         self.wake_key(key);
+        let last = self.cursor(key);
         self.hub.close_stream(&self.local, key, EndReason::StreamClosed)?;
         lock(&self.store).remove(key);
-        self.repull(key);
+        self.repull(key, last);
         Ok(())
     }
 
     /// For a key this node has no stream of: local followers that still want it wait on an empty relay stream for it
-    /// to be opened again, here or on another node. It is asked of the parents at the refusal backoff, and from its
-    /// record 1, as the sequence domain died with the close and the next generation may be any number.
-    fn repull(&mut self, key: &StreamKey) {
+    /// to be opened again, here or on another node. It is asked of the parents at the refusal backoff, after `last`,
+    /// the position it closed at, so an open of the same generation goes on from there; then from its record 1, as
+    /// the next generation may be any number.
+    fn repull(&mut self, key: &StreamKey, last: Option<Cursor>) {
         if self.hub.demand_count(key) == 0 || !self.cfg.relay {
             if self.feeds.contains_key(key) {
                 self.unfeed(key);
@@ -1068,8 +1073,8 @@ impl<A: Authorizer> RelayCore<A> {
         }
         let _ = self.hub.open_relay_stream(&self.local, key, DeliveryPolicy::ReplayRequired);
         let feed = self.feeds.entry(key.clone()).or_default();
-        (feed.current, feed.wanted_from, feed.fresh, feed.gave_up, feed.generation) =
-            (None, StartPosition::Live, true, false, 0);
+        (feed.current, feed.wanted_from, feed.gave_up, feed.generation) = (None, StartPosition::Live, false, 0);
+        feed.first = Some(last.map_or(StartPosition::First, StartPosition::After));
         feed.wants.clear();
         self.touch(key);
     }
@@ -1822,7 +1827,8 @@ impl<A: Authorizer> RelayCore<A> {
         let _ = self.hub.reset_relay_stream(&self.local, key, reason);
         if let Some(feed) = self.feeds.get_mut(key) {
             // A new generation is fetched from its record 1, as the origin's own followers see it.
-            (feed.wanted_from, feed.fresh) = (StartPosition::Live, reason == ResetReason::GenerationChanged);
+            feed.wanted_from = StartPosition::Live;
+            feed.first = (reason == ResetReason::GenerationChanged).then_some(StartPosition::First);
             feed.wants.clear();
             feed.gave_up = reason == ResetReason::HistoryUnavailable && feed.generation > 0;
         }
@@ -1836,13 +1842,14 @@ impl<A: Authorizer> RelayCore<A> {
         let Some(feed) = self.feeds.get_mut(key) else { return };
         let link = Link { peer: peer.clone(), epoch };
         let followed = feed.links().any(|l| *l == link);
-        // Record 1 of a new generation is a best effort: a parent that cannot give it is asked for what is wanted.
-        if feed.fresh
-            && matches!(status, Status::Forbidden | Status::HistoryUnavailable)
-            && followed
-            && self.hub.cursor(key) == Ok(None)
+        // The position closed at, then record 1 of a new generation, are a best effort: a parent that cannot give one
+        // is asked for the next, then for what is wanted.
+        if followed
+            && at.is_none()
+            && let Some(tried) = feed.first
+            && matches!(status, Status::Forbidden | Status::HistoryUnavailable | Status::GenerationMismatch)
         {
-            feed.fresh = false;
+            feed.first = matches!(tried, StartPosition::After(_)).then_some(StartPosition::First);
             return self.rebranch(key, &link);
         }
         // Perhaps only the state was refused: its waits end, and the records are asked for without it.
@@ -1989,7 +1996,8 @@ impl<A: Authorizer> RelayCore<A> {
                         self.rebranch(&key, &link);
                     } else if current && feed.gave_up && start.generation > feed.generation && start.sequence > 0 {
                         // Given up, the position is not continued: a newer generation is, from its record 1.
-                        (feed.fresh, feed.gave_up, feed.generation) = (true, false, start.generation);
+                        (feed.first, feed.gave_up, feed.generation) =
+                            (Some(StartPosition::First), false, start.generation);
                         self.rebranch(&key, &link);
                     } else if self.hub.adopt_relay_stream(&self.local, &key, start) == Ok(true) {
                         self.adopt_ring(&key, start);
@@ -2270,7 +2278,7 @@ impl<A: Authorizer> RelayCore<A> {
             }
             let linked = |feed: &Feed| feed.links().find(|l| l.peer == *peer).map(|l| l.epoch);
             let want = |key: &StreamKey, feed: &Feed, epoch| {
-                let from = if feed.fresh { StartPosition::First } else { feed.wanted_from };
+                let from = feed.first.filter(|s| !earlier(feed.wanted_from, *s)).unwrap_or(feed.wanted_from);
                 let start = hub.cursor(key).ok().flatten().map_or(from, StartPosition::After);
                 Want { key: key.clone(), epoch, start, snapshot: feed.wants_snapshot }
             };
