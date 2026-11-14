@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::time::Duration;
 
+use axon::files::Files;
 use axon::{
     ActorHandle, ActorSystem, ExtensionFuture, LeaveReason, LifecycleHandle, Reject, RejectReason, SupervisedHandle,
     SystemExtension, WeakActorSystem,
@@ -39,6 +40,11 @@ pub struct ClusterConfig {
     pub near: Option<Near>,
     pub tls: Option<Tls>,
     pub discovery: Arc<dyn Discovery>,
+    /// Where the node keeps its last live view, as the file `view`, written at most once per `poll_interval`. A node
+    /// that restarts while discovery cannot list it, as when its region is cut from most seeds, starts from that view,
+    /// stale, rather than with none; peers whose views are stale too take its new boot from their handshakes with it.
+    /// A file that is missing or does not read starts the node with an empty view.
+    pub view_store: Option<Arc<dyn Files>>,
     /// Advertised in discovery metadata and matched by `Placement`. Bounded so that every provider, Consul included,
     /// takes them: at most 60 entries, the cluster's own `axon.*` ones included, keys of 1 to 60 bytes with no control
     /// character, and values of at most 512 bytes.
@@ -120,6 +126,7 @@ impl ClusterConfig {
             near: None,
             tls: None,
             discovery: Arc::new(discovery),
+            view_store: None,
             labels: BTreeMap::new(),
             authorizer: None,
             ownership: None,
@@ -462,6 +469,7 @@ impl Cluster {
     /// the system so that `system.shutdown()` leaves the cluster gracefully.
     pub async fn start(system: &ActorSystem, cfg: ClusterConfig) -> Result<Self, ClusterError> {
         let advertised = cfg.advertise.unwrap_or(cfg.bind);
+        let view_store = cfg.view_store.clone();
         if advertised.ip().is_unspecified() {
             return Err(ClusterError::Config("binding a wildcard address requires `advertise`"));
         }
@@ -609,6 +617,14 @@ impl Cluster {
         });
         inner.discovery.attach(&inner.events);
         let started = async {
+            if let Some(files) = &view_store {
+                let cached = timeout(inner.operation_timeout, crate::view_file::load(&**files, inner.local_node()));
+                if let Ok(Some(nodes)) = cached.await
+                    && nodes.len() <= inner.max_nodes
+                {
+                    inner.engine.membership.cached(nodes);
+                }
+            }
             inner.register_system_endpoints()?;
             if let Some(authority) = &inner.ownership {
                 authority.attach(&Cluster(inner.clone())).await?;
@@ -620,6 +636,9 @@ impl Cluster {
                 tokio::spawn(inner.clone().poll_loop(poll, heartbeat)),
                 tokio::spawn(inner.clone().rebalance_loop()),
             ];
+            if let Some(files) = view_store.clone() {
+                tasks.push(tokio::spawn(crate::view_file::keep(files, inner.engine.membership.clone(), poll)));
+            }
             if inner.ownership.is_some() {
                 tasks.push(tokio::spawn(inner.clone().renew_loop(renew_every)));
                 tasks.push(tokio::spawn(inner.clone().eager_loop()));
@@ -1165,6 +1184,7 @@ impl Inner {
     pub async fn announce(&self) -> Result<(), ClusterError> {
         let record = self.record.lock().clone();
         record.validate()?;
+        self.engine.membership.announced(&record);
         match timeout(self.operation_timeout, self.discovery.register(&record)).await {
             Ok(Ok(())) | Ok(Err(DiscoveryError::ReadOnly)) => Ok(()),
             Ok(Err(error)) => Err(error.into()),
@@ -1229,9 +1249,11 @@ impl Inner {
     }
 
     /// `snapshot_ok` tells how long discovery has been failing, and a provider that is watched may not have
-    /// been asked for a while: the first failure counts from now, not from the last answer.
+    /// been asked for a while: the first failure counts from now, not from the last answer. A cached view is stale
+    /// before any failure; its first one counts from now too.
     fn unavailable(&self, error: String) {
-        if self.engine.membership.view().stale.is_none() {
+        let view = self.engine.membership.view();
+        if view.stale.is_none() || (view.cached && view.stale.as_deref() == Some(crate::membership::CACHED)) {
             *self.snapshot_ok.lock() = Instant::now();
         }
         self.engine.membership.unavailable(error);

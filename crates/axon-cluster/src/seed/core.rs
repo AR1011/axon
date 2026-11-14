@@ -42,7 +42,7 @@ const RETRY: Duration = Duration::from_secs(2);
 const AHEAD_MS: u64 = 60_000;
 const PACK_FROM: usize = 512;
 
-fn put_record(out: &mut BytesMut, r: &NodeRecord) {
+pub(crate) fn put_record(out: &mut BytesMut, r: &NodeRecord) {
     put_str(out, &r.id);
     out.put_u128(r.incarnation);
     match r.address.ip() {
@@ -60,7 +60,7 @@ fn put_record(out: &mut BytesMut, r: &NodeRecord) {
     put_map(out, &r.metadata);
 }
 
-fn get_record(body: &mut Bytes) -> Option<NodeRecord> {
+pub(crate) fn get_record(body: &mut Bytes) -> Option<NodeRecord> {
     let id = get_str(body)?;
     let incarnation = take(body, 16)?.get_u128();
     let ip = match take(body, 1)?.get_u8() {

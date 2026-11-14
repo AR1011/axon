@@ -486,7 +486,9 @@ example.
 
 ## 10. Starting from a cached view (wire v8)
 
-Status: designed, not built. The cache is the cluster's, so it serves every provider; seeds are where it matters.
+Status: built (`crates/axon-cluster/src/view_file.rs`, `Membership::{cached, announced, learn_boot}`, `View::cached`), but for the
+`Live` follower in the World test and `world_regions.rs`, which need the three-region rig. The cache is the cluster's,
+so it serves every provider; seeds are where it matters.
 
 **Problem.** A node that restarts while its region is cut from most seeds never gets a view. `snapshot` answers
 `Unavailable` while the node is not live (`seed/mod.rs:629-636`), `register` returns `Ok` (§5), so `Cluster::start`
@@ -505,8 +507,13 @@ succeeds with an empty view. Then:
    `FileOp::Replace`: after a crash the file holds the old view or the new. Format:
    `"AXVW" | version u16 | revision u64 | count u32 | record*`, the seed protocol's record encoding (§4.1), and a
    CRC-32 of what precedes it.
-2. At start, before the first snapshot, the node loads it into `Membership` as a stale view, its own old boot left
-   out. The first live snapshot replaces it. A missing file, a bad CRC or another version starts the node as today.
+2. At start, before the first snapshot, the node loads it into `Membership` as a stale view, `View::cached` set
+   and the reason `cached` until a discovery error takes its place, its own old boot left out. The view starts at
+   revision 0, not the file's: the provider's revision may have moved anywhere meanwhile, and a seed watch answers
+   only a revision other than the one asked after. Each record the node announces while its view is the cached one
+   goes into it too, as discovery would list it: without its own record the node owns no key, and its peers' calls
+   to its kinds are refused `NotOwner`. The first live snapshot replaces it. A missing file, a bad CRC or another
+   version starts the node as today.
 3. While a node's view is stale, a newer boot of a member it lists, proved by a handshake (dialled or accepted, the
    same id with a greater incarnation), replaces that member's record locally. It is the proof a static list's
    incarnation 0 already relies on (`engine.rs:1302`). So frozen peers take the restarted node's new boot: they dial
@@ -521,14 +528,17 @@ World.
 
 **Wire.** None: the file is local, and a handshake already carries the incarnation.
 
-**API.** `ClusterConfig::view_store`. The console shows a cached view as stale with the reason "cached".
+**API.** `ClusterConfig::view_store`, `View::cached`. The console shows a cached view as stale with the reason "cached" (the console column is not built).
 
 **Tests.**
 
 - `crates/axon-cluster/tests/world_faults.rs::a_node_restarted_while_cut_from_its_seeds_serves_from_its_cached_view`:
   the seeds in one region, a second region cut, one of its nodes restarted. It calls its neighbour's name, the
-  neighbour calls its unleased kind, its `Live` follower gets records, and it is not isolated after one
-  `heartbeat_grace`. Each fails today.
+  neighbour calls its unleased kind, and it is not isolated after one `heartbeat_grace`. Each fails without the
+  cached view; the neighbour's call fails without the learned boot (`Unreachable(Auth)`) and without the node's own
+  record (`NotOwner`). Its `Live` follower getting records is left to `world_regions.rs`: axon-cluster's tests have
+  no streams.
+- `crates/axon-cluster/src/view_file.rs`: `a_view_reads_back_and_a_flipped_byte_or_a_torn_tail_does_not`
 - `crates/axon-cluster/tests/cluster/discovery.rs::a_missing_or_corrupt_view_file_starts_the_node_with_an_empty_view`
 - `crates/axon-cluster/tests/cluster/discovery.rs::the_first_live_snapshot_replaces_the_cached_view`
 - `crates/axon-cluster/src/membership.rs`: `a_stale_view_takes_a_newer_boot_a_handshake_proves_and_a_live_view_does_not`

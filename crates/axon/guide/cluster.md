@@ -1617,6 +1617,12 @@ async fn main() {
   the running actors stay, nothing joins or leaves, and nodes thaw when a second seed is back. One seed alone
   is fine for development; if it restarts, the cluster freezes for 5 to 7 s. After a cut from most of the seeds, a
   node thaws once the others in its view are back, or 5 s after it reaches the seeds again.
+- **Give each node a `view_store` where a region can be cut from most seeds.** A node that restarts inside such a
+  cut gets no view from them: it would list no peer, and its frozen peers would still list its old boot and refuse
+  the new one. With `cfg.view_store = Some(Arc::new(OsFiles::new(dir)))` it writes its last live view there, as the
+  file `view`, and starts from it, stale and with `view.cached` set, listing itself as it now is. A peer whose view is
+  stale takes the node's new boot from its handshake, so they call each other again and the node is not isolated.
+  The first live view replaces the cached one. A missing or corrupt file starts the node with an empty view.
 - `discovery.set_seeds(list)` replaces the seed list of a running node. To replace a seed machine, keep its name
   and no list changes.
 - `discovery.stats()` and `server.stats()` show each link's state and last error, refusals, and the list size.

@@ -1216,6 +1216,9 @@ impl Engine {
             };
             let Some(session) = session else { return listener.close().await };
             let (identity, lane) = (&session.peer().identity, session.peer().lane);
+            if self.learn_boot(&identity.node_id, identity.incarnation) {
+                self.reset_peer(&identity.node_id);
+            }
             let near = (self.cfg.near.as_ref())
                 .filter(|_| self.membership.view().get(&identity.node_id).is_some_and(|m| self.is_near(&m.record)));
             if let Some((near, _)) = near {
@@ -1337,6 +1340,13 @@ impl Engine {
                     if matches!(attempt, Err(DialError::Failed(_))) {
                         self.counters.dial_failures.fetch_add(1, Relaxed);
                     }
+                    continue;
+                }
+                // A newer boot of it, taken while the view is stale: dialled again as that boot.
+                Ok(session)
+                    if *session.peer().identity.node_id == *node
+                        && self.learn_boot(&node, session.peer().identity.incarnation) =>
+                {
                     continue;
                 }
                 Ok(_) => {
@@ -1538,6 +1548,16 @@ impl Engine {
         link.sender.close();
         slot.state.send_replace(LinkState::Down(Error::Closed, None));
         None
+    }
+
+    /// A newer boot of `node` a handshake proved, taken into a stale view (`Membership::learn_boot`), never of this
+    /// node: the routes cached from the old boot go, as a snapshot's replace clears them. Whether it was taken.
+    fn learn_boot(&self, node: &str, incarnation: u128) -> bool {
+        let taken = self.local.identity.node_id != node && self.membership.learn_boot(node, incarnation);
+        if taken {
+            self.stale_routes.fetch_add(1, Relaxed);
+        }
+        taken
     }
 
     /// Ends the session to a node whose record changed under it; its task redials from the view. A dial or a backoff

@@ -22,6 +22,7 @@ mod quota;
 mod remote;
 mod seed;
 mod spawn;
+mod view_file;
 mod wire;
 
 pub use cluster::{
