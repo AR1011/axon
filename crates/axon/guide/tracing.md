@@ -14,7 +14,7 @@ current one, so everything the handler does is caused by that span without the h
 | `tell` / `send` / `ask`, any mailbox admission | the mailbox entry |
 | `schedule_at` / `schedule_after` | the timer's message (a repeating timer starts clean) |
 | `submit_io` / `submit_future` | the job while it runs, and its completion message |
-| `RemoteRef::tell` / `send` / `request`, `Cluster::request` | the frame: kind bit `0x8000` and 25 bytes ahead of the body; an untraced call is byte for byte what it was, and a body within 25 bytes of the peer's `max_frame` is sent untraced rather than refused |
+| `RemoteRef::tell` / `send` / `request`, `Cluster::request` | the frame: kind bit `0x8000` and 25 bytes after the contract's id, ahead of the body; an untraced call is byte for byte what it was, and a body within 25 bytes of the peer's `max_frame` is sent untraced rather than refused |
 | `StreamNode::publish` | the batch, on every live hop to every subscriber; a batch replayed from history has none |
 
 Outside an actor the application says where a trace starts and what belongs to it:
