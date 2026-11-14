@@ -751,9 +751,7 @@ impl Authorizer for NoReplayTo {
 fn seen<A: Authorizer>(core: &mut RelayCore<A>, id: u64) -> Vec<String> {
     std::iter::from_fn(|| core.poll(id))
         .filter_map(|event| match event {
-            StreamEvent::Batch(b) => {
-                Some(format!("{} {}..{}", b.generation(), b.first(), b.first() + b.len() as u64 - 1))
-            }
+            StreamEvent::Batch(b) => Some(format!("{} {}..{}", b.generation(), b.first(), b.last())),
             StreamEvent::Ready { .. } => None,
             other => Some(format!("{other:?}")),
         })
@@ -845,13 +843,23 @@ fn a_follower_on_the_standby_behind_the_open_replays_the_rest_from_the_history()
 /// is not given the records it missed, nor anything after.
 #[test]
 fn a_follower_on_the_standby_behind_the_open_that_may_not_replay_is_reset() {
+    // The standby's own subscriptions are `local:s` to its authorizer.
+    let (mut standby, live) = a_standby_catching_up(NoReplayTo("local:s"));
+    standby.publish(&key(0), vec![Bytes::from_static(b"x")]).expect("publishes");
+    let reset = format!("{:?}", StreamEvent::ResetRequired(ResetReason::HistoryUnavailable));
+    assert_eq!(seen(&mut standby, live), vec![reset]);
+    assert!(!standby.is_subscribed(live));
+}
+
+/// A standby with a `Live` follower that read records 1 to 10 as a relay, opened after the 20 its history holds, and
+/// the follower not polled since.
+fn a_standby_catching_up<A: Authorizer>(authorizer: A) -> (RelayCore<A>, u64) {
     let now = Instant::now();
     let (o, s) = (PeerId::new("o", 1), PeerId::new("s", 1));
     let mut origin = RelayCore::new(&o, AllowAll, CoreConfig { relay: false, ..scaled() }).expect("a valid config");
     origin.open_stream(&key(0), 1, DeliveryPolicy::ReplayRequired).expect("opens");
-    // The standby's own subscriptions are `local:s` to its authorizer.
     let cfg = CoreConfig { relay: true, ..scaled() };
-    let mut standby = RelayCore::new(&s, NoReplayTo("local:s"), cfg).expect("a valid config");
+    let mut standby = RelayCore::new(&s, authorizer, cfg).expect("a valid config");
     let log = Arc::new(Mutex::new(MemoryStore::new(MemoryLimits::default()).expect("valid limits")));
     lock(&log).open(&key(0), 1).expect("opens");
     let batch = SequencedBatch::new(1, 1, vec![Bytes::from_static(b"x"); 20]).expect("a batch");
@@ -864,10 +872,84 @@ fn a_follower_on_the_standby_behind_the_open_that_may_not_replay_is_reset() {
     assert_eq!(records(&mut standby, live), (1..=10).collect::<Vec<_>>());
     let through = Cursor { generation: 1, sequence: 20 };
     standby.open_stream_after(&key(0), through, DeliveryPolicy::ReplayRequired).expect("opens after the history");
-    standby.publish(&key(0), vec![Bytes::from_static(b"x")]).expect("publishes");
-    let reset = format!("{:?}", StreamEvent::ResetRequired(ResetReason::HistoryUnavailable));
-    assert_eq!(seen(&mut standby, live), vec![reset]);
-    assert!(!standby.is_subscribed(live));
+    (standby, live)
+}
+
+/// A `Live` follower whose replay from the history stops at a new generation, a restart or a close and an open of
+/// the next, follows the new generation from its first record, as any `Live` follower does.
+#[test]
+fn a_follower_whose_catch_up_stops_at_a_new_generation_follows_it_from_its_first_record() {
+    let rows = ["restart", "close and open"].map(|row| {
+        let (mut standby, live) = a_standby_catching_up(AllowAll);
+        if row == "restart" {
+            standby.restart_stream(&key(0), 2).expect("restarts");
+        } else {
+            standby.close_stream(&key(0)).expect("closes");
+            standby.open_stream(&key(0), 2, DeliveryPolicy::ReplayRequired).expect("opens generation 2");
+        }
+        standby.publish(&key(0), vec![Bytes::from_static(b"x"); 20]).expect("publishes");
+        (row, seen(&mut standby, live), standby.is_subscribed(live))
+    });
+    assert_eq!(rows, [("restart", vec!["2 1..20".into()], true), ("close and open", vec!["2 1..20".into()], true)]);
+}
+
+/// `OriginLost` told to a follower still replaying its start waits behind the live records held behind the replay:
+/// each record still comes once and in order.
+#[test]
+fn origin_lost_told_to_a_follower_still_replaying_comes_after_the_records_it_holds() {
+    let now = Instant::now();
+    let (o, r) = (PeerId::new("o", 1), PeerId::new("r", 1));
+    let mut origin = origin(&scaled(), 1, 0);
+    let mut relay = RelayCore::new(&r, AllowAll, CoreConfig { relay: true, ..scaled() }).expect("a valid config");
+    let live = relay.subscribe(&key(0), SubscribeOptions::default()).expect("follows");
+    ask(&mut origin, &o, &mut relay, &r, now);
+    origin.publish(&key(0), vec![Bytes::from_static(b"x"); 10]).expect("publishes");
+    deliver(&mut origin, &o, &mut relay, &r, now);
+    let start = StartPosition::FollowAfter(Cursor { generation: 1, sequence: 0 });
+    let after = relay.subscribe(&key(0), SubscribeOptions { start, ..Default::default() }).expect("follows after");
+    for _ in 0..2 {
+        origin.publish(&key(0), vec![Bytes::from_static(b"x")]).expect("publishes");
+        deliver(&mut origin, &o, &mut relay, &r, now);
+    }
+    // No parent is left: once the key is orphaned, the relay tells its followers it lost the origin.
+    for later in [60, 120] {
+        relay.reconcile(&[], now + Duration::from_secs(later));
+    }
+    let lost = format!("{:?}", StreamEvent::OriginLost);
+    assert_eq!(seen(&mut relay, live).last(), Some(&lost));
+    let caught_up = format!("{:?}", StreamEvent::CaughtUp { through: Cursor { generation: 1, sequence: 10 } });
+    assert_eq!(seen(&mut relay, after), vec!["1 1..10".into(), caught_up, "1 11..11".into(), "1 12..12".into(), lost]);
+}
+
+/// A relay whose follower was parked in the generation that closed asks for a subscriber that came after the reopen in
+/// the next: the parent holds it, so that subscriber goes on, and neither is reset.
+#[test]
+fn a_subscriber_in_the_new_generation_goes_on_beside_a_follower_parked_in_the_old() {
+    let now = Instant::now();
+    let (o, r) = (PeerId::new("o", 1), PeerId::new("r", 1));
+    let mut origin = origin(&scaled(), 1, 0);
+    let mut relay = RelayCore::new(&r, AllowAll, CoreConfig { relay: true, ..scaled() }).expect("a valid config");
+    let live = relay.subscribe(&key(0), SubscribeOptions::default()).expect("follows");
+    ask(&mut origin, &o, &mut relay, &r, now);
+    origin.publish(&key(0), vec![Bytes::from_static(b"x"); 10]).expect("publishes");
+    deliver(&mut origin, &o, &mut relay, &r, now);
+    assert_eq!(records(&mut relay, live), (1..=10).collect::<Vec<_>>());
+    origin.close_stream(&key(0)).expect("closes");
+    deliver(&mut origin, &o, &mut relay, &r, now);
+    origin.open_stream(&key(0), 2, DeliveryPolicy::ReplayRequired).expect("opens generation 2");
+    origin.publish(&key(0), vec![Bytes::from_static(b"x"); 20]).expect("publishes");
+    let start = StartPosition::After(Cursor { generation: 2, sequence: 10 });
+    let after = relay.subscribe(&key(0), SubscribeOptions { start, ..Default::default() }).expect("subscribes");
+    let mut at = now;
+    for _ in 0..4 {
+        at += Duration::from_secs(60);
+        ask(&mut origin, &o, &mut relay, &r, at);
+        deliver(&mut origin, &o, &mut relay, &r, at);
+    }
+    let mut events = seen(&mut relay, after);
+    events.retain(|e| !e.starts_with("CaughtUp"));
+    assert_eq!(events, vec!["2 11..20"]);
+    assert!(relay.is_subscribed(after) && relay.is_subscribed(live), "{:?}", seen(&mut relay, live));
 }
 
 /// A replay from the namespace's history, four branches long, goes to the child a window at a time: the branch is
@@ -887,7 +969,7 @@ fn a_source_replay_larger_than_the_branch_limit_goes_through_the_push_window_wit
     let log = Arc::new(Mutex::new(MemoryStore::new(limits).expect("valid limits")));
     lock(&log).open(&key(0), 1).expect("opens");
     let mut origin = RelayCore::new(&o, AllowAll, CoreConfig { relay: false, ..cfg.clone() }).expect("a valid config");
-    origin.history.insert("md".into(), log.clone());
+    origin.set_history("md", log.clone());
     origin.open_stream(&key(0), 1, DeliveryPolicy::ReplayRequired).expect("opens");
     let batch = vec![Bytes::from(vec![7u8; RECORD]); 16];
     for first in (1..=records as u64).step_by(16) {

@@ -202,6 +202,11 @@ struct Segment {
     bytes: u64,
 }
 
+/// The names and first positions of the segments that have files, as the shelf indexes them.
+fn named<'a>(key: &StreamKey, generation: u64, segments: impl IntoIterator<Item = &'a Segment>) -> Vec<(String, u64)> {
+    segments.into_iter().filter_map(|s| Some((s.name(key, generation)?, s.first))).collect()
+}
+
 impl Segment {
     /// Its file's name, once it has one.
     fn name(&self, key: &StreamKey, generation: u64) -> Option<String> {
@@ -606,8 +611,7 @@ impl DiskStore {
                 }
             }
             // Shelved before any open takes it: followers behind the open replay from it as the open is heard.
-            let named = found.segments.iter().filter_map(|s| Some((s.name(&key, generation)?, s.first)));
-            store.shelf.index(&key, Some((generation, named.collect())));
+            store.shelf.index(&key, Some((generation, named(&key, generation, &found.segments))));
             store.shelf.durable([(&key, found.last)]);
             store.found.insert(key, found);
         }
@@ -708,10 +712,7 @@ impl DiskStore {
 
     /// Tells the shelf the stream's segments that have files.
     fn shelve(&self, key: &StreamKey) {
-        let now = self.streams.get(key).map(|d| {
-            let named = d.segments.iter().filter_map(|s| Some((s.name(key, d.generation)?, s.first)));
-            (d.generation, named.collect())
-        });
+        let now = self.streams.get(key).map(|d| (d.generation, named(key, d.generation, &d.segments)));
         self.shelf.index(key, now);
     }
 

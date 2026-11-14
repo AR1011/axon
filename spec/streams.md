@@ -151,6 +151,15 @@ has no followers of its own behind the open (the fourth case above is tested in 
   for an open from the disk of a key the node relayed after its restart, with a ring of 4. The disk's source knew the
   key only once the open had taken it, after the hub heard of the open, so the follower was reset
   `HistoryUnavailable`; the disk now shelves every key it holds at its boot.
+- `crates/axon-stream/src/core/tests.rs::a_follower_whose_catch_up_stops_at_a_new_generation_follows_it_from_its_first_record`:
+  a replay a close or a reset stops leaves a `Live` follower at the last position it was given, as any `Live`
+  follower, and a `FollowAfter` waiting for it. Before, a `Live` one waited too: a restart ended it
+  `GenerationChanged`, and a close and an open of the next generation dropped that generation's first records.
+- `crates/axon-stream/src/core/tests.rs::origin_lost_told_to_a_follower_still_replaying_comes_after_the_records_it_holds`:
+  `OriginLost` waits behind the live records held behind a replay. Before, they came ahead of the replay.
+- `crates/axon-stream/src/core/tests.rs::a_subscriber_in_the_new_generation_goes_on_beside_a_follower_parked_in_the_old`:
+  a parent's `GenerationMismatch` to the position a relay closed at moves it on to `First` (§3), on the parent it
+  follows too. Before, the relay reset the stream `GenerationChanged`, ending a subscriber of the new generation.
 - `crates/axon-stream/tests/world_wan.rs::an_origin_moved_to_another_region_keeps_every_cursor`: the same across three
   regions at the WAN timings. Every follower recovers within 15 s of the fault (the cluster calls a silent origin gone
   about 11.5 s after it), and within `upstream_timeout` plus one round trip of an old origin's close.

@@ -742,8 +742,8 @@ fn a_history_source_is_not_asked_for_a_key_the_node_relays() {
     lock(&log).open(&key, 1).unwrap();
     let mut origin = RelayCore::new(&o, crate::AllowAll, CoreConfig { relay: false, ..cfg.clone() }).unwrap();
     let mut relay = RelayCore::new(&r, crate::AllowAll, cfg).unwrap();
-    origin.history.insert("md".into(), log.clone());
-    relay.history.insert("md".into(), Arc::new(Never));
+    origin.set_history("md", log.clone());
+    relay.set_history("md", Arc::new(Never));
     origin.open_stream(&key, 1, DeliveryPolicy::ReplayRequired).unwrap();
     let _follower = relay.subscribe(&key, SubscribeOptions::default()).unwrap();
     let mut at = Instant::now().into_std();

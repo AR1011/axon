@@ -584,8 +584,9 @@ impl Sub {
         }
     }
 
-    /// At a close the source of its replay goes: a follower still replaying waits instead for its stream to come back
-    /// to the last position it was given, and the live batches held behind the replay are given back.
+    /// At a close or a reset the source of its replay goes: a follower still replaying goes on from the last position
+    /// it was given, and the live batches held behind the replay are given back. One held to its generation waits for
+    /// its stream to come back to that position; a `Live` one goes on as any `Live` follower at it.
     fn stop_replay(&mut self, total: &mut QueueUsage) {
         let Phase::Recovering { next_after, cut, .. } = self.phase else { return };
         for _ in 0..self.tail {
@@ -593,7 +594,8 @@ impl Sub {
             self.release(&event, total);
         }
         let given = Cursor { generation: cut.generation, sequence: next_after };
-        (self.tail, self.at, self.phase) = (0, Some(given), Phase::Waiting(Some(given)));
+        let phase = if self.one_generation { Phase::Waiting(Some(given)) } else { Phase::Live };
+        (self.tail, self.at, self.phase) = (0, Some(given), phase);
     }
 
     /// Behind the position its stream opened at, which `source` holds from its own on: it is told its own position,
@@ -905,20 +907,18 @@ impl<A: Authorizer> StreamHub<A> {
         let Some(stream) = self.streams.get_mut(key) else { return };
         let (ids, start) = (std::mem::take(&mut stream.subscribers), stream.cursor);
         for id in ids {
-            match self.subs.get_mut(&id) {
-                Some(sub) if sub.follow && !matches!(terminal, StreamEvent::End(_)) => {
-                    if let Err(reset) = sub.ready(start) {
-                        self.terminate(id, reset);
-                        continue;
-                    }
-                    self.stats.count(&terminal);
-                    self.streams.get_mut(key).expect("looked up above").subscribers.push(id);
-                }
-                Some(sub) if sub.follow => {
-                    sub.stop_replay(&mut self.total);
-                    self.parked.entry(key.clone()).or_default().push(id);
-                }
-                _ => self.terminate(id, terminal.clone()),
+            let Some(sub) = self.subs.get_mut(&id).filter(|s| s.follow) else {
+                self.terminate(id, terminal.clone());
+                continue;
+            };
+            sub.stop_replay(&mut self.total);
+            if matches!(terminal, StreamEvent::End(_)) {
+                self.parked.entry(key.clone()).or_default().push(id);
+            } else if let Err(reset) = sub.ready(start) {
+                self.terminate(id, reset);
+            } else {
+                self.stats.count(&terminal);
+                self.streams.get_mut(key).expect("looked up above").subscribers.push(id);
             }
         }
     }
@@ -1169,7 +1169,7 @@ impl<A: Authorizer> StreamHub<A> {
     /// Tells a follower [`StreamEvent::OriginLost`]; it keeps its position.
     pub(crate) fn origin_lost(&mut self, id: u64) {
         if let Some(sub) = self.subs.get_mut(&id).filter(|s| s.follow) {
-            sub.queue.push_back(StreamEvent::OriginLost);
+            sub.push(StreamEvent::OriginLost);
         }
     }
 

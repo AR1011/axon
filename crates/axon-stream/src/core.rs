@@ -2549,10 +2549,13 @@ impl<A: Authorizer> RelayCore<A> {
         }
         for ((key, epoch), Answer { status, path }) in sent.wants.into_iter().zip(answers) {
             let link = Link { peer: parent.clone(), epoch };
-            let current = self.feeds.get(&key).is_some_and(|f| f.current.as_ref() == Some(&link));
+            let feed = self.feeds.get(&key);
+            let current = feed.is_some_and(|f| f.current.as_ref() == Some(&link));
+            // A best-effort start of a stream with no position is refused as any other: the next one is asked.
+            let tries_first = feed.is_some_and(|f| f.first.is_some());
             match status {
                 Status::Ok => self.learn_path(&key, parent, epoch, path, now),
-                Status::GenerationMismatch if current => {
+                Status::GenerationMismatch if current && !(tries_first && self.cursor(&key).is_none()) => {
                     self.local_reset(&key, ResetReason::GenerationChanged, now);
                     self.rebranch(&key, &link);
                 }
