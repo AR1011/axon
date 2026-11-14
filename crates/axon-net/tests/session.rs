@@ -365,6 +365,66 @@ async fn the_round_trip_is_known_one_round_trip_after_a_dial() {
     }
 }
 
+/// A stream that carries bytes each way until `cut` is set, then drops them, and the close of the end that gives up.
+fn cuttable(cut: Arc<std::sync::atomic::AtomicBool>) -> (tokio::io::DuplexStream, tokio::io::DuplexStream) {
+    use std::sync::atomic::Ordering::Relaxed;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let carry = |mut from: tokio::io::ReadHalf<tokio::io::DuplexStream>,
+                 mut to: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+                 cut: Arc<std::sync::atomic::AtomicBool>| async move {
+        let mut buf = vec![0; 1 << 16];
+        while let Ok(n @ 1..) = from.read(&mut buf).await {
+            if !cut.load(Relaxed) && to.write_all(&buf[..n]).await.is_err() {
+                return;
+            }
+        }
+        if cut.load(Relaxed) {
+            std::future::pending::<()>().await;
+        }
+    };
+    let ((a, a_far), (b, b_far)) = (tokio::io::duplex(1 << 16), tokio::io::duplex(1 << 16));
+    let ((a_rx, a_tx), (b_rx, b_tx)) = (tokio::io::split(a_far), tokio::io::split(b_far));
+    tokio::spawn(carry(a_rx, b_tx, cut.clone()));
+    tokio::spawn(carry(b_rx, a_tx, cut));
+    (a, b)
+}
+
+/// An accepted session learns its peer only from the handshake, so its timings are set after it: its reader ticks on
+/// them at once, and the other end keeps its `Config`'s.
+#[tokio::test(start_paused = true)]
+async fn a_session_given_its_own_timings_goes_idle_on_them_and_its_peer_on_the_config() {
+    let cut = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (x, y) = cuttable(cut.clone());
+    let (a, b) = (config("a"), config("b"));
+    let (a, b) = tokio::join!(establish(x, Role::Initiator(Lane::Control), &a), establish(y, Role::Responder, &b));
+    let (a, b) = (a.unwrap(), b.unwrap());
+    // Round numbers on the paused clock, well apart from the config's 10 s and 30 s.
+    b.set_timings(LinkTimings { keepalive: SECOND, idle: 3 * SECOND, connect: SECOND }).unwrap();
+    // A keepalive the session could not tick on.
+    assert!(b.set_timings(LinkTimings { keepalive: 3 * SECOND, idle: 3 * SECOND, connect: SECOND }).is_err());
+    // The config's next tick is 10 s away: the set ticks at once, and again a second later.
+    tokio::time::sleep(1500 * MS).await;
+    let pings = b.sender.stats().pings;
+    assert!(pings >= 3, "b pings on its own timings at once, not a config keepalive later: {pings}");
+    tokio::time::sleep(18500 * MS).await;
+    let (a_end, b_end) = (a.sender.stats().closed, b.sender.stats().closed);
+    assert!(a_end.is_none() && b_end.is_none(), "keepalives hold both ends on their own timings: {a_end:?} {b_end:?}");
+    let pings = b.sender.stats().pings;
+    assert!(pings >= 11, "b pings every second from the set: {pings}");
+    cut.store(true, std::sync::atomic::Ordering::Relaxed);
+    let silent = Instant::now();
+    let b_idle = b.sender.closed().await;
+    assert!(matches!(b_idle, Error::Timeout(Timeout::Idle)), "{b_idle:?}");
+    let took = silent.elapsed();
+    // Counted from the last pong, up to a keepalive before the cut, to a tick at or after 3 s of silence.
+    assert!((2 * SECOND..4 * SECOND + MS).contains(&took), "b goes idle on its own 3 s: {took:?}");
+    assert!(a.sender.is_active(), "a runs on the config's 30 s");
+    let a_idle = a.sender.closed().await;
+    assert!(matches!(a_idle, Error::Timeout(Timeout::Idle)), "{a_idle:?}");
+    let took = silent.elapsed();
+    assert!((29 * SECOND..40 * SECOND + MS).contains(&took), "a goes idle on the config's 30 s: {took:?}");
+}
+
 /// A silent peer's session ends as idle whichever half runs first: a writer that saw the reader go and called it
 /// `Closed` made the cluster wait out a handshake for a peer that had only stopped answering. Many sessions on several
 /// workers, each with a caller waiting on its receiver as the cluster's does, so a writer can run before its reader has

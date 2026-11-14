@@ -17,7 +17,7 @@ use crate::error::within;
 use crate::frame::{Compression, Control, Decoder, Encoder, HEADER_LEN};
 use crate::handshake::{self, Link, Role};
 use crate::queued::Queued;
-use crate::{Config, Error, Frame, Identity, Lane, Limits, SubmitError, SubmitReason, TcpHealth, Timeout};
+use crate::{Config, Error, Frame, Identity, Lane, Limits, LinkTimings, SubmitError, SubmitReason, TcpHealth, Timeout};
 
 const READ_CHUNK: usize = 64 << 10;
 /// A submit writes the socket itself only when nothing was written for this long. A caller sending more often than
@@ -139,6 +139,10 @@ struct Shared {
     fd: Option<i32>,
     tcp: Mutex<Option<TcpHealth>>,
     sample_every: u32,
+    /// Read by the reader at each keepalive tick: `Session::set_timings` replaces them.
+    timings: Mutex<LinkTimings>,
+    /// Wakes the reader to tick at once on timings `Session::set_timings` replaced.
+    retimed: Notify,
     opened: Instant,
     _connection: Option<OwnedSemaphorePermit>,
 }
@@ -263,6 +267,17 @@ pub struct Session {
 impl Session {
     pub fn peer(&self) -> &Peer {
         self.sender.peer()
+    }
+
+    /// Runs this session on its own keepalive and idle timeout, for an accepted session whose peer is known only once
+    /// the handshake named it. Its reader ticks at once and pings on them, and the ticks after it judge silence by them.
+    /// Refused, changing nothing, with a keepalive of zero or not below the idle timeout; `connect` is not read.
+    pub fn set_timings(&self, timings: LinkTimings) -> Result<(), Error> {
+        timings.validate_ticks()?;
+        let shared = &self.sender.shared;
+        *shared.timings.lock().unwrap_or_else(|e| e.into_inner()) = timings;
+        shared.retimed.notify_one();
+        Ok(())
     }
 }
 
@@ -561,14 +576,16 @@ where
         fd: link.fd,
         tcp: Mutex::new(None),
         sample_every: cfg.timing_sample_every,
+        timings: Mutex::new(LinkTimings::of(cfg)),
+        retimed: Notify::new(),
         opened: Instant::now(),
         _connection: connection,
     });
 
-    let (keepalive, idle, write_timeout) = (cfg.keepalive_interval, cfg.idle_timeout, cfg.write_timeout);
+    let write_timeout = cfg.write_timeout;
     let reading = shared.clone();
     tokio::spawn(async move {
-        let read = read_loop(reader, in_tx, &ctl_tx, decoder, reading.clone(), keepalive, idle);
+        let read = read_loop(reader, in_tx, &ctl_tx, decoder, reading.clone());
         until_closed(reading, read).await;
         // Only once the reader's reason is recorded: a writer that saw `ctl` close first would end the session as
         // `Closed`, calling a silent peer one that hung up. A reader that panics still drops it and ends the writer.
@@ -612,13 +629,13 @@ async fn read_loop<R: AsyncRead + Unpin>(
     ctl: &mpsc::Sender<Ctl>,
     mut decoder: Decoder,
     shared: Arc<Shared>,
-    keepalive: Duration,
-    idle: Duration,
 ) -> Error {
     let c = &shared.counters;
     let (mut buf, mut sparse) = (BytesMut::with_capacity(READ_CHUNK), true);
+    let timings = || *shared.timings.lock().unwrap_or_else(|e| e.into_inner());
+    let mut current = timings();
     // The first tick is at once: a ping as the session comes up measures its round trip one round trip in.
-    let mut tick = tokio::time::interval(keepalive);
+    let mut tick = tokio::time::interval(current.keepalive);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut heard = Instant::now();
     let mut ping: Option<(u64, Instant)> = None;
@@ -700,8 +717,18 @@ async fn read_loop<R: AsyncRead + Unpin>(
                 }
                 Err(e) => return e.into(),
             },
+            // New timings tick at once, not a whole keepalive of the old ones later.
+            () = shared.retimed.notified() => tick.reset_immediately(),
             _ = tick.tick() => {
-                if heard.elapsed() >= idle {
+                let now = timings();
+                let retimed = now != current;
+                if now.keepalive != current.keepalive {
+                    tick = tokio::time::interval_at(Instant::now() + now.keepalive, now.keepalive);
+                    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                }
+                current = now;
+                // The gap so far followed the old keepalive: silence is judged on the new one from the next tick.
+                if !retimed && heard.elapsed() >= current.idle {
                     return Error::Timeout(Timeout::Idle);
                 }
                 sample();

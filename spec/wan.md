@@ -757,7 +757,7 @@ axon-stream (feature cluster)
 
 ## 14. Near links (wire v8)
 
-Status: designed, not built.
+Status: built, except `world_regions.rs` (it needs the three-region rig) and the console column.
 
 **Problem.** A node has one transport `Config`, and `Cluster::start` lowers every session's idle timeout to the
 authority's `hold` when that is shorter, and its keepalive and connect to `hold / 4` (`cluster.rs:470-475`). A service
@@ -768,16 +768,17 @@ every session gets idle 3.76 s and connect 0.94 s, far ones too, and one lost SY
 
 **Design.**
 
-- `ClusterConfig::near: Option<Near>`, `Near { label: String, keepalive, idle, connect }`. A peer whose record has
+- `ClusterConfig::near: Option<Near>`, `Near { label: String, timings: LinkTimings }` (keepalive, idle, connect). A peer whose record has
   this node's value of `label` (for example `region`) is near: each of its lanes runs the near timings. Every other
   peer, and every peer of a node without the label, runs the transport's.
 - The dialler reads the target's record, which it already holds for the dial (`engine.rs:1290-1303`). The acceptor
   looks the peer's id up in its view after the handshake (`accept`, `engine.rs:1203`); a peer not in the view yet runs
   far timings until its next session.
-- axon-net takes timings per session: `LinkTimings { keepalive, idle, connect }`, an argument of the dial and a setter
-  on an accepted session before its first idle check. Unset, they are the `Config`'s.
+- axon-net takes timings per session: `LinkTimings { keepalive, idle, connect }`, applied to the dial's `Config`
+  (`LinkTimings::applied`) and set on an accepted session (`Session::set_timings`), whose reader ticks at once on
+  them and judges silence by them from the tick after. Unset, they are the `Config`'s.
 - The clamp. With `near` set, `Cluster::start` applies the hold clamp to the near timings only, and refuses a
-  `near.idle` above `hold` (`ClusterError::Config`). Far links keep their idle above `hold`. The clamp exists so that a
+  near `idle` above `hold` (`ClusterError::Config`). Far links keep their idle above `hold`. The clamp exists so that a
   caller does not send a holder's keys over a quiet session after the lease let them go (`cluster.rs:471-472`). Over a
   far link that costs liveness only: the holder's fence stops its actors at `lease_grace`
   ([paxos-leases.md §5.1](paxos-leases.md#51-the-renew-loop-measured-from-the-reply)), and a far caller walks on after

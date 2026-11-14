@@ -25,7 +25,8 @@ mod spawn;
 mod wire;
 
 pub use cluster::{
-    AccessPolicy, Cluster, ClusterConfig, ClusterStats, ControlRequest, EndpointBuilder, PendingReply, WeakCluster,
+    AccessPolicy, Cluster, ClusterConfig, ClusterStats, ControlRequest, EndpointBuilder, Near, PendingReply,
+    WeakCluster,
 };
 #[cfg(feature = "consul")]
 pub use consul::{ConsulConfig, ConsulDiscovery, ConsulLeases};

@@ -451,3 +451,37 @@ async fn each_start_of_a_key_has_its_own_number_though_starts_share_an_epoch() {
     assert!(s1 < s2 && s2 < s3 && s3 < s4, "{starts:?}");
     a.system.shutdown().await.unwrap();
 }
+
+/// Near links are held to the authority's hold, so a caller near a holder stops trusting a quiet session before the
+/// lease lets the holder's keys go; an idle beyond it is refused at start, not clamped.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_near_idle_beyond_the_hold_is_refused() {
+    let start = |near_idle: Duration| async move {
+        let mut cfg = ClusterConfig::new("127.0.0.1:0".parse().unwrap(), transport("a"), MemoryDiscovery::new());
+        common::short(&mut cfg);
+        let mut paxos = PaxosConfig::new(["a"]);
+        // spec/wan.md § 14's near lease: a hold of 3.76 s.
+        paxos.lease = Duration::from_secs(4);
+        paxos.store = Some(Arc::new(axon::files::MemoryFiles::new()));
+        cfg.ownership = Some(Arc::new(PaxosLeases::new(paxos).unwrap()));
+        cfg.labels.insert("region".into(), "one".into());
+        // The near timings of spec/wan.md § 14, with the idle under test.
+        cfg.near = Some(Near {
+            label: "region".into(),
+            timings: axon_net::LinkTimings {
+                // spec/wan.md § 14's near keepalive and connect; the idle is the one under test.
+                keepalive: Duration::from_millis(500),
+                idle: near_idle,
+                connect: Duration::from_millis(500),
+            },
+        });
+        let system = ActorSystem::builder().build().unwrap();
+        let started = Cluster::start(&system, cfg).await.map(drop);
+        (system, started)
+    };
+    let (_, refused) = start(Duration::from_secs(4)).await;
+    assert!(matches!(refused, Err(ClusterError::Config(_))), "{refused:?}");
+    let (system, started) = start(Duration::from_secs(2)).await;
+    started.unwrap();
+    system.shutdown().await.unwrap();
+}

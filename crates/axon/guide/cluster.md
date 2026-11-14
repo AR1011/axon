@@ -2129,6 +2129,49 @@ Calls and stream pushes share the `Live` lane unless a namespace goes on `Bulk` 
 the network ahead of `Live`. A parent keeps up to `core.max_push_window` of pushes unanswered per child
 ([streams § Tree](streams.md#tree)), which the host settings above let one connection carry.
 
+### Near links
+
+With an ownership authority, `Cluster::start` lowers every session's idle timeout to the authority's `hold` when that
+is shorter, and its keepalive and connect to a quarter of it, so that a caller does not send a holder's keys over a
+quiet session after the lease let them go. With the acceptors and the holders of the leased keys 1 to 2 ms apart in
+one region and peers in others, one lease cannot suit both: at a 4 s lease every link idles out at 3.76 s and one lost
+SYN marks a far peer unreachable, and at the 10 s lease above a dead holder's keys wait about 14 s, also for callers
+0.24 ms away. `ClusterConfig::near` gives the links between peers that share a label's value timings of their own:
+
+```rust,no_run
+use std::time::Duration;
+
+use axon_cluster::{ClusterConfig, Near, PaxosConfig};
+use axon_net::LinkTimings;
+
+/// The acceptors in this node's region, 1 to 2 ms apart; the other regions keep across_regions's transport timings.
+fn acceptors_near(cluster: &mut ClusterConfig, paxos: &mut PaxosConfig, region: &str) {
+    cluster.labels.insert("region".into(), region.into());
+    cluster.near = Some(Near {
+        label: "region".into(),
+        timings: LinkTimings { keepalive: Duration::from_millis(500), idle: Duration::from_secs(2), connect: Duration::from_millis(500) },
+    });
+    // A hold of 3.76 s, a lease_grace of 3.29 s and a renew every 1.32 s.
+    paxos.lease = Duration::from_secs(4);
+}
+```
+
+A peer whose record has this node's value of `label` is near, on each of its lanes; every other peer runs the
+transport's timings, as does every peer of a node without the label. A dial knows the peer from its record; an
+accepted session looks the peer up in the view once the handshake names it, and a peer not listed yet runs the
+transport's timings until its next session. `PeerStats::near` says which links run them.
+
+With `near` set the hold clamps the near links only, and `Cluster::start` refuses a `near.idle` above the hold
+(`ClusterError::Config`). Far links keep their idle above it: there that costs liveness, not safety, as the holder's
+fence stops its actors at `lease_grace` and a far caller walks on after its idle and a connect. The lease is one value,
+part of the acceptors' protocol, so a short one pays only where a majority of the acceptors and the holders of the
+leased kinds are near each other. Its bound is a round's patience, `lease / 6`, which must hold an ask and one
+retransmit on the slowest link any holder renews over: at 4 s, 0.67 s, enough up to 219 ms (0.22 + 0.42 s).
+
+At these values a dead holder is unreachable to near callers 2 to 2.5 s after it died. The acceptors free its keys at
+most a lease after its last renew reached them, and the next owner's acquire is one round at near round trips: its
+keys run again about 4.5 s after it died. Callers in far regions see it after their own idle and connect, 11.5 s.
+
 ## Simulating a cluster
 
 `axon-testkit`'s `World` runs real nodes (cluster, keyed actors, leases, seed servers, streams, your actors) in one

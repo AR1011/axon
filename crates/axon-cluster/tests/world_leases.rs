@@ -5,14 +5,19 @@
 //! it on their own.
 mod accounts;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use accounts::{
     NODES, Node, accounts, check, keys, leased, moved, no_stale_write, ops, owned_by, placed_on, start_ticker, stream,
     tickers,
 };
-use axon_testkit::world::{Crash, Wire, World, WorldConfig};
+use axon::ActorSystem;
+use axon_cluster::{Cluster, ClusterConfig, MemoryDiscovery, Near, PaxosConfig, PaxosLeases};
+use axon_net::{LinkTimings, SharedSecret};
+use axon_testkit::world::{Crash, Host, Wire, World, WorldConfig};
 use axon_testkit::{check_seeds, seeds};
+use bytes::Bytes;
 
 #[test]
 fn holders_at_plus_and_minus_5000_ppm_keep_their_leases_exclusive() {
@@ -243,6 +248,96 @@ fn a_holder_suspended_past_its_lease_wakes_and_writes_and_only_the_epoch_check_r
             w.trace_tail(40)
         );
         println!("world digest suspended seed {seed}: {:016x}", w.digest());
+    })
+    .unwrap();
+}
+
+#[derive(Clone)]
+struct Regional {
+    cluster: Cluster,
+    _system: ActorSystem,
+}
+
+/// The acceptors a, b and c share a region, d is in another: spec/wan.md § 14's near and far timings.
+async fn regional(host: Host, discovery: MemoryDiscovery) -> Regional {
+    let transport = host.transport(SharedSecret::new("at-least-16-bytes-long").unwrap());
+    let system = ActorSystem::builder().runtime(host.runtime()).build().unwrap();
+    let mut cfg = ClusterConfig::new(host.addr(), transport, discovery);
+    // spec/wan.md § 9's far timings, on every link that is not near.
+    cfg.transport.keepalive_interval = Duration::from_secs(1);
+    cfg.transport.idle_timeout = Duration::from_secs(8);
+    cfg.transport.connect_timeout = Duration::from_millis(3500);
+    let region = if host.name() == "d" { "far" } else { "near" };
+    cfg.labels.insert("region".into(), region.into());
+    // spec/wan.md § 14's near timings, and its lease of 4 s: a hold of 3.76 s.
+    cfg.near = Some(Near {
+        label: "region".into(),
+        timings: LinkTimings {
+            // spec/wan.md § 14's near values: 0.5 s, 2 s, 0.5 s.
+            keepalive: Duration::from_millis(500),
+            idle: Duration::from_secs(2),
+            connect: Duration::from_millis(500),
+        },
+    });
+    let mut paxos = PaxosConfig::new(["a", "b", "c"]);
+    // spec/wan.md § 14's near lease: a hold of 3.76 s, which the near idle of 2 s is within.
+    paxos.lease = Duration::from_secs(4);
+    paxos.store = Some(Arc::new(host.disk().dir("leases")));
+    cfg.ownership = Some(Arc::new(PaxosLeases::new(paxos).unwrap()));
+    Regional { cluster: Cluster::start(&system, cfg).await.unwrap(), _system: system }
+}
+
+/// Whether each link `from` holds to `to`, dialled and accepted, runs the near timings.
+fn near(w: &World<Regional>, from: &str, to: &str) -> Vec<bool> {
+    let rows = |n: &Regional| n.cluster.stats().engine.peers.into_iter().filter(|p| p.node == to).map(|p| p.near);
+    w.read(from, |n| rows(n).collect()).unwrap_or_default()
+}
+
+fn reachable(w: &World<Regional>, from: &str, to: &str) -> bool {
+    w.read(from, |n| n.cluster.view().get(to).is_some_and(|m| m.reachable)).unwrap_or(false)
+}
+
+/// The hold clamp is on near links only: a near peer cut off is unreachable within its near idle and connect, while a
+/// far one cut as long keeps its session on the transport's 8 s, not the 3.76 s hold every link took without `near`.
+#[test]
+fn near_peers_run_the_near_timings_and_far_peers_the_transports() {
+    check_seeds(seeds(0..16), |seed| {
+        let (mut w, discovery) = (World::new(WorldConfig { seed, ..WorldConfig::default() }), MemoryDiscovery::new());
+        for name in ["a", "b", "c", "d"] {
+            let discovery = discovery.clone();
+            w.add(name, move |host| regional(host, discovery.clone()));
+        }
+        for near in ["a", "b", "c"] {
+            let far = Wire { latency: Duration::from_millis(40), jitter: Duration::from_millis(1), ..Wire::default() };
+            w.wire(near, "d", far);
+            w.wire("d", near, far);
+        }
+        w.run_until("every node lists the four", Duration::from_secs(30), |w| {
+            w.nodes().count() == 4 && w.nodes().all(|(_, n)| n.cluster.view().members.len() == 4)
+        });
+        // Every node dials every other and is dialled by it once calls or leases cross: the acceptors renew, and a
+        // probe from each node to each other opens what is left.
+        for from in ["a", "b", "c", "d"] {
+            for to in ["a", "b", "c", "d"].into_iter().filter(|to| *to != from) {
+                let to = to.to_owned();
+                let probe = move |n: Regional| async move { drop(n.cluster.control(&to, "probe", Bytes::new()).await) };
+                w.block_on(from, probe).unwrap();
+            }
+        }
+        w.run_for(Duration::from_secs(2));
+        for (from, to, want) in [("a", "b", true), ("b", "a", true), ("a", "d", false), ("d", "a", false)] {
+            let links = near(&w, from, to);
+            assert!(!links.is_empty() && links.iter().all(|n| *n == want), "seed {seed}: {from} to {to}: {links:?}");
+        }
+        // Near: unreachable 2 to 2.5 s in, past its idle and a connect. Far: 8 s and 3.5 s, where the hold on every
+        // link gave 3.76 s and 0.94 s.
+        w.partition(&["a"], &["b", "d"]);
+        w.run_for(Duration::from_secs(6));
+        assert!(!reachable(&w, "a", "b"), "seed {seed}: a near peer cut for 6 s\n{}", w.trace_tail(30));
+        assert!(reachable(&w, "a", "d"), "seed {seed}: a far peer cut for 6 s\n{}", w.trace_tail(30));
+        w.run_for(Duration::from_secs(7));
+        assert!(!reachable(&w, "a", "d"), "seed {seed}: a far peer cut for 13 s");
+        w.heal();
     })
     .unwrap();
 }

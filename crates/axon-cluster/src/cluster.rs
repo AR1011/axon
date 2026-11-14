@@ -9,7 +9,7 @@ use axon::{
     ActorHandle, ActorSystem, ExtensionFuture, LeaveReason, LifecycleHandle, Reject, RejectReason, SupervisedHandle,
     SystemExtension, WeakActorSystem,
 };
-use axon_net::{AcceptLimits, Backoff, Identity, Lane};
+use axon_net::{AcceptLimits, Backoff, Identity, Lane, LinkTimings};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use parking_lot::{Mutex, RwLock};
 use tokio::sync::{Notify, Semaphore};
@@ -34,6 +34,9 @@ pub struct ClusterConfig {
     /// The address peers dial. Defaults to the bound address; a port of 0 takes the bound port.
     pub advertise: Option<SocketAddr>,
     pub transport: axon_net::Config,
+    /// Timings for the links to peers that share this node's value of a label, apart from the transport's, which the
+    /// rest keep.
+    pub near: Option<Near>,
     pub tls: Option<Tls>,
     pub discovery: Arc<dyn Discovery>,
     /// Advertised in discovery metadata and matched by `Placement`. Bounded so that every provider, Consul included,
@@ -87,11 +90,23 @@ pub struct ClusterConfig {
     pub event_capacity: usize,
 }
 
+/// A peer whose record has this node's value of `label` (for example `region`) is near: each of its lanes runs these
+/// timings in place of the transport's. Every other peer, and every peer of a node without the label, runs the
+/// transport's. A dial knows the peer from its record; an accepted session from the view, once the handshake named
+/// the peer, and a peer not listed yet runs the transport's until its next session.
+#[derive(Clone, Debug)]
+pub struct Near {
+    pub label: String,
+    pub timings: LinkTimings,
+}
+
 impl ClusterConfig {
     /// Tightens the transport keepalive to 1 s / 4 s idle: it is the cluster's failure detector. A dial's connect gets
     /// 1.5 s, or the handshake timeout where that is shorter, so a SYN lost once, which the kernel sends again at 1 s,
     /// still connects. `Cluster::start` tightens the idle timeout further to the ownership authority's
-    /// [`hold`](OwnershipAuthority::hold) when that is shorter, and the keepalive and the connect to a quarter of it.
+    /// [`hold`](OwnershipAuthority::hold) when that is shorter, and the keepalive and the connect to a quarter of it:
+    /// on every link. With [`near`](Self::near) set it does so on the near links only, refusing a near idle above the
+    /// hold rather than lowering it, and leaves the other links on the transport's.
     pub fn new(bind: SocketAddr, mut transport: axon_net::Config, discovery: impl Discovery) -> Self {
         transport.keepalive_interval = Duration::from_secs(1);
         transport.idle_timeout = Duration::from_secs(4);
@@ -101,6 +116,7 @@ impl ClusterConfig {
             bind,
             advertise: None,
             transport,
+            near: None,
             tls: None,
             discovery: Arc::new(discovery),
             labels: BTreeMap::new(),
@@ -467,15 +483,34 @@ impl Cluster {
         }
         let mut transport = cfg.transport;
         // A holder silent for a whole lease holds nothing. A session that quiet is not trusted, or a caller holding one
-        // would send the holder's keys there until the idle timeout, long after the lease let them go.
-        if let Some(hold) = hold.filter(|hold| *hold < transport.idle_timeout) {
-            transport.idle_timeout = hold;
-            transport.keepalive_interval = transport.keepalive_interval.min(hold / 4);
-            transport.connect_timeout = transport.connect_timeout.min(hold / 4);
-        }
+        // would send the holder's keys there until the idle timeout, long after the lease let them go. With `near` only
+        // near links are held to it: over a far one that costs liveness only, since the holder's fence stops its actors
+        // at `lease_grace`, and a far caller walks on after its idle and a connect.
+        let near = match cfg.near {
+            Some(mut near) => {
+                if let Some(hold) = hold {
+                    if near.timings.idle > hold {
+                        return Err(ClusterError::Config("near idle must be at most the ownership authority's hold"));
+                    }
+                    near.timings.keepalive = near.timings.keepalive.min(hold / 4);
+                    near.timings.connect = near.timings.connect.min(hold / 4);
+                }
+                near.timings.validate(&transport)?;
+                cfg.labels.get(&near.label).cloned().map(|value| (near, value))
+            }
+            None => {
+                if let Some(hold) = hold.filter(|hold| *hold < transport.idle_timeout) {
+                    transport.idle_timeout = hold;
+                    transport.keepalive_interval = transport.keepalive_interval.min(hold / 4);
+                    transport.connect_timeout = transport.connect_timeout.min(hold / 4);
+                }
+                None
+            }
+        };
         let membership = Membership::new(cfg.event_capacity);
         let engine_cfg = EngineConfig {
             transport,
+            near,
             backoff: cfg.backoff,
             request_timeout: cfg.request_timeout,
             poll_interval: cfg.poll_interval,
