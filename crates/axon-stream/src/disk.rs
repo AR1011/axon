@@ -373,10 +373,8 @@ pub(crate) struct Asked {
     /// The last position the read found, at least the last durable one when it was asked for. A start at or past it
     /// reads the file again.
     upto: u64,
-    /// When its start first asked for it, in the shelf's count of asks.
-    turn: u64,
-    /// Whether a start has read from it since it came in.
-    served: bool,
+    /// When a start last read a page from it, in the shelf's count of pages; 0 before one has.
+    served: u64,
 }
 
 /// A segment read in: its batches, `None` when it could not be read.
@@ -397,13 +395,11 @@ struct Indexed {
 #[derive(Default)]
 struct Shelved {
     index: BTreeMap<StreamKey, Indexed>,
-    /// Oldest turn first, so each start waiting gets its turn.
+    /// In the order they were asked for, so each start waiting gets its turn.
     asked: VecDeque<Asked>,
     reading: BTreeSet<String>,
     read: VecDeque<SegmentRead>,
-    /// Segments evicted before a start read from them: asked again, they keep their turn.
-    waited: Vec<Asked>,
-    turns: u64,
+    pages: u64,
 }
 
 impl Shelf {
@@ -415,12 +411,9 @@ impl Shelf {
             s.index.remove(key);
             s.read.retain(|(asked, _)| asked.key != *key);
             s.asked.retain(|asked| asked.key != *key);
-            s.waited.retain(|asked| asked.key != *key);
             return;
         };
-        let kept = |asked: &Asked| asked.key != *key || segments.iter().any(|(name, _)| *name == asked.name);
-        s.read.retain(|(asked, _)| kept(asked));
-        s.waited.retain(kept);
+        s.read.retain(|(asked, _)| asked.key != *key || segments.iter().any(|(name, _)| *name == asked.name));
         let last = s.index.get(key).filter(|e| e.generation == generation).map_or(0, |e| e.last);
         s.index.insert(key.clone(), Indexed { generation, last, segments });
     }
@@ -434,22 +427,23 @@ impl Shelf {
         }
     }
 
-    fn asked(&self) -> bool {
-        !lock(&self.0).asked.is_empty()
+    /// Whether a read is due: segments asked for, and room for them.
+    fn asked(&self, max: usize) -> bool {
+        let s = lock(&self.0);
+        !s.asked.is_empty() && s.room(max) > 0
     }
 
-    /// At most `max` of them; the rest wait for the next read.
+    /// At most as many as there is room for; the rest wait for the next read.
     fn take_asked(&self, max: usize) -> Vec<Asked> {
         let mut s = lock(&self.0);
-        let n = max.min(s.asked.len());
+        let n = s.room(max).min(s.asked.len());
         let asked: Vec<Asked> = s.asked.drain(..n).collect();
         s.reading.extend(asked.iter().map(|a| a.name.clone()));
         asked
     }
 
-    /// Keeps what a read brought in, at most `max` segments, and returns the streams it was for. Past `max`, a segment
-    /// a start has read from goes first, oldest first; with none, the one asked for last, so the start that has waited
-    /// longest keeps its segment and goes on.
+    /// Keeps what a read brought in, at most `max` segments, and returns the streams it was for. Past `max`, the
+    /// segment a start read from longest ago goes.
     fn read_in(&self, read: Vec<SegmentRead>, max: usize) -> BTreeSet<StreamKey> {
         let mut s = lock(&self.0);
         let mut keys = BTreeSet::new();
@@ -461,15 +455,21 @@ impl Shelf {
             }
         }
         while s.read.len() > max {
-            let served = s.read.iter().position(|(a, _)| a.served);
-            let last = || s.read.iter().enumerate().max_by_key(|(_, (a, _))| a.turn).map(|(at, _)| at);
-            let at = served.or_else(last).expect("more than max segments held");
-            let (asked, _) = s.read.remove(at).expect("held");
-            if !asked.served {
-                s.waited.push(asked);
-            }
+            // A read takes only the room the unread segments leave, so one has been read from; else the newest goes.
+            let read_from = s.read.iter().enumerate().filter(|(_, (a, _))| a.served > 0);
+            let at = read_from.min_by_key(|(_, (a, _))| a.served).map_or(s.read.len() - 1, |(at, _)| at);
+            s.read.remove(at);
         }
         keys
+    }
+}
+
+impl Shelved {
+    /// The segments a read may bring in: `max` less those read in that no start has read from yet, and those being
+    /// read. A read never brings in one it would evict unread, so the starts that asked first keep theirs.
+    fn room(&self, max: usize) -> usize {
+        let unread = self.read.iter().filter(|(a, _)| a.served == 0).count();
+        max.saturating_sub(unread + self.reading.len())
     }
 }
 
@@ -504,14 +504,8 @@ impl RecoverySource for Shelf {
         s.read.retain(|(a, _)| a.name != *name || a.upto > after.sequence);
         let Some(at) = s.read.iter().position(|(a, _)| a.name == *name) else {
             if !s.reading.contains(name) && !s.asked.iter().any(|a| a.name == *name) {
-                s.turns += 1;
-                let turn = match s.waited.iter().position(|a| a.name == *name) {
-                    Some(at) => s.waited.swap_remove(at).turn,
-                    None => s.turns,
-                };
                 let (name, key, generation, first, upto) = (name.clone(), key.clone(), *generation, *first, *last);
-                let at = s.asked.partition_point(|a| a.turn < turn);
-                s.asked.insert(at, Asked { name, key, generation, first, upto, turn, served: false });
+                s.asked.push_back(Asked { name, key, generation, first, upto, served: 0 });
             }
             return Err(RecoveryError::Pending);
         };
@@ -532,7 +526,8 @@ impl RecoverySource for Shelf {
             return Err(RecoveryError::HistoryUnavailable);
         }
         let page = page(after, through, bounds, held);
-        s.read[at].0.served = true;
+        s.pages += 1;
+        s.read[at].0.served = s.pages;
         page
     }
 }
@@ -899,7 +894,7 @@ impl DiskStore {
 
     /// Whether a write waits to be taken.
     pub(crate) fn queued(&self) -> bool {
-        !self.unwritten.is_empty() || self.shelf.asked()
+        !self.unwritten.is_empty() || self.shelf.asked(self.cfg.max_read_segments)
     }
 
     /// Whether retention may yet remove a segment: some stream has more than the one being written.

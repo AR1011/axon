@@ -43,9 +43,10 @@ supplies", but no `StreamNodeConfig` field reaches it. Disk history serves only 
 - `DiskStore` is a history source from day one. For a namespace on `disk`, a start behind the ring reads the segments
   that hold it, in the node's writer task, and answers `Pending` until they are in. Retention bounds it: a start older
   than the oldest segment is `HistoryUnavailable`. `DiskConfig::max_read_segments` (8) bounds the segments read in
-  that stay in memory and each read; more starts at once take turns, in the order they asked. Past it, a segment a
-  start has read from goes first, and with none the one asked for last, which keeps its turn when it asks again, so
-  the start that has waited longest goes on. Replay beyond the ring is then axon's own, and the World tests it.
+  that stay in memory and each read; more starts at once take turns, in the order they asked. A read brings in only
+  what the segments no start has read from yet, and those being read, leave room for: none is read in to be evicted
+  unread, and the start that asked first keeps its segment until it reads it. Past the limit the segment read from
+  longest ago goes. Replay beyond the ring is then axon's own, and the World tests it.
 - A start behind every relay's ring. A relay refuses it `HistoryUnavailable` (`core.rs:1435-1437`); the child asks its
   other candidates and waits for one that holds it while any is still appearing (`reconcile`, `core.rs:2176-2190`). The
   origin must be among the child's candidates (`upstream_for`): the guide says so, and a test holds it. A relay that
@@ -67,9 +68,10 @@ supplies", but no `StreamNodeConfig` field reaches it. Disk history serves only 
   answers `Pending` for 0 to 500 ms; a relay crashes during the replay. Fails today with `HistoryUnavailable`.
 - `crates/axon-stream/tests/world_disk.rs::a_subscriber_behind_the_ring_replays_from_the_files`
 - `crates/axon-stream/src/node/tests.rs::more_replays_from_the_disk_than_it_keeps_segments_for_take_turns`: five
-  replays share two segments, read in once to three times between polls; the shelf holds at most two. Before, the
-  starts were read by segment name, and the last key waited for the others' whole replays; then a read past the
-  limit evicted the first read's segments unread, and the first key got its first record in round 38.
+  replays share two segments, read in once to three times between polls; the shelf holds at most two, and every row
+  reads in as many segments. Before, the starts were read by segment name, and the last key waited for the others'
+  whole replays; then a read past the limit evicted the first read's segments unread, and the first key got its first
+  record in round 38; then reads twice a round brought in 168 segments against 90, evicted unread.
 - `crates/axon-stream/src/core/tests.rs::a_source_replay_larger_than_the_branch_limit_goes_through_the_push_window_without_a_slow_consumer_reset`
 - `crates/axon-stream/src/node/tests.rs::a_history_source_is_not_asked_for_a_key_the_node_relays`
 

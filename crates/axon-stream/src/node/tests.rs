@@ -727,10 +727,11 @@ fn a_follower_behind_an_open_from_disk_replays_the_rest_from_the_disk() {
 
 /// More starts behind the ring at once than the disk keeps segments read in for: five replays, two segments, read
 /// once, twice or three times before the followers are polled. Each follower gets every record once and in order, they
-/// take turns (each gets its first record before any has all of its own), and the shelf never holds more than two
-/// segments. Before, the starts of the keys first by name were read first, and the others waited for their whole
-/// replays; and a read past the limit evicted the segments read in first, unread, so the starts waiting longest asked
-/// again behind the others every time.
+/// take turns (each gets its first record before any has all of its own), the shelf never holds more than two
+/// segments, and the reads between two polls bring in no segment the first did not: as many segments are read in every
+/// row. Before, the starts of the keys first by name were read first, and the others waited for their whole replays;
+/// then a read past the limit evicted the segments read in first, unread, so the starts waiting longest asked again
+/// behind the others every time; and a read brought in segments the shelf had no room for, to evict them unread.
 #[test]
 fn more_replays_from_the_disk_than_it_keeps_segments_for_take_turns() {
     use crate::recovery::RingLimits;
@@ -761,10 +762,11 @@ fn more_replays_from_the_disk_than_it_keeps_segments_for_take_turns() {
         let mut seen = vec![Vec::new(); keys.len()];
         // The round each follower got its first record in, and its last.
         let (mut first, mut last) = (vec![0; keys.len()], vec![0; keys.len()]);
-        let mut held = 0;
+        let (mut held, mut segments) = (0, 0);
         for round in 1..=1000 {
             for _ in 0..reads {
                 if let Some((files, asked)) = origin.take_disk_reads() {
+                    segments += asked.len();
                     let Poll::Ready(read) = now(disk::read_asked(files, asked)) else {
                         panic!("files in memory waited")
                     };
@@ -792,12 +794,14 @@ fn more_replays_from_the_disk_than_it_keeps_segments_for_take_turns() {
             }
         }
         let whole = seen.iter().all(|s| *s == (1..=40).map(|n| (n, record(n))).collect::<Vec<_>>());
-        (reads, whole, first.iter().max() < last.iter().min(), held, first, last)
+        (reads, whole, first.iter().max() < last.iter().min(), held, segments, first, last)
     });
-    for (reads, whole, turns, held, first, last) in rows {
+    let once = rows[0].4;
+    for (reads, whole, turns, held, segments, first, last) in rows {
         assert!(
-            whole && turns && held <= 2,
-            "{reads} reads a round, {held} held: first records in rounds {first:?}, last in {last:?}"
+            whole && turns && held <= 2 && segments == once,
+            "{reads} reads a round, {held} held, {segments} read in against {once}: first records in rounds {first:?}, \
+             last in {last:?}"
         );
     }
 }

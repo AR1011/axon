@@ -503,12 +503,13 @@ the generation and last record the files hold, until the stream is opened. A sub
 `After(cursor)` on any node with nothing missed or seen twice. A start behind the origin's ring replays from the files:
 the node's writer task reads the segment that holds it between two writes, the subscription waits meanwhile, and a
 replay goes to a child a push window at a time. `max_read_segments` (8; `StreamNode::start` refuses 0) bounds the
-segments read in that stay in memory, and each read: more starts at once take turns, in the order they asked. Past
-it, a segment a start has read from goes first, and with none the one asked for last, so the start that has waited
-longest goes on. Retention bounds it: a start older than the oldest segment is `HistoryUnavailable`. Relays keep only
-their rings and refuse such a start, so a child that may come back far behind needs the origin among its candidates (`upstream_for`). A follower on the restarted node itself, which relayed the key
-from another node until the open, replays from the files too what it missed before the open. Opening a newer generation,
-`restart_stream` or `close_stream` removes the old files; opening an older one is refused with `GenerationMismatch`.
+segments read in that stay in memory, and each read: more starts at once take turns, in the order they asked. A read
+brings in only what the segments no start has read from yet leave room for, so the start that asked first keeps its
+segment until it reads it, and the segment read from longest ago goes first. Retention bounds it: a start older than
+the oldest segment is `HistoryUnavailable`. Relays keep only their rings and refuse such a start, so a child that may
+come back far behind needs the origin among its candidates (`upstream_for`). A follower on the restarted node itself,
+which relayed the key from another node until the open, replays from the files too what it missed before the open.
+Opening a newer generation, `restart_stream` or `close_stream` removes the old files; opening an older one is refused with `GenerationMismatch`.
 
 `StreamNode::start` reads every segment of the listed namespaces once to check it, one at a time, keeping only their
 positions, and `open_stream` reads back the newest segments until they fill the ring. Both await the files. An open is
