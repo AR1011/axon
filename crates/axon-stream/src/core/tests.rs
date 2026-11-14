@@ -777,6 +777,34 @@ fn an_open_of_a_generation_older_than_the_node_holds_is_refused() {
     assert_eq!(rows, [("relaying", refused.clone(), vec!["2 11..11".into()], true), ("closed", refused, vec![], true)]);
 }
 
+/// A follower parked on a node that closed a key it originated holds the node's generation: an `open_stream` or an
+/// `open_stream_after` of an older one is refused `GenerationMismatch`, and an open of a newer one goes on, with the
+/// follower in it. Without the parked follower counted, the open of generation 1 took it back a generation.
+#[test]
+fn a_parked_follower_in_a_newer_generation_refuses_an_open_of_an_older_one() {
+    let mut origin = RelayCore::new(&PeerId::new("o", 1), AllowAll, scaled()).expect("a valid config");
+    let log = MemoryStore::new(MemoryLimits::default()).expect("valid limits");
+    origin.set_history("md", Arc::new(Mutex::new(log)));
+    origin.open_stream(&key(0), 2, DeliveryPolicy::ReplayRequired).expect("opens");
+    let live = origin.subscribe(&key(0), SubscribeOptions::default()).expect("follows");
+    origin.publish(&key(0), vec![Bytes::from_static(b"x"); 10]).expect("publishes");
+    assert_eq!(records(&mut origin, live), (1..=10).collect::<Vec<_>>());
+    origin.close_stream(&key(0)).expect("closes");
+    let parked = (origin.hub.has_stream(&key(0)), origin.hub.newest_generation(&key(0)));
+    let older = Cursor { generation: 1, sequence: 5 };
+    let refused = [
+        origin.open_stream(&key(0), 1, DeliveryPolicy::ReplayRequired),
+        origin.open_stream_after(&key(0), older, DeliveryPolicy::ReplayRequired),
+    ];
+    let newer = origin.open_stream(&key(0), 3, DeliveryPolicy::ReplayRequired);
+    origin.publish(&key(0), vec![Bytes::from_static(b"x")]).expect("publishes");
+    let mismatch = || Err(StreamError::Recovery(RecoveryError::GenerationMismatch));
+    assert_eq!(
+        (parked, refused, newer, seen(&mut origin, live)),
+        ((false, Some(2)), [mismatch(), mismatch()], Ok(()), vec!["3 1..1".to_string()])
+    );
+}
+
 /// Everything, except replay for the node it names.
 struct NoReplayTo(&'static str);
 

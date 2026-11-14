@@ -181,6 +181,8 @@ has no followers of its own behind the open (the fourth case above is tested in 
 - `crates/axon-stream/src/core/tests.rs::an_open_of_a_generation_older_than_the_node_holds_is_refused`: while the
   relay holds a position in the newer generation, and after its parent closed the key, where only its follower holds
   one. Before, the open took the key and the follower back a generation.
+- `crates/axon-stream/src/core/tests.rs::a_parked_follower_in_a_newer_generation_refuses_an_open_of_an_older_one`:
+  a node that closed a key it originated holds the generation of the follower parked at the close.
 - The rig: `move/m0` and `move/m1` in `examples/rig/src/streams.rs` (`Mover`). The owner of the eager key `mov`, which
   only b1 and b2 serve, opens both with `open_stream_after` after the record due last, or after the position its node
   relays where that is later, and closes them when it stops (drained or fenced). A record is a function of its position

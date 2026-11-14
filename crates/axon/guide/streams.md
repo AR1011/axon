@@ -156,9 +156,9 @@ any parent continue any child.
 
 A generation only goes up: `restart_stream` refuses one that is not above the current one, an open of a key refuses
 one older than the node relays or a follower there holds (`GenerationMismatch`), and a relay refuses a parent that
-shows a generation older than the newest it has seen, since that parent is behind the origin. The
-start time in milliseconds is a generation that survives a restart of the publisher; a stream kept
-[on disk](#history-on-disk) resumes only when it is opened with the generation its files hold instead.
+shows a generation older than the newest it has seen, since that parent is behind the origin. A follower parked at a
+close counts: a node that closed its key still refuses an older generation while one waits there. The start time in
+milliseconds is a generation that survives a restart of the publisher; a stream kept [on disk](#history-on-disk) resumes only when it is opened with the generation its files hold instead.
 
 A subscription sees `Ready`, then `Snapshot` if it started `SnapshotThenLive`, replayed batches, `CaughtUp`, live batches, and
 another `Ready` at each restart of the key it follows. It ends with exactly one `ResetRequired(reason)` (continuity
