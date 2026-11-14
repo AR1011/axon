@@ -140,6 +140,11 @@ Unset, `lease_grace` is 7/8 of that and `lease_renew_interval` 2/5 of the grace,
 and a short lease needs no other setting (`a_short_lease_needs_no_other_setting`). Defaults: `T = 6 s`,
 `drift = 1 %`, `margin = 200 ms`, hence `lease_grace = 5.02 s` and `lease_renew_interval = 2.01 s`.
 
+The table counts from the holder's cut. A caller sees a dead holder only once its session idles out and a redial
+fails, so the key runs again at the later of "6 s + one acquire" and the caller's idle plus connect. With near links
+([wan.md §14](wan.md#14-near-links-wire-v8)) a short `T` moves only the links near the acceptors: 4.5 s from a
+holder's death at `T` = 4 s, while far links keep their WAN idle.
+
 ## 3. API
 
 ```rust
@@ -632,3 +637,61 @@ allocating.
 | Waiting for the log while it fails | Grants go on without it (§4.1), so the floor of a restart then falls back on the clock (§2.3). |
 | Reading who holds a key without acquiring it | A refused acquire names the holder (§4), which is all `get_or_spawn` needs. |
 | Agreeing on the acceptor list | Each node takes it from its config; nodes whose lists differ get no votes from each other (§4), but a list that is a majority on its own, or two lists running side by side during a change, each grant. Needs the list decided like a lease, with the joint phase above. |
+
+## 11. Leases per kind (wire v8)
+
+Status: designed, not built.
+
+**Problem.** The authority is the node's, not the kind's: `ClusterConfig::ownership` (`cluster.rs:44-45`), and every
+keyed path tests `self.ownership`, never the kind. Acquire (`spawn.rs:670`), the caller's walk past an unreachable
+owner (`spawn.rs:531`), accepting a start that passed the owner (`spawn.rs:644`), `can_grant` and its `Isolated`
+refusal (`spawn.rs:494,637-639`), the isolation sweep (`spawn.rs:1479`) and the `stops_within` check
+(`cluster.rs:461-467`) all follow the node. So on a node with an authority:
+
+- every keyed start costs a Paxos round, two round trips to a majority, also for a kind that a membership-consistent
+  owner would serve well (a per-session cache, a counter that tolerates a brief duplicate);
+- a node cut from a majority of the acceptors refuses every start `Isolated`, so a region cut from the acceptors' region
+  stops starting keys of every kind;
+- `max_leases` (`paxos/mod.rs:45-48`) counts every key of every kind;
+- a caller's own config decides how it walks (`spawn.rs:531`), so a node without an authority and one with it walk
+  differently to the same owner.
+
+**Design.**
+
+- Kinds are leased by default on a node with an authority. `KindBuilder::unleased()` opts a kind out: its keys are
+  placed membership-consistent, as on a node without one (CL-10: at most one per view, brief duplicates during a
+  partition). On a node without an authority every kind is unleased, as today.
+- The node advertises the mode in `axon.kinds`: `kind/2+1` gains `/u` for an unleased kind (`kind/2+1/u`), written at
+  register (`spawn.rs` `register`) and read by `NodeRecord::kind_schemas`'s neighbour `kind_leased(kind) -> Option<bool>`
+  (`discovery.rs:90-95`). A node that advertises a kind in the other mode is no candidate for it, as a schema it does not
+  serve is not (`placement.rs`), so every node computes the same owner set.
+- Each `self.ownership` test becomes `self.leased(kind)`. On the serving side the kind's own registration decides; on
+  the calling side the mode its owner advertises does, so every caller walks one way to one owner.
+- `can_grant` and `Isolated` hold back leased kinds only: an isolated or cut node keeps starting unleased keys. The
+  isolation sweep stops unleased keys at once and leaves leased ones to their fences. `max_leases` counts leased keys
+  only, by construction.
+- `eager` requires a leased kind (`spawn.rs:1694`): `.unleased().eager(..)` is refused at `register`.
+- The `stops_within` check moves to `register` of an unleased kind on a node with an authority, where it now matters:
+  `heartbeat_interval + 3/2 heartbeat_grace` under the discovery's `drops_after`, else `ClusterError::Config`.
+- The transport clamp (`cluster.rs:470-475`) stays tied to the authority, on near links only when
+  [wan.md §14](wan.md#14-near-links-wire-v8)'s `near` is set.
+
+**Wire.** No frame changes. The `axon.kinds` value is a record format, and it changes in v8: a v7 node would read
+`2+1/u` as schemas `2` and nothing, which the clean break to v8 keeps out ([rolling-upgrades.md §6](rolling-upgrades.md#6-wire-v8)).
+No `SCHEMA` bump: spawn requests do not carry the mode. No TLA change: `PaxosLeases.tla` and `Handover.tla` cover leased
+kinds, and an unleased kind behaves as a kind on a node without an authority, which the World covers.
+
+**API.** `KindBuilder::unleased`, `NodeRecord::kind_leased`.
+
+**Tests.**
+
+- `crates/axon-cluster/tests/ownership.rs::an_unleased_kind_starts_with_the_acceptors_down_and_a_leased_kind_is_refused_isolated`
+- `crates/axon-cluster/tests/world_reach.rs::a_caller_without_an_authority_walks_past_a_leased_owner_cut_from_the_acceptors`
+  (fails today: the caller's own config decides the walk)
+- `crates/axon-cluster/tests/world_faults.rs::a_region_cut_from_the_acceptors_keeps_starting_its_unleased_keys_while_leased_ones_wait`
+- `crates/axon-cluster/tests/upgrade.rs::nodes_that_advertise_a_kind_in_two_modes_are_not_each_others_candidates`
+- `crates/axon-cluster/tests/cluster/keyed.rs::an_unleased_eager_kind_is_refused_at_register`
+- The leased-kind rows of [faults.md](faults.md) (keyed actors) gain the unleased variant of each World test.
+
+CL-10 and CL-12 in [00-overview-and-requirements.md](00-overview-and-requirements.md) say "per kind" where they say
+"optional strict mode".

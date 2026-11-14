@@ -12,11 +12,12 @@ how the code keeps that promise. The user's view is [guide/cluster.md § Rolling
   The promise covers the transport and every internal protocol: membership, the directory, remote calls, remote
   spawn, watches, leases, streams, quotas and telemetry.
 - **Before 1.0, no promise.** Every release may break the wire, and a pre-1.0 release speaks only its own version.
-  This release speaks version 6 only. Version 6 added requests in parts (the `BODY` bit on `REQUEST`, `PART`, `END`
-  and `CREDIT`); version 5 says in a spawn's answer whether that request started the actor, so that one node records
+  This release speaks version 8 only (`axon_net::VERSIONS`, `handshake.rs:23`), a clean break from 7 (§6).
+  Version 8 put the contract's id in every call (§6.1); version 7 named the lane in the hello ([lanes.md §4.1](lanes.md#41-the-lane-and-the-hello-v7)); version 6 added
+  requests in parts (the `BODY` bit on `REQUEST`, `PART`, `END` and `CREDIT`); version 5 says in a spawn's answer whether that request started the actor, so that one node records
   an eager restart; version 4 added replies in parts (`PART`, `CREDIT`, the `PARTS` bit); version 3 put the nodes a
   keyed start passed in the spawn request and added `axon.owns`
-  ([paxos-leases.md §5.3](paxos-leases.md#53-placement-under-partial-cuts)). A node of version 5 is refused at the
+  ([paxos-leases.md §5.3](paxos-leases.md#53-placement-under-partial-cuts)). A node of version 7 is refused at the
   handshake. A node on version 1, whose hello named a single version where the lowest is now, is
   refused as `Negotiation::Version` with `theirs` = `(1, 1)` and counted under `version`, so a range starts at 2.
 - **User protocols are the user's.** A protocol's `ID` stays fixed, and a breaking change takes a larger `SCHEMA`.
@@ -53,7 +54,8 @@ without a real one.
 ## 3. Schemas side by side
 
 The internal protocols that are served by name use the same mechanism as user protocols. These are streams
-(`SCHEMA` 6), Paxos leases, quotas and telemetry, all served with `Cluster::serve`.
+(`SCHEMA` 7, `axon-stream/src/node.rs:42`; 8 in wire v8, §6), Paxos leases, quotas and telemetry, all served with
+`Cluster::serve`.
 
 - **A name maps to one protocol, and to one endpoint per schema.** Publishing a name again is allowed only for the
   same protocol at a new schema. Anything else is `NameTaken`. Each endpoint has its own lifecycle, so withdrawing
@@ -131,3 +133,105 @@ The test asserts the following for every seed in `SEEDS=0..512`:
 - `crates/axon-net/tests/session.rs::a_session_runs_the_highest_version_both_speak_and_ranges_that_do_not_meet_are_refused_naming_both`
 - `crates/axon-cluster/tests/upgrade.rs`
 - `crates/axon-cluster/src/placement.rs::only_nodes_serving_every_callers_schema_of_a_kind_are_candidates`
+
+## 6. Wire v8
+
+Status: §6.1 and §6.2 built; the trace bytes and `axon.kinds` with their own specs. Wire v8 is one release and a clean break: `VERSIONS = 8..=8`. A v8 node and a v7 node
+refuse each other at the handshake (`Negotiation::Version`), and no code picks a format by `Peer::version`. The
+pre-1.0 policy (§1) allows it, and a window would be code deleted in the release after.
+
+| Change | Where | Spec |
+|---|---|---|
+| A call carries its contract's id, and the server checks it | call body, `call_frame_bytes_are_pinned` | §6.1 |
+| A new rejection, `ProtocolMismatch` | `END` answer byte, `REJECTION_NAMES` | §6.1 |
+| A trace context is 25 bytes, on calls and stream batches | `TRACED` body, stream item kind 5; stream `SCHEMA` 8 | [tracing.md §1](tracing.md#1-context) |
+| `axon.kinds` marks unleased kinds | node record metadata | [paxos-leases.md §11](paxos-leases.md#11-leases-per-kind-wire-v8) |
+
+Nothing on disk changes: the lease log, a node's durable log and a stream's segments keep their formats, and a batch's
+trace is not written to its segment (`disk.rs:545-592`). A node starts on v8 with its directories as they are.
+
+### 6.1 Wire contracts
+
+**Problem.** A contract is checked at one end. The caller compares the route's protocol id when it makes a target
+(`Route::target`, `cluster.rs:196-199`). The call frame then carries the endpoint and the schema, not the contract
+(`wire.rs:3-5`, the header's `protocol` field is the endpoint), and the server compares the schema alone
+(`engine.rs:981-985`). A call whose target was made wrong, from a hand-built `Target`, a fixed endpoint id or a fault in
+route caching, is admitted by another contract's endpoint at the same schema, and its body goes to that contract's
+`decode`. And every serde contract repeats the same glue by hand (guide `cluster.md:600-630`, `json()`).
+
+**Design.**
+
+- A call's body starts with its contract's id, `u64`, before the trace context. The server compares `(ID, SCHEMA)`
+  with the endpoint's and refuses another id `Rejection::ProtocolMismatch` (END code 8, counted under
+  `protocol_mismatch`), which the caller sees as `CallError::Rejected(ProtocolMismatch)`, `retry()` `Resolve`: the
+  target was made wrong, and a fresh lookup makes it again. `ClusterError::ProtocolMismatch`, a lookup that finds the
+  name served by another protocol, stays `Never`. The system endpoints and the directory carry `axon.control`'s id.
+  Eight bytes a call: `Cluster::max_frame(lane)`, the largest call body, is the frame less 8. The id, trace, deadline
+  and window go in the frame's `Prefix` (axon-net, at most `PREFIX_MAX`, 48 bytes), which the encoder writes in front
+  of the payload, so a call's body is not copied to put them there. `scripts/bench.sh` `route` and `remote` gate it.
+- `WireProtocol::NAME: &'static str`, default `""`. A protocol's label, in telemetry and the console, is its `NAME`, or
+  else its `ID` as 16 hex digits: `axon_cluster::protocol_label(id, name)`. axon's own protocols are raw endpoints
+  with no `WireProtocol`, so `protocol_label` names them by id: `axon.control` (the system endpoints and the control
+  services, telemetry among them, which share its id), `axon.stream`, `axon.lease`, `axon.quota`.
+- In axon-cluster, behind its `serde` feature:
+
+  ```rust,ignore
+  pub trait Codec: 'static {
+      fn encode<T: Serialize>(value: &T) -> Result<Bytes, String>;
+      fn decode<T: DeserializeOwned>(body: &[u8]) -> Result<T, String>;
+  }
+  pub trait Contract: 'static {
+      type Message: Serialize + DeserializeOwned + Send + 'static;
+      type Reply: Serialize + DeserializeOwned + Send + 'static;
+      type Codec: Codec;
+      const ID: u64;
+      const SCHEMA: u16;
+      const LANE: Lane = Lane::Live;
+      const NAME: &'static str = "";
+  }
+  impl<C: Contract> WireProtocol for C { .. }
+  impl<C: Contract> ActorProtocol for C { type Mailbox = (C::Message, Option<Reply<C::Reply>>); .. }
+  ```
+
+  A codec error on encode is `CallError::Codec`, on decode at the server `Rejection::InvalidMessage`. A type with a
+  hand-written `WireProtocol` and no `Contract` still compiles, as `ToString` beside `Display` does. axon names no
+  codec: its tests and the guide use a JSON one; an application brings its own.
+
+**Tests.**
+
+- `crates/axon-cluster/src/wire.rs::call_frame_bytes_are_pinned`, with the id in front.
+- `crates/axon-cluster/tests/cluster/remote.rs::a_call_for_one_contract_at_another_contracts_endpoint_is_refused_protocol_mismatch`
+  (fails today: admitted and decoded)
+- `crates/axon-cluster/tests/cluster/remote.rs::a_contract_from_serde_types_round_trips_tell_send_and_request`
+- `crates/axon-cluster/tests/cluster/remote.rs::a_body_its_codec_cannot_read_is_rejected_invalid_message_and_a_bad_reply_is_a_codec_error`
+- `crates/axon-cluster/src/wire.rs::a_protocol_is_labelled_by_its_name_or_else_its_hex_id`; the series that carry the
+  label are [lanes.md §8.1](lanes.md#81-link-meters-wire-v8)'s.
+- A guide program in `guide/cluster.md` (an axon-obs doctest) in place of the `json()` glue.
+
+### 6.2 Upgrading a cluster to v8
+
+The whole cluster at once:
+
+1. Build every deployable at v8.
+2. Stop every node and every seed server. A drain with `LeaveReason::Maintenance` hands keys to nobody: no peer on v8 is
+   up yet.
+3. Start them, in any order. The view forms once more than half of the seeds are past their warm-up
+   ([seed-discovery.md §4.2](seed-discovery.md#42-the-seed-server)); acceptors refuse grants for their restart wait,
+   `T·(1 + drift) + 200 ms` ([paxos-leases.md §2.2](paxos-leases.md#22-restarts)); eager keys start again after it. It
+   costs what a cold restart costs, which the rig runs (`cold-restart`, [fault-rig.md](fault-rig.md)).
+4. Check that no v7 node is left: `listener.handshake_failures{reason="version"}` stays 0 on every node.
+
+A v7 node left running splits the cluster by version: each half sees only its own. Leased keys run only on the half
+with a majority of the acceptors; unleased keys may run on both. So do not roll v8.
+
+**Tests.** `crates/axon-net/tests/session.rs::a_v8_node_and_a_v7_node_refuse_each_other_naming_both_ranges`, through
+the hidden `Config::versions`. `world_upgrade.rs` keeps rolling a test-only next version, which holds the N and N-1
+mechanism for 1.0.
+
+## Open
+
+- §6.1: a build-time check that an application's contract ids are unique (`(ID, SCHEMA)` pairs), and a reserved range
+  for axon's own ids (they spell `AXON`, `wire.rs:69`). Neither is chosen here; the server's check refuses a call that
+  reaches another id, not two contracts that share one.
+- §6.1: the contract id as 8 body bytes against a 16-bit tag in the frame header's reserved `u16` (`frame.rs:4`). The
+  tag costs nothing and catches all but 1 in 65 536 mismatches; the id is exact. Default: the id.

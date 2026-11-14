@@ -76,7 +76,7 @@ export const LANES = ["control", "live", "bulk"] as const;
 export type Lane = (typeof LANES)[number];
 
 /** The names of `inbound_rejected`, by index (axon_cluster::REJECTION_NAMES). */
-export const INBOUND_REJECTIONS = ["unknown_actor", "schema_mismatch", "full", "forbidden", "invalid_message", "stopped"];
+export const INBOUND_REJECTIONS = ["unknown_actor", "schema_mismatch", "full", "forbidden", "invalid_message", "stopped", "protocol_mismatch"];
 /** The names of `listener.handshake_failures`, by index (axon_net::HANDSHAKE_FAILURE_REASONS). */
 export const HANDSHAKE_FAILURES = ["auth", "negotiation", "timeout", "other", "version"];
 

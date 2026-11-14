@@ -148,6 +148,8 @@ pub(crate) struct Target {
     pub node: Arc<str>,
     pub incarnation: u128,
     pub endpoint: u64,
+    /// The caller's contract, which the serving node compares with the endpoint's.
+    pub protocol: u64,
     pub schema: u16,
     pub lane: Lane,
 }
@@ -175,8 +177,8 @@ fn ended(code: u8) -> Result<(), CallError> {
 }
 
 fn end(id: u64, code: u8) -> Frame {
-    static CODES: [u8; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
-    let code = (code as usize).min(7);
+    static CODES: [u8; 9] = [0, 1, 2, 3, 4, 5, 6, 7, 8];
+    let code = (code as usize).min(CODES.len() - 1);
     Frame { kind: END, id, payload: Bytes::from_static(&CODES[code..code + 1]), ..Frame::default() }
 }
 
@@ -697,7 +699,7 @@ struct Counters {
     failed: AtomicU64,
     abandoned: AtomicU64,
     inbound: AtomicU64,
-    inbound_rejected: [AtomicU64; 6],
+    inbound_rejected: [AtomicU64; REJECTION_NAMES.len()],
     inbound_expired: AtomicU64,
     connects: AtomicU64,
     dial_failures: AtomicU64,
@@ -710,8 +712,8 @@ impl Counters {
     }
 }
 
-pub const REJECTION_NAMES: [&str; 6] =
-    ["unknown_actor", "schema_mismatch", "full", "forbidden", "invalid_message", "stopped"];
+pub const REJECTION_NAMES: [&str; 7] =
+    ["unknown_actor", "schema_mismatch", "full", "forbidden", "invalid_message", "stopped", "protocol_mismatch"];
 
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
@@ -747,7 +749,7 @@ pub struct EngineStats {
     pub abandoned: u64,
     pub inbound_calls: u64,
     /// Indexed like `REJECTION_NAMES`.
-    pub inbound_rejected: [u64; 6],
+    pub inbound_rejected: [u64; REJECTION_NAMES.len()],
     /// Requests dropped unrun and unanswered because their caller's deadline passed before they came in, or while they
     /// waited for their actor's next generation.
     pub inbound_expired: u64,
@@ -966,12 +968,14 @@ impl Engine {
         &self,
         kind: u16,
         peer: &Peer,
-        endpoint: u64,
-        schema: u16,
+        (endpoint, protocol, schema): (u64, u64, u16),
         body: Bytes,
         reply: Option<&Arc<ReplyCore>>,
     ) -> Result<Option<Waiting>, Rejection> {
         if endpoint == DIRECTORY {
+            if protocol != CONTROL_PROTOCOL {
+                return Err(Rejection::ProtocolMismatch);
+            }
             let reply = reply.ok_or(Rejection::InvalidMessage)?;
             reply.state.reply();
             reply.finish(Outcome::Reply(self.lookup(&body)));
@@ -981,6 +985,9 @@ impl Engine {
         let admit = {
             let registry = self.registry.read();
             let entry = registry.by_id.get(&endpoint).ok_or(Rejection::UnknownActor)?;
+            if entry.protocol != protocol {
+                return Err(Rejection::ProtocolMismatch);
+            }
             if entry.schema != schema {
                 return Err(Rejection::SchemaMismatch);
             }
@@ -1005,10 +1012,11 @@ impl Engine {
         self.counters.inbound.fetch_add(1, Relaxed);
         let (kind, id, peer) = (frame.kind & !(TRACED | DEADLINE | PARTS | BODY), frame.id, link.sender.peer());
         let mut payload = frame.payload;
+        let protocol = payload.try_get_u64().ok();
         let trace = (frame.kind & TRACED != 0 && payload.len() >= TraceContext::WIRE_LEN)
             .then(|| TraceContext::from_bytes(payload.split_to(TraceContext::WIRE_LEN)[..].try_into().ok()?))
             .flatten();
-        let mut malformed = frame.kind & TRACED != 0 && trace.is_none();
+        let mut malformed = protocol.is_none() || frame.kind & TRACED != 0 && trace.is_none();
         let left = match (frame.kind & DEADLINE != 0 && !malformed).then(|| payload.try_get_u64()) {
             Some(Ok(us)) => Some(Duration::from_micros(us)),
             Some(Err(_)) => {
@@ -1071,7 +1079,8 @@ impl Engine {
         let admitted = if malformed {
             Err(Rejection::InvalidMessage)
         } else {
-            enter(trace, || self.dispatch(kind, peer, frame.protocol, frame.schema, payload, core.as_ref()))
+            let to = (frame.protocol, protocol.unwrap_or_default(), frame.schema);
+            enter(trace, || self.dispatch(kind, peer, to, payload, core.as_ref()))
         };
         let admitted = match admitted {
             Ok(Some(wait)) => return self.wait(&link.sender, id, core, deadline, Scoped::new(trace, wait)),
@@ -1671,7 +1680,8 @@ impl Engine {
         if target.incarnation != self.local.identity.incarnation {
             return Err(CallError::StaleNode);
         }
-        match enter(trace, || self.dispatch(kind, &self.local, target.endpoint, target.schema, body, core)) {
+        let to = (target.endpoint, target.protocol, target.schema);
+        match enter(trace, || self.dispatch(kind, &self.local, to, body, core)) {
             Ok(Some(wait)) => timeout_at(deadline, Scoped::new(trace, wait))
                 .await
                 .map_err(|_| CallError::NotSent(SubmitReason::Deadline)),
@@ -1734,12 +1744,20 @@ impl Engine {
         let left = (kind & DEADLINE != 0).then(|| deadline.saturating_duration_since(Instant::now()));
         let window = (kind & PARTS != 0).then_some(parts::WINDOW);
         let room = payload.len() + TraceContext::WIRE_LEN + left.map_or(0, |_| 8) + window.map_or(0, |_| 4);
-        let trace = trace.filter(|_| room <= link.sender.peer().max_frame);
-        let (kind, payload) = stamp(kind, trace, left, window, payload);
+        let trace = trace.filter(|_| CONTRACT_LEN + room <= link.sender.peer().max_frame);
+        let (kind, prefix) = stamp(kind, target.protocol, trace, left, window);
         link.calls.fetch_add(1, Relaxed);
         let id = link.next_id.fetch_add(1, Relaxed);
-        let frame =
-            Frame { kind, schema: target.schema, protocol: target.endpoint, id, payload, compress, ..Frame::default() };
+        let frame = Frame {
+            kind,
+            schema: target.schema,
+            protocol: target.endpoint,
+            id,
+            payload,
+            compress,
+            prefix,
+            ..Frame::default()
+        };
         Ok((link, frame))
     }
 
@@ -2026,7 +2044,8 @@ impl Engine {
         body: Bytes,
     ) -> Result<(u128, Option<Bytes>), CallError> {
         let incarnation = self.incarnation_of(&node).await?;
-        let target = Target { node, incarnation, endpoint, schema: SYSTEM_SCHEMA, lane: Lane::Control };
+        let (protocol, schema, lane) = (CONTROL_PROTOCOL, SYSTEM_SCHEMA, Lane::Control);
+        let target = Target { node, incarnation, endpoint, protocol, schema, lane };
         Ok((incarnation, self.call(&target, REQUEST, body).await?))
     }
 
@@ -2186,7 +2205,8 @@ pub(crate) mod tests {
             }
             engine.membership.apply(discovery.snapshot().await.unwrap());
             engine.reset_peer(&id);
-            let target = Target { node: id, incarnation, endpoint: LISTED, schema: SYSTEM_SCHEMA, lane: Lane::Control };
+            let (protocol, schema, lane) = (CONTROL_PROTOCOL, SYSTEM_SCHEMA, Lane::Control);
+            let target = Target { node: id, incarnation, endpoint: LISTED, protocol, schema, lane };
             let refused = engine.call(&target, REQUEST, Bytes::new()).await;
             let looks_again = if restarted {
                 matches!(refused, Err(CallError::StaleNode))

@@ -149,6 +149,22 @@ async fn garbage_and_silence_fail_the_handshake_without_detail() {
     assert!(matches!(establish(y, Role::Responder, &cfg).await, Err(Error::Timeout(Timeout::Handshake))));
 }
 
+/// Wire v8 is a clean break: a v8 node speaks only 8, so it and a v7 node refuse each other, each naming both ranges,
+/// in either direction of the dial.
+#[tokio::test]
+async fn a_v8_node_and_a_v7_node_refuse_each_other_naming_both_ranges() {
+    assert_eq!(VERSIONS, 8..=8);
+    let mut v7 = config("old");
+    v7.versions = 7..=7;
+    let v8 = config("new");
+    let version = |ours, theirs| format!("{:?}", Some(Error::Negotiation(Negotiation::Version { ours, theirs })));
+    for (dials, answers, refused) in [(&v7, &v8, [(7, 7), (8, 8)]), (&v8, &v7, [(8, 8), (7, 7)])] {
+        let (a, b) = pair(dials, answers).await;
+        let seen = (format!("{:?}", a.err()), format!("{:?}", b.err()));
+        assert_eq!(seen, (version(refused[0], refused[1]), version(refused[1], refused[0])));
+    }
+}
+
 /// Each side speaks a range of wire versions, and a session runs the highest both speak. Only ranges that do not meet
 /// are refused, by both sides, naming both, and a listener counts that apart from other failed negotiations.
 #[tokio::test]

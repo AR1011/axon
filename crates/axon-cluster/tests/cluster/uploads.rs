@@ -460,6 +460,8 @@ async fn a_body_part_past_its_credit_or_a_short_body_frame_closes_only_that_sess
         payload: Bytes::copy_from_slice(payload),
         ..axon_net::Frame::default()
     };
+    // A call's body starts with its contract's id; the frames of its body do not.
+    let call = |id, body: &[u8]| frame(upload, id, &[&0xC0Cu64.to_be_bytes()[..], body].concat());
     /// The next frame that is not a grant of credit.
     async fn answer(raw: &mut axon_net::Session) -> Result<(u16, u64, Bytes), axon_net::Error> {
         loop {
@@ -474,26 +476,26 @@ async fn a_body_part_past_its_credit_or_a_short_body_frame_closes_only_that_sess
     let raw_session = || axon_net::connect(a.cluster.local_addr(), axon_net::Lane::Control, None, &z);
 
     let mut raw = raw_session().await.unwrap();
-    for f in [frame(upload, 1, b"head:"), frame(part, 1, b"ab"), frame(part, 1, b"cd"), frame(end, 1, &[0])] {
+    for f in [call(1, b"head:"), frame(part, 1, b"ab"), frame(part, 1, b"cd"), frame(end, 1, &[0])] {
         raw.sender.submit(f, None).await.unwrap();
     }
     assert_eq!(answer(&mut raw).await.unwrap(), (reply, 1, Bytes::from_static(b"head:abcd")));
     // A part for a body nobody reads is dropped, and a cut body reads as cut.
     raw.sender.submit(frame(part, 99, b"lost"), None).await.unwrap();
-    for f in [frame(upload, 2, b"head:"), frame(part, 2, b"ab"), frame(end, 2, &[1])] {
+    for f in [call(2, b"head:"), frame(part, 2, b"ab"), frame(end, 2, &[1])] {
         raw.sender.submit(f, None).await.unwrap();
     }
     assert_eq!(answer(&mut raw).await.unwrap(), (reply, 2, Bytes::from_static(b"head:ab!cut")));
     // Five parts of 1 MiB to a body nobody reads: the fourth takes its 4 MiB below zero, the fifth is past it.
-    raw.sender.submit(frame(upload, 3, b"keep"), None).await.unwrap();
+    raw.sender.submit(call(3, b"keep"), None).await.unwrap();
     for _ in 0..5 {
         raw.sender.submit(frame(part, 3, &vec![7; 1 << 20]), None).await.unwrap();
     }
     assert!(answer(&mut raw).await.is_err(), "a part past its credit closes the session");
 
-    for bad in [frame(upload, 1, b"head:"), frame(end, 1, &[])] {
+    for bad in [call(1, b"head:"), frame(end, 1, &[])] {
         let mut raw = raw_session().await.unwrap();
-        raw.sender.submit(frame(upload, 1, b"head:"), None).await.unwrap();
+        raw.sender.submit(call(1, b"head:"), None).await.unwrap();
         raw.sender.submit(bad, None).await.unwrap();
         assert!(answer(&mut raw).await.is_err(), "an id in use or an end without its byte closes the session");
     }

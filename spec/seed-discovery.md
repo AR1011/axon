@@ -58,6 +58,7 @@ core code than the listener here, and gives slower failure detection.
 | A partition | The side with most seeds carries on and drops the other side's nodes. The other side freezes on its last view. |
 | A cut from most seeds heals | Each node thaws once every member of its last view is listed again, or 5 s after it is attached again (§2.2). |
 | Cluster start | No view exists until more than half of the seeds are up and past their warm-up (§4.2). |
+| A node restarts while cut from most seeds | It lists no peer and serves nothing until the cut heals; with `ClusterConfig::view_store` it starts frozen on its last view (§10). |
 | 1 seed | The seed is the arbiter. If it dies the rest freeze. Fine for 2 to 5 nodes and for development. The seed itself is live alone. |
 | 2 or 4 seeds | Allowed, never better. 2 tolerates no seed failure, like 1, with twice the chance of one. 4 tolerates one, like 3, and a 2–2 partition freezes both sides. |
 
@@ -482,3 +483,58 @@ example.
 | Full records from one seed only | Cold start measures too slow even compressed. |
 | A node re-checking a seed whose process is wedged but whose sessions still answer pings | It is seen in practice. |
 | A DNS name that expands to several seeds | Someone needs it. The seed count must be known for "more than half". |
+
+## 10. Starting from a cached view (wire v8)
+
+Status: designed, not built. The cache is the cluster's, so it serves every provider; seeds are where it matters.
+
+**Problem.** A node that restarts while its region is cut from most seeds never gets a view. `snapshot` answers
+`Unavailable` while the node is not live (`seed/mod.rs:629-636`), `register` returns `Ok` (§5), so `Cluster::start`
+succeeds with an empty view. Then:
+
+- it lists no peer: names, keyed calls and stream parents fail with `NoCandidate`;
+- its peers, frozen too, list its old boot: their dials refuse the new incarnation (`engine.rs:1301-1303`), pushes to it
+  fail `StaleNode`, and `axon.listed` answers false for it (`spawn.rs:355`), so its isolation check finds itself
+  dropped and sweeps (`spawn.rs:1475-1481`);
+- only its outbound calls work, because accept does not check the view (`engine.rs:1203`).
+
+**Design.**
+
+1. `ClusterConfig::view_store: Option<Arc<dyn Files>>`, the type of `PaxosConfig::store`. After each change of a live
+   view, at most once per `poll_interval`, the node writes the view (its revision and records) with
+   `FileOp::Replace`: after a crash the file holds the old view or the new. Format:
+   `"AXVW" | version u16 | revision u64 | count u32 | record*`, the seed protocol's record encoding (§4.1), and a
+   CRC-32 of what precedes it.
+2. At start, before the first snapshot, the node loads it into `Membership` as a stale view, its own old boot left
+   out. The first live snapshot replaces it. A missing file, a bad CRC or another version starts the node as today.
+3. While a node's view is stale, a newer boot of a member it lists, proved by a handshake (dialled or accepted, the
+   same id with a greater incarnation), replaces that member's record locally. It is the proof a static list's
+   incarnation 0 already relies on (`engine.rs:1302`). So frozen peers take the restarted node's new boot: they dial
+   it, push to it, and `axon.listed` vouches for it, and it rejoins after a `heartbeat_grace` heard (`spawn.rs`,
+   `rejoined`). Under `CertificateIdentity` the id is bound to the certificate; under a shared secret the proof is
+   no weaker than an id claim is today.
+
+A cached view is a frozen view (§2), so what holds while frozen holds here: unleased keys may run on both sides of the
+cut until it heals; leased keys are the acceptors' ([paxos-leases.md §11](paxos-leases.md#11-leases-per-kind-wire-v8)).
+`SeedMembership.tla` is unchanged: it has frozen views already, and the learned boot is the cluster's, proven in the
+World.
+
+**Wire.** None: the file is local, and a handshake already carries the incarnation.
+
+**API.** `ClusterConfig::view_store`. The console shows a cached view as stale with the reason "cached".
+
+**Tests.**
+
+- `crates/axon-cluster/tests/world_faults.rs::a_node_restarted_while_cut_from_its_seeds_serves_from_its_cached_view`:
+  the seeds in one region, a second region cut, one of its nodes restarted. It calls its neighbour's name, the
+  neighbour calls its unleased kind, its `Live` follower gets records, and it is not isolated after one
+  `heartbeat_grace`. Each fails today.
+- `crates/axon-cluster/tests/cluster/discovery.rs::a_missing_or_corrupt_view_file_starts_the_node_with_an_empty_view`
+- `crates/axon-cluster/tests/cluster/discovery.rs::the_first_live_snapshot_replaces_the_cached_view`
+- `crates/axon-cluster/src/membership.rs`: `a_stale_view_takes_a_newer_boot_a_handshake_proves_and_a_live_view_does_not`
+- `crates/axon-stream/tests/world_regions.rs`: the restart inside a 300 s cut ([fault-rig.md § Three regions](fault-rig.md#three-regions)).
+
+## Open
+
+- §10: an age past which a cached view is not loaded. A view a day old lists nodes long gone; dials to them fail and mark
+  them unreachable, which costs calls, not safety. Default: no limit.

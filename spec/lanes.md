@@ -512,6 +512,56 @@ said in the commit.
 `crates/axon-obs/ui/tests/dashboard.spec.ts` (a connection's page by lane), and a `scripts/ctl.sh` run with the
 verify-axon skill: a screenshot of the peer table with three lanes, the detail page clicked open, no layout shift.
 
+### 8.1 Link meters (wire v8)
+
+Status: designed, not built.
+
+**Problem.** The `connection.*` series answer "which sessions are busy", not "what crossed this link". Telemetry
+stores series for the `sample_connections` busiest sessions only (32, `crates/axon-obs/src/telemetry.rs:35,62`, sorted
+at `:585-591`, cut at `:994`). `Engine::stats` lists sessions that are up (`links`, `crates/axon-cluster/src/engine.rs:889-893`),
+and a session's counters (`crates/axon-net/src/session.rs:48-72`) die with it: what it moved since the last sample is
+lost, and a redial counts from 0. There is no region and no protocol on any of them, so the traffic between two regions
+cannot be split by what sent it: every stream namespace is one protocol over three endpoints
+(`crates/axon-stream/src/node.rs:41,565-567`).
+
+**Design.**
+
+- The engine keeps meters for the node's life, never reset:
+  - per `(peer region, lane, direction, protocol)`: `frames` and `frame_bytes`, the frame header (`HEADER_LEN`, 32,
+    `crates/axon-net/src/frame.rs:11`) plus the payload before compression: exact for what was sent, an upper bound on
+    what crossed when compressed;
+  - per `(peer region, lane, direction)`: `wire_bytes`, the session's own count after compression, above TLS
+    (`session.rs:92`), exact. A link that closes folds its session's count in; reading adds the open sessions'.
+- Protocol counts are taken where the engine sends and dispatches: the caller by its `Target`, which gains `protocol`
+  (the `Route` has it, `crates/axon-cluster/src/cluster.rs:185-207`), the server by the endpoint's `Entry.protocol`
+  (`engine.rs:981-984`). Replies, parts and credits count under their call's protocol; the system endpoints under
+  `axon.control`. A link caches one meter per protocol it has carried, so a frame costs one relaxed add of each count.
+- A region is the peer's `region` label, read from the view when the link comes up; this node's is
+  `ClusterConfig::labels["region"]`. No label is `""`.
+- `ClusterStats.links: Vec<LinkMeter>` (public, serde): `src_region`, `dst_region`, `lane`, `direction`, `protocol` (the
+  protocol's label, [rolling-upgrades.md §6.1](rolling-upgrades.md#61-wire-contracts)), `frames`, `frame_bytes`, and
+  `wire_bytes` on the rows with no protocol. Every link is in it, up or down or closed.
+- Telemetry writes them uncapped: `link.wire_bytes` {`src_region`, `dst_region`, `lane`, `direction`}, and `link.frames`
+  and `link.frame_bytes` with `protocol` too. Prometheus renders `axon_link_wire_bytes_total`, `axon_link_frames_total`
+  and `axon_link_frame_bytes_total`. At most regions² × 3 lanes × 2 directions × protocols series a node. The
+  `connection.*` series and their cap stay, for the console.
+- The console's topology draws an edge between regions with the bytes per second across it.
+
+**Wire.** None. **Bench.** `scripts/bench.sh` `route` and `remote` before and after: one add a frame on the call path.
+
+**Tests.**
+
+- `crates/axon-obs/tests/prometheus.rs::link_counters_cover_every_peer_past_the_busiest`: `sample_connections = 1`, three
+  peers in two regions, each pair's series present. Fails today: there is no `link.*` series.
+- `crates/axon-obs/tests/prometheus.rs::counters_and_histograms_never_go_backwards_across_scrapes_while_the_node_works`
+  cuts a session mid-run.
+- `crates/axon-obs/tests/telemetry.rs::link_series_are_per_region_pair_lane_and_protocol`
+- `crates/axon-cluster/tests/cluster/lanes.rs::a_links_meters_take_in_the_sessions_it_closed`: kill `Live`, redial, and
+  no total drops.
+- `crates/axon-stream/tests/world_wan.rs::each_region_pairs_meter_matches_what_its_sessions_moved_across_cuts`, which
+  needs the World's network to count the bytes each connection carries (`axon-testkit`).
+- The fault loop `crates/axon-net/tests/faults.rs` gains the class "a counter that goes backwards".
+
 ## 9. Benchmarks
 
 The harness `crates/axon-cluster/examples/uploads.rs`

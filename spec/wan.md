@@ -595,10 +595,12 @@ What the values give:
 - Every renew crosses at least the 92 ms EU ↔ us link. Only eu-a of the three acceptors is in Europe, so a majority
   always holds a non-European one. eu-a and eu-b renew through us at 92 ms; sin and us renew through eu-a at 190 and
   92 ms.
-- One timing set per cluster (settled): eu-a ↔ eu-b, 0.24 ms apart, also waits
-  11.5 s for a dead machine.
+- Without near links (§14), eu-a ↔ eu-b, 0.24 ms apart, also waits 11.5 s for a dead machine.
 - The first call on a Live or Bulk lane to a peer waits that lane's dial, about 0.9 s on sin ↔ us
   ([lanes.md §2.1](lanes.md#21-one-connection-per-lane)).
+- What crosses each pair of regions is counted for every link, by region pair, lane and protocol, and never goes
+  backwards across a redial ([lanes.md §8.1](lanes.md#81-link-meters-wire-v8)): the number a transfer bill is checked
+  against.
 
 ## 10. The guide section "Across regions" (work item D1)
 
@@ -753,6 +755,65 @@ axon-stream (feature cluster)
   StreamNodeConfig .relay_timings(namespace, RelayTimings { upstream_timeout, hold_down })   that namespace's keys ; cfg.core.timings the rest's, default 3 s and 10 s
 ```
 
+## 14. Near links (wire v8)
+
+Status: designed, not built.
+
+**Problem.** A node has one transport `Config`, and `Cluster::start` lowers every session's idle timeout to the
+authority's `hold` when that is shorter, and its keepalive and connect to `hold / 4` (`cluster.rs:470-475`). A service
+with its acceptors and holders 1 to 2 ms apart inside one region, and peers in two others, must choose. At `T` = 4 s
+every session gets idle 3.76 s and connect 0.94 s, far ones too, and one lost SYN marks a far peer unreachable
+(`world_wan.rs::the_shipped_timings_mark_a_peer_unreachable_on_a_lost_syn_and_the_wan_timings_do_not`). At the WAN
+`T` of 10 s a dead holder's keys run elsewhere after about 14 s (§9), even for callers 0.24 ms away.
+
+**Design.**
+
+- `ClusterConfig::near: Option<Near>`, `Near { label: String, keepalive, idle, connect }`. A peer whose record has
+  this node's value of `label` (for example `region`) is near: each of its lanes runs the near timings. Every other
+  peer, and every peer of a node without the label, runs the transport's.
+- The dialler reads the target's record, which it already holds for the dial (`engine.rs:1290-1303`). The acceptor
+  looks the peer's id up in its view after the handshake (`accept`, `engine.rs:1203`); a peer not in the view yet runs
+  far timings until its next session.
+- axon-net takes timings per session: `LinkTimings { keepalive, idle, connect }`, an argument of the dial and a setter
+  on an accepted session before its first idle check. Unset, they are the `Config`'s.
+- The clamp. With `near` set, `Cluster::start` applies the hold clamp to the near timings only, and refuses a
+  `near.idle` above `hold` (`ClusterError::Config`). Far links keep their idle above `hold`. The clamp exists so that a
+  caller does not send a holder's keys over a quiet session after the lease let them go (`cluster.rs:471-472`). Over a
+  far link that costs liveness only: the holder's fence stops its actors at `lease_grace`
+  ([paxos-leases.md §5.1](paxos-leases.md#51-the-renew-loop-measured-from-the-reply)), and a far caller walks on after
+  far idle plus connect. Without `near`, the clamp is today's, on every session.
+- `T` stays one value: it is part of the Paxos protocol id (`paxos/mod.rs:77-89`). A short `T` pays when a majority
+  of the acceptors and the holders of the leased kinds are near each other. The bound: a round's patience `T / 6` holds
+  an ask and one retransmit on the slowest link any holder renews over.
+
+Values for three acceptors in one region, 1 to 2 ms apart, and two far regions at the WAN values of §9:
+
+| Setting | Near | Far |
+|---|---|---|
+| keepalive, idle, connect | 0.5 s, 2 s, 0.5 s | 1 s, 8 s, 3.5 s |
+| `PaxosConfig::lease` | 4 s | (one value) |
+| hold, `lease_grace`, renew | 3.76, 3.29, 1.32 s | derived |
+
+A dead holder is unreachable to near callers 2 to 2.5 s after it died. The acceptors free its keys at most `T` after
+its last renew reached them, 4 s, and the next owner's acquire is one round at near round trips: its keys run again
+about 4.5 s after it died. Holders in a far region renew across it: at `T` = 4 s the patience, 0.67 s, holds an ask
+and one retransmit up to 219 ms (0.22 + 0.42 s).
+
+**Wire.** None: the timings are local to each end. No TLA change: `PaxosLeases.tla` and `Handover.tla` hold for any
+timing.
+
+**API.** `ClusterConfig::near`, `Near`, `axon_net::LinkTimings`, `PeerStats::near: bool` (the console's peer table
+shows it).
+
+**Tests.**
+
+- `crates/axon-net/tests/session.rs::a_session_given_its_own_timings_goes_idle_on_them_and_its_peer_on_the_config`
+- `crates/axon-cluster/tests/cluster/leases.rs::a_near_idle_beyond_the_hold_is_refused`
+- `crates/axon-cluster/tests/world_leases.rs::near_peers_run_the_near_timings_and_far_peers_the_transports`
+- `crates/axon-stream/tests/world_regions.rs::a_dead_holder_near_its_acceptors_is_replaced_within_5s_and_no_far_link_flaps`
+  ([fault-rig.md § Three regions](fault-rig.md#three-regions)). Fails today either way: 14 s at `T` = 10 s, and far
+  links marked unreachable at `T` = 4 s.
+
 ## 15. Risks
 
 - **Run time.** `SeedMembership-Wan.cfg` may not finish in an hour even at one fault; then it drops `CutFor` to
@@ -775,8 +836,8 @@ Chosen not to add:
 
 - `ClusterConfig::wan()` or any preset across config structs: rejected. The guide's
   function is the application's.
-- Timings per peer or per link: one set per cluster (settled). Per lane: [lanes.md §14](lanes.md#14-left-out) leaves
-  it out.
+- Timings per peer: two sets, near and far (§14), not one per peer. Per lane: [lanes.md §14](lanes.md#14-left-out)
+  leaves it out.
 - Timings that adapt to the measured RTT: every bound here is a sum the operator can read; an adaptive one is not.
 - A seed keepalive or seed connect setting: neither changes with the RTT (§4, §5).
 - `SO_SNDBUF`, `SO_RCVBUF`, `TCP_CONGESTION`: §8.

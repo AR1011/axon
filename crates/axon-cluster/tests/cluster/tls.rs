@@ -290,3 +290,36 @@ async fn a_rotation_checked_by_an_authenticator_that_panics_is_refused_and_the_c
     drop(n.cluster);
     n.system.shutdown().await.unwrap();
 }
+
+/// One wildcard certificate per deployable binds each of its nodes to one principal, so one rule lets them all in,
+/// and a node of a deployable the rules do not name is refused `Forbidden`.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_nodes_under_one_wildcard_certificate_share_a_principal_and_a_third_deployable_is_forbidden() {
+    let root = ca("root");
+    let (svc_a, svc_b) = (mtls("*.svc-a.example", &root, &[&root]), mtls("*.svc-b.example", &root, &[&root]));
+    let discovery = MemoryDiscovery::new();
+    let a1 = mtls_node("n1.svc-a.example", &discovery, svc_a.clone()).await;
+    let a2 = mtls_node("n2.svc-a.example", &discovery, svc_a).await;
+    let b1 = mtls_node("n1.svc-b.example", &discovery, svc_b).await;
+    assert_eq!([principal("n1.svc-a.example"), principal("n2.svc-a.example")], ["svc-a.example"; 2]);
+    a1.cluster.set_authorizer(Some(Arc::new(Rules::new().allow("svc-a.example", Allow::call("counter")))));
+
+    eventually("a2 calls a1", || calls(&a2, &a1)).await;
+    let resolve = || b1.cluster.resolve_on::<CounterApi>("n1.svc-a.example", "counter");
+    // The directory is an axon.* endpoint, open to every member.
+    eventually("b1 resolves a1's counter", || async { resolve().await.is_ok() }).await;
+    let refused = resolve().await.unwrap().request(Op::Get).await;
+    assert!(matches!(refused, Err(CallError::Rejected(Rejection::Forbidden))), "{refused:?}");
+}
+
+/// A wildcard matches one left-most label: a node one label further down cannot claim its id with the certificate,
+/// so no session comes up either way.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_name_two_labels_under_the_wildcard_fails_the_handshake() {
+    let root = ca("root");
+    let svc_a = mtls("*.svc-a.example", &root, &[&root]);
+    let discovery = MemoryDiscovery::new();
+    let a1 = mtls_node("n1.svc-a.example", &discovery, svc_a.clone()).await;
+    assert_eq!(joins("n2.svc-a.example", &discovery, svc_a.clone(), &[&a1]).await, Some(true));
+    assert_eq!(joins("x.n3.svc-a.example", &discovery, svc_a, &[&a1]).await, Some(false));
+}

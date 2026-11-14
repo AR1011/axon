@@ -87,10 +87,11 @@ axon-cluster
       max_bytes_per_sec: what one session of the lane writes, pings and pongs apart, from a bucket of write_batch_bytes ; SessionStats::paced the time it waited
     axon_net::connect(addr, lane, tls, cfg) ; establish(io, Role::Initiator(lane) | Role::Responder, cfg) ; Peer::lane   the initiator names the lane in its hello, the responder echoes it
     trait Network { connect(to, lane) -> Dial, bind(at) } ; AcceptLimits { max_connections 3072, max_handshakes 64, max_handshakes_per_ip 16 }
-    axon_net::VERSIONS (7..=7) the wire versions this build speaks ; a session runs the highest both ends do, Peer::version, PeerStats::version ; ranges that do not meet: Negotiation::Version { ours, theirs }, handshake failure reason version ; from 1.0 a release speaks its own and the one before
+    axon_net::VERSIONS (8..=8) the wire versions this build speaks ; a session runs the highest both ends do, Peer::version, PeerStats::version ; ranges that do not meet: Negotiation::Version { ours, theirs }, handshake failure reason version ; from 1.0 a release speaks its own and the one before
   ClusterConfig::new(bind, transport, discovery)   .labels .tls .advertise .ownership .authorizer ; record.label(key) -> Option<&str> ; record.has_labels(&labels) every one, each value whole ; a label has one value: a node with two roles carries a label for each (runner=yes, control=yes)
   cluster.set_tls(Tls)?   new sessions and redials take the new certificates, sessions up keep theirs ; refused without TLS or when they would not pass as the node id
   cluster.set_authorizer(Option<Arc<dyn Authorizer>>)   each call, spawn and watch question that arrives after it is checked by the new one ; what was admitted finishes ; a stream the peer follows stops within its parent's StreamNodeConfig::downstream_expiry and a tick
+  Rules::new().allow(principal, Allow::call(prefix).spawn(kind).watch(kind).stream(namespace, [Access]))   an Authorizer for calls and, in axon-stream, streams ; principal(node_id) is the id after its first label, one wildcard certificate per deployable ; axon.* stays open unless the rule names axon. ; no rule, nothing else
   discovery: MemoryDiscovery::new() | StaticDiscovery::new(records)? | ConsulDiscovery::new(cfg)? (feature consul)
            | SeedDiscovery::start(SeedConfig::new(seeds, &transport) .timings).await?   seeds run SeedServer::bind(SeedServerConfig::new(addr, &transport) { tls, accept, timings }).await?
              SeedConfig::transport.connect_timeout   a seed dial's connect, 1 s from new ; across regions as the cluster's ; SeedDiscovery::start refuses a warm_up under it + 2 s
@@ -104,7 +105,10 @@ axon-cluster
              .warming() for a little over a lease after an acceptor starts, the first start too: a cluster started at once owns nothing until then ; in a rolling restart, restart the next acceptor after it
            trait OwnershipAuthority { acquire, renew, release, close, hold, attach(&Cluster) -> BoxFuture, describe, held_by(Holder::Node(id) | Holder::Lapsed, kinds), warming, can_grant } ; PaxosLeases refuses an acquire OwnershipError::Held(Some(node)), naming the holder ; it holds cluster.downgrade() -> WeakCluster, not a Cluster
   Cluster::start(&system, cfg).await?
-  trait WireProtocol { Message, Reply, ID, SCHEMA, encode, decode_reply, const LANE: Lane = Lane::Live } ; trait ActorProtocol { Mailbox, encode_reply, decode }
+  trait WireProtocol { Message, Reply, ID, SCHEMA, encode, decode_reply, const LANE: Lane = Lane::Live, const NAME: &str = "" } ; trait ActorProtocol { Mailbox, encode_reply, decode }
+    a call carries its ID and SCHEMA, and the serving node checks both: another contract's Rejected(ProtocolMismatch), retry() Resolve ; another schema's Rejected(SchemaMismatch)
+    feature serde: trait Contract { Message, Reply: Serialize + DeserializeOwned, Codec, ID, SCHEMA, LANE, NAME } is a WireProtocol and an ActorProtocol, Mailbox (Message, Option<Reply<Reply>>) ; trait Codec { encode(&T) -> Result<Bytes, String>, decode(&[u8]) } ; encode error CallError::Codec, a body the server cannot read Rejected(InvalidMessage)
+    protocol_label(id, name)   a protocol's label in telemetry and the console: its NAME, axon's name for one of its own (axon.control, axon.stream, axon.lease, axon.quota), else the ID as 16 hex digits
     LANE: the session its calls, replies, parts and uploads take ; calls to one peer on one lane arrive in order ; publish::<P> and kind::<P> refuse Lane::Control, axon's own (membership, heartbeats, leases, round trips) ; .also::<Q>() serves Q on Q::LANE
     a Live or Bulk session dials the boot Control reaches, once it does ; one that fails fails only its calls, NotSent(Closed), Retry::Later: the peer stays reachable and keeps its keys
   reply.send(r) on the Reply<P::Reply> a request carries   (Err only for the reply, Codec or NotSent(Oversized): the caller gets NoReply; nothing else to do) ; reply.is_abandoned() ; reply.time_left() -> Option<Duration>, None without a deadline
@@ -126,7 +130,7 @@ axon-cluster
   err.retry() -> Retry { Later, Resolve, IfIdempotent, Never }   on CallError and ClusterError
   raw endpoints, under the protocols: cluster.serve(name, protocol, schema, |peer, body, reply: Option<Reply>| -> Result<(), Rejection>)? -> id   on the session's read path, must not block ; cluster.unserve(id)
     cluster.endpoint(name, protocol, schema) .lane(lane) .serve(handler)? -> id   the lane callers send on ; Control only for names under axon. ; cluster.serve(..) is .lane(Live)
-    cluster.request(node, name, protocol, schema, body).await? -> Bytes   on the lane the endpoint's node names, bounded by request_timeout ; request_to(node, incarnation, ..) refuses another boot of node unsent, StaleNode ; cluster.max_frame(lane) the largest body on that lane
+    cluster.request(node, name, protocol, schema, body).await? -> Bytes   on the lane the endpoint's node names, bounded by request_timeout ; request_to(node, incarnation, ..) refuses another boot of node unsent, StaleNode ; cluster.max_frame(lane) the largest call body on that lane, the frame less the contract's 8 bytes
     cluster.start_request_to(node, incarnation, ..).await? -> PendingReply   once the session admits it (within request_timeout ; Busy without a max_pending slot), so the next can follow at once, sent in that order ; PendingReply.await -> Result<Bytes, ClusterError>, due request_timeout after admission ; one call, counted and traced, holding its slot until it ends or is dropped ; request_to is start_request_to(..).await?.await
     cluster.round_trip(node) -> Option<Duration>   the shortest of the last four keepalive round trips on the Control session to node ; a session pings as it comes up, so None only until its first answer
     cluster.serve_control(service, AccessPolicy::{Deny | Nodes(set) | Cluster}, |ControlRequest { peer, body, max_response }| async { Ok(bytes) })? ; cluster.control(node, service, body).await? -> Bytes   management traffic, ClusterConfig::max_control_handlers at once
@@ -214,7 +218,8 @@ axon-obs
    `tell` returning `Ok` says nothing about the far side.
 4. Integer literals need a suffix: `handle.tell(1u64)`, because `tell` takes `impl Into<M>`.
 5. A supervised actor restarts with fresh state and an empty mailbox. Nothing is replayed.
-6. Remote messages are bytes you encode yourself. Keep `ID` fixed per contract and bump `SCHEMA` on breaking changes.
+6. Remote messages are bytes: encode them yourself, or with the `serde` feature from a `Contract` and your `Codec`.
+   Keep `ID` fixed and unique per contract, and bump `SCHEMA` on breaking changes.
 7. A `RemoteRef` never retargets. `err.retry()` says what to do; on `Retry::Resolve`, resolve again (a `KeyedRef`
    or `NamedRef` does it for you on its next call).
 8. Without TLS you must set `transport.allow_plaintext = true`. Use that on loopback only.

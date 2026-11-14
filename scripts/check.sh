@@ -11,7 +11,8 @@
 #                             tests on SEEDS (0..4), then doc links. Pass `git diff --name-only main` (a box copy has no
 #                             git). The full check and sim run where lanes are merged
 #   scripts/check.sh live     the #[ignore]d ClickHouse and Consul tests           needs `docker compose up -d`
-#   scripts/check.sh smoke    a playground from scripts/ctl.sh passes doctor, then is stopped
+#   scripts/check.sh smoke    a playground from scripts/ctl.sh passes doctor, and with AXON_CONSUL `ops nodes --json`
+#                             (crates/axon-obs/examples/ops.rs) lists its nodes, then it is stopped
 #   scripts/check.sh loom     the loom models (mailbox, idle workers, reply state, session write order), release
 #   scripts/check.sh sim [test]  the World tests (tests/world*.rs) in the sim build (tokio seeded), profile sim
 #                             (release without LTO), under target/sim, in two processes whose digests must match;
@@ -261,6 +262,17 @@ smoke() {
     trap "scripts/ctl.sh -p $port down >/dev/null" EXIT
     step "doctor";   scripts/ctl.sh -p "$port" doctor || { scripts/ctl.sh -p "$port" logs; fail "doctor"; }
     step "overview"; scripts/ctl.sh -p "$port" api overview >target/check/overview.json
+    if [ -n "${AXON_CONSUL:-}" ]; then
+        step "ops nodes"
+        cargo run -q -p axon-obs --example ops -- nodes --json >target/check/ops.json || fail "ops nodes"
+        # Every node of this playground, and each answered: another run in the same Consul service does not count.
+        jq -e --slurpfile o target/check/overview.json \
+            'length > 0 and all(.[]; .error == null) and ($o[0].nodes | map(.node.id)) - map(.id) == []' \
+            target/check/ops.json >/dev/null ||
+            fail "ops nodes: $(cat target/check/ops.json)"
+    else
+        step "ops nodes: skipped, no AXON_CONSUL (docker compose up -d)"
+    fi
     printf '\nOK: smoke (body: target/check/overview.json)\n'
 }
 

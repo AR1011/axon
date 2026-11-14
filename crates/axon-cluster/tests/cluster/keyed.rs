@@ -654,7 +654,7 @@ async fn calls_to_a_supervised_keyed_actor_wait_out_its_restart() {
             assert_eq!(number(caller.request(Op::Get).await.unwrap()), 2);
         }
     }
-    assert_eq!(a.cluster.stats().engine.inbound_rejected, [0; 6], "nothing was turned away");
+    assert_eq!(a.cluster.stats().engine.inbound_rejected, [0; 7], "nothing was turned away");
 
     // A request whose deadline passes while it waits is dropped: the next generation never sees it.
     for (from, caller) in [("b", &remote), ("a", &local)] {

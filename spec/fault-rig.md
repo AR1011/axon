@@ -460,6 +460,61 @@ timer alone; the World's `starve` and `hold_actors` find it.
 each for timeline legality at T = 2 and 6); a role is an entry in `ROLES`; a trigger on a new log line needs only `t`
 and `r`. `EDGE`, `ROLE` and `LEDGER` are sets a class joins.
 
+## Three regions
+
+Status: designed, not built (wire v8). The proof run for a service with its acceptors in one region and peers in two
+others, the shape [wan.md §14](wan.md#14-near-links-wire-v8)'s near links,
+[paxos-leases.md §11](paxos-leases.md#11-leases-per-kind-wire-v8)'s unleased kinds,
+[seed-discovery.md §10](seed-discovery.md#10-starting-from-a-cached-view-wire-v8)'s cached view and
+[streams.md §2](streams.md#2-moving-an-origin)'s moving origin are for. Neither harness has that shape today:
+`world_wan.rs` and the rig's `geo` map put one acceptor in each region (`world_wan.rs:30-32`, `nemesis.py` `geo`), no
+test cuts a region of more than one node or for longer than 30 s, no WAN scenario cuts one way or steps a clock, and
+none bounds the time to fail over.
+
+**The World: `crates/axon-stream/tests/world_regions.rs`**, shaped like `world_wan.rs`, on 32 seeds, its timings §9's
+WAN values with near links inside region one (`//` reason on each).
+
+| Region | Nodes | Runs |
+|---|---|---|
+| one | `r1-a`, `r1-b`, `r1-c`, 1 to 2 ms apart | the seeds and acceptors at `T` = 4 s; a leased kind; a stream origin with a standby (`open_stream_after`) |
+| two | `r2-a`, `r2-b`, 92 ms from region one | unleased kinds; `Live` and `FollowAfter` followers of region one's stream; `view_store` |
+| three | `r3-a`, 219 ms from region one, 190 ms from two | the same as region two |
+
+Faults, one at a time, each followed by the checks below within its bound:
+
+- `r1-a`'s machine crashes while it holds leased keys and originates the stream;
+- region two is partitioned from the rest for 30 s, and for 300 s with `r2-b` restarted inside the cut;
+- region two is cut one way, to region one and then from it;
+- every acceptor restarts at once, then one at a time;
+- the wall clock steps ±5 s and ±59 s on a holder and on an acceptor, and a holder's clock drifts;
+- a holder pauses for `T` + 1 s;
+- 10 000 unleased keys start at once, each taking tells from all three regions.
+
+Checks: a leased key is served again within 5 s of its holder's death (`failover-bound`); no epoch runs on two nodes; a
+cut region keeps starting its unleased keys and serving its followers; `r2-b` serves from its cached view; no follower
+sees a gap, a repeat or a reset across the origin's move; every link is back within its bound once a cut heals; the
+link meters ([lanes.md §8.1](lanes.md#81-link-meters-wire-v8)) never go backwards. Before each item lands its checks
+fail, so the file lands first with each test `#[ignore = "<the spec section it waits for>"]`, and each item's change
+removes its own.
+
+**The rig: `GEO=regions`.** b1..b3 are region one, under 1 ms apart, with the acceptors and the seeds; b4 is region two
+and b5 region three, at the `geo` delays of [wan.md § 12](wan.md#12-the-rig-work-item-d3). `TIMING=wan GEO=regions
+scenarios` runs:
+
+| Scenario | Faults inside `geo` |
+|---|---|
+| `regions-zone` | `kill` of the holder of most keys on b1..b3 |
+| `regions-cut-30` | `partition` b4 from the rest for 30 s |
+| `regions-cut-300` | `partition` b4 for 300 s, with a restart of b4 at 150 s |
+| `regions-oneway` | `oneway` b4 → b1..b3 for 30 s, then the other way |
+| `regions-acceptors` | `acceptors-restart`, then `acceptors-rolling` |
+| `regions-pause` | `pause` of a holder for `T` + 1 s |
+| `regions-step` | `step` ±59 s on a holder (five boxes only) |
+
+A `sessions` workload runs 100 000 unleased keys beside the keyed workload. A new invariant, `failover-bound`: a leased key is
+served again within 5 s of its holder's last frame, with a plant in `check.py --selftest`. `nemesis.py selftest` checks
+each scenario's timeline at `T` = 2, 4 and 10.
+
 ## Open findings
 
 Each is axon's, not the rig's, and reproduces on one box with every workload

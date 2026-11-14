@@ -27,8 +27,8 @@ use crate::core::{
 };
 use crate::disk::{DiskConfig, DiskStore, RETAIN_EVERY, RETRY_WRITE};
 use crate::hub::{
-    Authorizer, DeliveryPolicy, NamespaceLimit, NamespaceLimits, PeerId, PublishError, StreamError, StreamEvent,
-    SubscribeOptions,
+    Access, Authorizer, DeliveryPolicy, NamespaceLimit, NamespaceLimits, PeerId, PublishError, StreamError,
+    StreamEvent, SubscribeOptions,
 };
 use crate::recovery::{Cursor, Payload, StreamKey};
 use crate::wire;
@@ -56,6 +56,14 @@ pub struct StreamDetail {
 }
 
 pub type SharedAuthorizer = Arc<dyn Authorizer + Send + Sync>;
+
+/// A peer by its principal's stream grants. This process, `local:<node>`, may do anything to its own hub; under
+/// `CertificateIdentity` no peer can claim such an id, as it is no DNS name.
+impl Authorizer for axon_cluster::Rules {
+    fn authorize(&self, peer: &PeerId, key: &StreamKey, access: Access) -> bool {
+        peer.node.starts_with("local:") || self.allows_stream(&peer.node, key.namespace(), access)
+    }
+}
 
 #[derive(Clone)]
 pub struct StreamNodeConfig {

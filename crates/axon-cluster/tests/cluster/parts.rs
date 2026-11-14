@@ -525,7 +525,9 @@ async fn a_short_credit_or_a_parts_request_without_its_window_closes_only_that_s
         ..axon_net::Frame::default()
     };
     let window = (4u32 << 20).to_be_bytes();
-    let asking = |id, body: &[u8]| frame(parts_request, id, &[&window[..], body].concat());
+    // A call's body starts with its contract's id.
+    let contract = 0xE0u64.to_be_bytes();
+    let asking = |id, body: &[u8]| frame(parts_request, id, &[&contract[..], &window[..], body].concat());
     async fn answer(raw: &mut axon_net::Session) -> Result<(u16, u64, Bytes), axon_net::Error> {
         let answer = tokio::time::timeout(Duration::from_secs(5), raw.receiver.recv()).await.expect("an answer");
         answer.map(|a| a.into_frame()).map(|f| (f.kind, f.id, f.payload))
@@ -546,7 +548,7 @@ async fn a_short_credit_or_a_parts_request_without_its_window_closes_only_that_s
 
     let mut raw =
         axon_net::connect(a.cluster.local_addr(), axon_net::Lane::Control, None, &transport("z")).await.unwrap();
-    raw.sender.submit(frame(parts_request, 1, &[0, 0, 1]), None).await.unwrap();
+    raw.sender.submit(frame(parts_request, 1, &[&contract[..], &[0, 0, 1]].concat()), None).await.unwrap();
     assert!(answer(&mut raw).await.is_err(), "a request in parts without its window closes the session");
 
     let echoed = b.cluster.request("a", "echo", 0xE0, 1, Bytes::from_static(b"still")).await.unwrap();

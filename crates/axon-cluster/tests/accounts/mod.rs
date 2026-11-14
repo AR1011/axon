@@ -193,19 +193,25 @@ async fn boot(
 ) -> Node {
     let transport = host.transport(SharedSecret::new(SECRET).unwrap());
     let system = ActorSystem::builder().runtime(host.runtime()).build().unwrap();
+    // A node outside `nodes` is a member that registers no kind and runs no seed, as an operator's tool is.
+    let tool = !nodes.contains(&host.name());
     let (mut cfg, seed) = match memory {
         Some(memory) => (ClusterConfig::new(host.addr(), transport, memory), None),
         None => {
             // Every node is also a seed, so discovery partitions and crashes with the nodes.
             let addr = SocketAddr::new(host.ip(), SEED_PORT);
-            let seed = SeedServer::bind(SeedServerConfig::new(addr, &transport)).await.unwrap();
+            let seed = if tool {
+                None
+            } else {
+                Some(Arc::new(SeedServer::bind(SeedServerConfig::new(addr, &transport)).await.unwrap()))
+            };
             let entries: Vec<_> = nodes.iter().map(|n| SocketAddr::new(host.ip_of(n), SEED_PORT).to_string()).collect();
             let discovery = SeedDiscovery::start(SeedConfig::new(entries, &transport)).await.unwrap();
             let mut cfg = ClusterConfig::new(host.addr(), transport, discovery);
             // With seeds, as guide/cluster.md § Seed servers asks.
             cfg.heartbeat_interval = Duration::from_millis(500);
             cfg.heartbeat_grace = Duration::from_secs(1);
-            (cfg, Some(Arc::new(seed)))
+            (cfg, seed)
         }
     };
     let mut paxos = PaxosConfig::new(nodes[..3].iter().copied());
@@ -234,6 +240,9 @@ async fn boot(
             })
             .await
             .unwrap();
+    }
+    if tool {
+        return Node { system, cluster, leases, seed };
     }
     let name = host.name().to_owned();
     cluster
@@ -296,6 +305,11 @@ fn world(
     (w, ledger)
 }
 
+/// Adds `name`, a member that registers no kind and serves no name, finding the others through their seeds.
+pub fn member(w: &mut World<Node>, name: &str) {
+    w.add(name, |host| boot(host, Ledger::default(), None, &[], &NODES, None));
+}
+
 /// Each of `n` nodes is up and lists all `n` with the kind.
 fn settled(w: &mut World<Node>, n: usize) {
     w.run_until("every member with the kind", Duration::from_secs(30), |w| {
@@ -349,8 +363,8 @@ pub fn send(w: &mut World<Node>, keys: &[(String, Option<u64>)], from: &str, id:
 }
 
 /// Deposits from `from`, one every 10 ms round the keys for `d`, each through a reference kept for its key, as a
-/// long-lived client's. Ends once every call has.
-pub fn stream(w: &mut World<Node>, from: &str, d: Duration, first_id: u64) -> Task<()> {
+/// long-lived client's. Ends once every call has, with how many failed.
+pub fn stream(w: &mut World<Node>, from: &str, d: Duration, first_id: u64) -> Task<u64> {
     w.spawn_on(from, move |n| async move {
         let refs: Vec<_> = keys()
             .iter()
@@ -363,15 +377,19 @@ pub fn stream(w: &mut World<Node>, from: &str, d: Duration, first_id: u64) -> Ta
             }
             let keyed = keyed.clone();
             calls.push(tokio::task::spawn_local(async move {
-                if let Ok(got) = keyed.request(id).await {
+                let got = keyed.request(id).await;
+                if let Ok(got) = got {
                     assert_eq!(got, id);
                 }
+                got.is_err()
             }));
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        let mut failed = 0;
         for call in calls {
-            call.await.unwrap();
+            failed += u64::from(call.await.unwrap());
         }
+        failed
     })
 }
 

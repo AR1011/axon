@@ -31,7 +31,7 @@ use crate::{
 const SERVICE: &str = "axon.lease";
 /// Which keys a node holds, asked of an acceptor.
 const HELD: &str = "axon.lease.held";
-const PROTOCOL: u64 = 0x4158_4f4e_4c45_4153;
+pub(crate) const PROTOCOL: u64 = 0x4158_4f4e_4c45_4153;
 const SWEEP_EVERY: Duration = Duration::from_secs(1);
 /// How long the log waits after a failed write before it tries again.
 const RETRY_WRITE: Duration = Duration::from_secs(1);

@@ -20,6 +20,7 @@ mod paxos;
 mod placement;
 mod quota;
 mod remote;
+mod rules;
 mod seed;
 mod spawn;
 mod wire;
@@ -43,13 +44,16 @@ pub use paxos::{PaxosConfig, PaxosLeases};
 pub use placement::{Placement, Strategy, rendezvous};
 pub use quota::{Denied, Permit, Permits, QuotaConfig, QuotaStats, Quotas, Rate};
 pub use remote::{KeyedRef, KeyedRefs, NamedRef, RemoteRef};
+pub use rules::{Allow, Grants, Rules, principal};
 pub use seed::{
     SeedConfig, SeedDiscovery, SeedLinkStats, SeedServer, SeedServerConfig, SeedServerStats, SeedStats, SeedTimings,
 };
 pub use spawn::{
     HELD_RETRY, Hosted, HostedKey, HostedKind, KEYED_ENDS, KEYED_STARTS, KeyWatch, KindBuilder, Owner, SpawnContext,
 };
-pub use wire::{ActorProtocol, Unaddressed, WireProtocol};
+pub use wire::{ActorProtocol, Unaddressed, WireProtocol, protocol_label};
+#[cfg(feature = "serde")]
+pub use wire::{Codec, Contract};
 
 /// What the simulations share.
 #[cfg(test)]

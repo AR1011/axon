@@ -3,10 +3,11 @@
 //! A call is one frame; the frame header carries everything but the body:
 //! `kind` = how much the caller wants back, `protocol` = destination endpoint id,
 //! `schema` = the contract's schema, `id` = correlation id. The answer is one `REPLY` or `END` frame, or parts (below).
+//! The body starts with the contract's `ID`, `u64`: the serving node compares it and the schema with the endpoint's.
 //! A tell has none, but for one to an endpoint that is gone: an `END` that names the endpoint, as dynamic ids are never
 //! reused.
-//! The body starts with the caller's trace context if `kind` has `TRACED`, then with its deadline if `DEADLINE`, then
-//! with its window if `PARTS`.
+//! After the id comes the caller's trace context if `kind` has `TRACED`, then its deadline if `DEADLINE`, then its window
+//! if `PARTS`. A body too short for its id or its trace context is refused `InvalidMessage`.
 //!
 //! A request with `PARTS` is answered in parts: `PART` frames, each carrying the caller's call id, and then `END`,
 //! `ADMITTED` once the handler's stream ended, `NO_REPLY` where it was cut, a rejection where it never started. Never
@@ -24,6 +25,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use axon::{Lane, TraceContext};
+use axon_net::Prefix;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::engine::Reply;
@@ -68,18 +70,93 @@ pub(crate) const FIRST_DYNAMIC: u64 = 16;
 pub(crate) const SYSTEM_SCHEMA: u16 = 1;
 pub(crate) const CONTROL_PROTOCOL: u64 = 0x4158_4f4e_4354_524c;
 
-/// A remote contract, shared by both sides. `ID` and `SCHEMA` are checked when a reference is
-/// made, `SCHEMA` again on every call. `LANE` is the connection the protocol's calls take to a peer, the serving
-/// node's choice: calls on one lane keep their order, calls on two may pass each other. `Control` is axon's own.
+/// A remote contract, shared by both sides. `ID` and `SCHEMA` are checked when a reference is made, and again by the
+/// serving node on every call, which refuses another contract's `Rejected(ProtocolMismatch)` and another schema's
+/// `Rejected(SchemaMismatch)`. `LANE` is the connection the protocol's calls take to a peer, the serving node's choice:
+/// calls on one lane keep their order, calls on two may pass each other. `Control` is axon's own. `NAME` labels the
+/// protocol in telemetry and the console ([`protocol_label`]).
 pub trait WireProtocol: 'static {
     type Message;
     type Reply;
     const ID: u64;
     const SCHEMA: u16;
     const LANE: Lane = Lane::Live;
+    const NAME: &'static str = "";
 
     fn encode(message: Self::Message) -> Result<Bytes, CallError>;
     fn decode_reply(body: Bytes) -> Result<Self::Reply, CallError>;
+}
+
+/// axon's own protocols, by `ID`. The control services, telemetry among them, and the system endpoints are
+/// `axon.control`.
+const AXON_PROTOCOLS: [(u64, &str); 4] = [
+    (CONTROL_PROTOCOL, "axon.control"),
+    (0x4158_4f4e_5354_524d, "axon.stream"), // axon-stream's, held to it by its test
+    (crate::paxos::PROTOCOL, "axon.lease"),
+    (crate::quota::wire::PROTOCOL, "axon.quota"),
+];
+
+/// A protocol's label: its `NAME`, else axon's name for one of its own, else its `ID` as 16 hex digits.
+pub fn protocol_label(id: u64, name: &str) -> std::borrow::Cow<'_, str> {
+    if !name.is_empty() {
+        return name.into();
+    }
+    match AXON_PROTOCOLS.iter().find(|(own, _)| *own == id) {
+        Some((_, own)) => (*own).into(),
+        None => format!("{id:016x}").into(),
+    }
+}
+
+/// How a [`Contract`]'s values become bytes and back. axon names none: an application brings its own.
+#[cfg(feature = "serde")]
+pub trait Codec: 'static {
+    fn encode<T: serde::Serialize>(value: &T) -> Result<Bytes, String>;
+    fn decode<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, String>;
+}
+
+/// A contract from serde types and a [`Codec`]: it is a [`WireProtocol`] and an [`ActorProtocol`] whose mailbox is
+/// `(Message, Option<Reply<Reply>>)`, the reply present for a request. A codec error on encode is
+/// `CallError::Codec`; a body the serving node's codec cannot read is refused `Rejected(InvalidMessage)`.
+#[cfg(feature = "serde")]
+pub trait Contract: 'static {
+    type Message: serde::Serialize + serde::de::DeserializeOwned + Send + 'static;
+    type Reply: serde::Serialize + serde::de::DeserializeOwned + Send + 'static;
+    type Codec: Codec;
+    const ID: u64;
+    const SCHEMA: u16;
+    const LANE: Lane = Lane::Live;
+    const NAME: &'static str = "";
+}
+
+#[cfg(feature = "serde")]
+impl<C: Contract> WireProtocol for C {
+    type Message = C::Message;
+    type Reply = C::Reply;
+    const ID: u64 = C::ID;
+    const SCHEMA: u16 = C::SCHEMA;
+    const LANE: Lane = C::LANE;
+    const NAME: &'static str = C::NAME;
+
+    fn encode(message: C::Message) -> Result<Bytes, CallError> {
+        C::Codec::encode(&message).map_err(CallError::Codec)
+    }
+
+    fn decode_reply(body: Bytes) -> Result<C::Reply, CallError> {
+        C::Codec::decode(&body).map_err(CallError::Codec)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<C: Contract> ActorProtocol for C {
+    type Mailbox = (C::Message, Option<Reply<C::Reply>>);
+
+    fn encode_reply(reply: C::Reply) -> Result<Bytes, CallError> {
+        C::Codec::encode(&reply).map_err(CallError::Codec)
+    }
+
+    fn decode(body: Bytes, reply: Option<Reply<C::Reply>>) -> Result<Self::Mailbox, Rejection> {
+        C::Codec::decode(&body).map(|message| (message, reply)).map_err(|_| Rejection::InvalidMessage)
+    }
 }
 
 /// Existence only: `get_or_spawn::<Unaddressed>` starts or finds a keyed actor of any kind without naming its
@@ -113,33 +190,36 @@ pub trait ActorProtocol: WireProtocol {
     fn decode(body: Bytes, reply: Option<Reply<Self::Reply>>) -> Result<Self::Mailbox, Rejection>;
 }
 
-/// The call's kind and body, with the trace context, the deadline and the window in front when there are any.
+/// The bytes a call's body carries in front of the contract's: its `ID`.
+pub(crate) const CONTRACT_LEN: usize = 8;
+
+// What `stamp` puts in front of a body fits a frame's prefix.
+const _: () = assert!(CONTRACT_LEN + TraceContext::WIRE_LEN + 8 + 4 <= axon_net::PREFIX_MAX);
+
+/// The call's kind and what goes in front of its body: the contract's id, then the trace context, the deadline and the
+/// window when there are any. The frame sends it as its prefix, so the body is not copied.
 pub(crate) fn stamp(
     kind: u16,
+    protocol: u64,
     trace: Option<TraceContext>,
     left: Option<Duration>,
     window: Option<u32>,
-    body: Bytes,
-) -> (u16, Bytes) {
-    if trace.is_none() && left.is_none() && window.is_none() {
-        return (kind, body);
-    }
-    let mut out = BytesMut::with_capacity(TraceContext::WIRE_LEN + 8 + 4 + body.len());
-    let mut kind = kind;
+) -> (u16, Prefix) {
+    let (mut kind, mut prefix) = (kind, Prefix::default());
+    prefix.put(&protocol.to_be_bytes());
     if let Some(trace) = trace {
         kind |= TRACED;
-        out.put_slice(&trace.to_bytes());
+        prefix.put(&trace.to_bytes());
     }
     if let Some(left) = left {
         kind |= DEADLINE;
-        out.put_u64(left.as_micros() as u64);
+        prefix.put(&(left.as_micros() as u64).to_be_bytes());
     }
     if let Some(window) = window {
         kind |= PARTS;
-        out.put_u32(window);
+        prefix.put(&window.to_be_bytes());
     }
-    out.put_slice(&body);
-    (kind, out.freeze())
+    (kind, prefix)
 }
 
 pub(crate) fn take(body: &mut Bytes, n: usize) -> Option<Bytes> {
@@ -182,23 +262,53 @@ mod tests {
     /// guards: a node that does not know a bit of `kind` closes the session, so a new bit is a breaking change.
     #[test]
     fn call_frame_bytes_are_pinned() {
+        const ID: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 0xc0];
+        let with_id = |rest: &[u8]| [&ID[..], rest].concat();
         let trace = TraceContext::from_bytes([0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 9]);
-        let body = Bytes::from_static(b"hi");
-        let (kind, both) = stamp(REQUEST, trace, Some(Duration::from_micros(1500)), None, body.clone());
-        let mut pinned = vec![0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 9];
+        // The frame sends the prefix as the body's first bytes.
+        let stamp = |kind, trace, left, window| {
+            let (kind, prefix): (u16, Prefix) = stamp(kind, 0xc0, trace, left, window);
+            (kind, [prefix.as_slice(), &b"hi"[..]].concat())
+        };
+        let (kind, both) = stamp(REQUEST, trace, Some(Duration::from_micros(1500)), None);
+        let mut pinned = with_id(&[0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 9]);
         pinned.extend([0, 0, 0, 0, 0, 0, 0x05, 0xdc, b'h', b'i']);
         assert_eq!((kind, &both[..]), (0xc003, &pinned[..]));
-        let (kind, left) = stamp(REQUEST, None, Some(Duration::from_millis(2)), None, body.clone());
-        assert_eq!((kind, &left[..]), (0x4003, &[0, 0, 0, 0, 0, 0, 0x07, 0xd0, b'h', b'i'][..]));
-        assert_eq!(stamp(SEND, None, None, None, body.clone()), (SEND, body.clone()));
-        let (kind, window) = stamp(REQUEST, None, None, Some(4 << 20), body.clone());
-        assert_eq!((kind, &window[..]), (0x2003, &[0, 0x40, 0, 0, b'h', b'i'][..]));
-        let (kind, all) = stamp(REQUEST, trace, Some(Duration::from_micros(1500)), Some(4 << 20), body);
-        pinned.splice(24..24, [0, 0x40, 0, 0]);
+        let (kind, left) = stamp(REQUEST, None, Some(Duration::from_millis(2)), None);
+        assert_eq!((kind, &left[..]), (0x4003, &with_id(&[0, 0, 0, 0, 0, 0, 0x07, 0xd0, b'h', b'i'])[..]));
+        let (kind, plain) = stamp(SEND, None, None, None);
+        assert_eq!((kind, &plain[..]), (SEND, &with_id(b"hi")[..]));
+        let (kind, window) = stamp(REQUEST, None, None, Some(4 << 20));
+        assert_eq!((kind, &window[..]), (0x2003, &with_id(&[0, 0x40, 0, 0, b'h', b'i'])[..]));
+        let (kind, all) = stamp(REQUEST, trace, Some(Duration::from_micros(1500)), Some(4 << 20));
+        pinned.splice(32..32, [0, 0x40, 0, 0]);
         assert_eq!((kind, &all[..]), (0xe003, &pinned[..]));
         assert_eq!((PART, CREDIT), (6, 7));
-        let (kind, upload) = stamp(REQUEST | BODY, None, None, Some(4 << 20), Bytes::from_static(b"hi"));
-        assert_eq!((kind, &upload[..]), (0x3003, &[0, 0x40, 0, 0, b'h', b'i'][..]));
+        let (kind, upload) = stamp(REQUEST | BODY, None, None, Some(4 << 20));
+        assert_eq!((kind, &upload[..]), (0x3003, &with_id(&[0, 0x40, 0, 0, b'h', b'i'])[..]));
         assert_eq!([PART, END, CREDIT].map(|kind| kind | BODY), [0x1006, 0x1005, 0x1007]);
+    }
+
+    #[test]
+    fn a_protocol_is_labelled_by_its_name_or_else_its_hex_id() {
+        struct Named;
+        impl WireProtocol for Named {
+            type Message = ();
+            type Reply = ();
+            const ID: u64 = 0xC0;
+            const SCHEMA: u16 = 1;
+            const NAME: &'static str = "counter";
+            fn encode((): ()) -> Result<Bytes, CallError> {
+                Ok(Bytes::new())
+            }
+            fn decode_reply(_: Bytes) -> Result<(), CallError> {
+                Ok(())
+            }
+        }
+        assert_eq!(protocol_label(Named::ID, Named::NAME), "counter");
+        assert_eq!(protocol_label(0xC0, Unaddressed::NAME), "00000000000000c0");
+        let own = [CONTROL_PROTOCOL, 0x4158_4f4e_5354_524d, crate::paxos::PROTOCOL, crate::quota::wire::PROTOCOL];
+        let own = own.map(|id| protocol_label(id, "").into_owned());
+        assert_eq!(own, ["axon.control", "axon.stream", "axon.lease", "axon.quota"]);
     }
 }

@@ -589,6 +589,7 @@ fn every_error_says_whether_to_retry_resolve_or_stop() {
         (CallError::Rejected(Rejection::Full), Later),
         (CallError::Rejected(Rejection::UnknownActor), Resolve),
         (CallError::Rejected(Rejection::Stopped), Resolve),
+        (CallError::Rejected(Rejection::ProtocolMismatch), Resolve),
         (CallError::StaleNode, Resolve),
         (CallError::NoRoute, Resolve),
         (CallError::Unreachable(io()), Resolve),
@@ -659,4 +660,157 @@ async fn a_request_its_caller_gave_up_on_is_counted_in_an_outcome() {
     for n in [b, a] {
         n.system.shutdown().await.unwrap();
     }
+}
+
+/// A call carries its contract's `ID` and the serving node compares it with the endpoint's, so a call whose target was
+/// made wrong is refused before its body reaches another contract's `decode`. Here the raw API's id 0, which takes
+/// any endpoint of a name, stands in for a target made by hand.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_call_for_one_contract_at_another_contracts_endpoint_is_refused_protocol_mismatch() {
+    let discovery = MemoryDiscovery::new();
+    let (a, b) = (node("a", &discovery).await, node("b", &discovery).await);
+    sees(&b, 2).await;
+    let _counter = publish_counter(&a, 5, "counter");
+    let get = CounterApi::encode(Op::Get).unwrap();
+    for from in [&b, &a] {
+        let refused = from.cluster.request("a", "counter", 0, CounterApi::SCHEMA, get.clone()).await;
+        let mismatch = matches!(refused, Err(ClusterError::Call(CallError::Rejected(Rejection::ProtocolMismatch))));
+        assert!(mismatch, "from {}: {refused:?}", from.cluster.identity().node_id);
+    }
+    let refusals = a.cluster.stats().engine.inbound_rejected;
+    let at = REJECTION_NAMES.iter().position(|name| *name == "protocol_mismatch").unwrap();
+    assert_eq!((refusals[at], refusals.iter().sum::<u64>()), (1, 1), "b's call, counted where it came in");
+    let right = b.cluster.request("a", "counter", CounterApi::ID, CounterApi::SCHEMA, get).await.unwrap();
+    assert_eq!(number(right), 5);
+    for n in [b, a] {
+        n.system.shutdown().await.unwrap();
+    }
+}
+
+#[cfg(feature = "serde")]
+struct Json;
+
+#[cfg(feature = "serde")]
+impl Codec for Json {
+    fn encode<T: serde::Serialize>(value: &T) -> Result<Bytes, String> {
+        serde_json::to_vec(value).map(Bytes::from).map_err(|e| e.to_string())
+    }
+
+    fn decode<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, String> {
+        serde_json::from_slice(body).map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(feature = "serde")]
+#[derive(serde::Serialize, serde::Deserialize)]
+enum Tally {
+    Add(u64),
+    Total,
+    /// Fails to encode.
+    #[serde(skip_serializing)]
+    Unsent,
+}
+
+#[cfg(feature = "serde")]
+struct TallyApi;
+
+#[cfg(feature = "serde")]
+impl Contract for TallyApi {
+    type Message = Tally;
+    type Reply = u64;
+    type Codec = Json;
+    const ID: u64 = 0x7A;
+    const SCHEMA: u16 = 2;
+    const NAME: &'static str = "tally";
+}
+
+#[cfg(feature = "serde")]
+struct Tallies(u64);
+
+#[cfg(feature = "serde")]
+impl Actor for Tallies {
+    type Message = (Tally, Option<Reply<u64>>);
+    type Error = ();
+
+    fn on_message(&mut self, (tally, reply): Self::Message, _: &mut Context<'_, Self>) -> Result<(), ()> {
+        match tally {
+            Tally::Add(n) => self.0 += n,
+            Tally::Total => drop(reply.map(|r| r.send(self.0))),
+            Tally::Unsent => {}
+        }
+        Ok(())
+    }
+}
+
+/// A contract from serde types and a codec is a protocol of both ends, with no encode or decode written by hand.
+#[cfg(feature = "serde")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_contract_from_serde_types_round_trips_tell_send_and_request() {
+    let discovery = MemoryDiscovery::new();
+    let (a, b) = (node("a", &discovery).await, node("b", &discovery).await);
+    sees(&b, 2).await;
+    a.cluster.publish::<TallyApi>(&a.system.spawn(Tallies(0)).start().unwrap(), "tally").unwrap();
+    let tally = b.cluster.resolve::<TallyApi>("tally").await.unwrap();
+    tally.tell(Tally::Add(2)).await.unwrap();
+    tally.send(Tally::Add(3)).await.unwrap();
+    assert_eq!(tally.request(Tally::Total).await.unwrap(), 5);
+    for n in [b, a] {
+        n.system.shutdown().await.unwrap();
+    }
+}
+
+/// A codec error is the caller's `Codec` on its own side, and a body the serving node's codec cannot read is refused
+/// `InvalidMessage` there.
+#[cfg(feature = "serde")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_body_its_codec_cannot_read_is_rejected_invalid_message_and_a_bad_reply_is_a_codec_error() {
+    let discovery = MemoryDiscovery::new();
+    let (a, b) = (node("a", &discovery).await, node("b", &discovery).await);
+    sees(&b, 2).await;
+    a.cluster.publish::<TallyApi>(&a.system.spawn(Tallies(0)).start().unwrap(), "tally").unwrap();
+    let (id, schema) = (<TallyApi as Contract>::ID, <TallyApi as Contract>::SCHEMA);
+    let unread = b.cluster.request("a", "tally", id, schema, Bytes::from_static(b"{not")).await;
+    assert!(matches!(unread, Err(ClusterError::Call(CallError::Rejected(Rejection::InvalidMessage)))), "{unread:?}");
+    let tally = b.cluster.resolve::<TallyApi>("tally").await.unwrap();
+    assert!(matches!(tally.tell(Tally::Unsent).await, Err(CallError::Codec(_))), "an encode error is not sent");
+
+    // An endpoint of the same contract whose answer the caller's codec cannot read.
+    let odd = |_: &axon_net::Identity, _: Bytes, reply: Option<Reply>| {
+        drop(reply.map(|r| r.send(Bytes::from_static(b"{"))));
+        Ok(())
+    };
+    a.cluster.serve("odd", id, schema, odd).unwrap();
+    let odd = b.cluster.resolve::<TallyApi>("odd").await.unwrap();
+    assert!(matches!(odd.request(Tally::Total).await, Err(CallError::Codec(_))));
+    assert_eq!(tally.request(Tally::Total).await.unwrap(), 0, "nothing reached the actor");
+    for n in [b, a] {
+        n.system.shutdown().await.unwrap();
+    }
+}
+
+/// `Rules` judge each peer by its principal. The cluster's own `axon.*` endpoints (here `axon.spawn`) stay open to a
+/// member whose rule does not name `axon.`; once its rule names one, only what it names is let through.
+#[tokio::test(flavor = "multi_thread")]
+async fn rules_let_every_member_call_axon_endpoints_unless_a_rule_names_them() {
+    let discovery = MemoryDiscovery::new();
+    let (a, b) = (node("a", &discovery).await, node("b", &discovery).await);
+    counter_kind(&a).await;
+    publish_counter(&a, 3, "open");
+    let open = b.cluster.resolve_on::<CounterApi>("a", "open").await.unwrap();
+    let forbidden = |e: &CallError| matches!(e, CallError::Rejected(Rejection::Forbidden));
+    let b_may = || Allow::spawn("counter").call("open");
+
+    a.cluster.set_authorizer(Some(Arc::new(Rules::new().allow("b", b_may()))));
+    assert_eq!(number(open.request(Op::Get).await.unwrap()), 3);
+    let spawned = b.cluster.spawn_on::<CounterApi>("a", "counter", seed(0)).await;
+    assert!(spawned.is_ok(), "{spawned:?}");
+
+    a.cluster.set_authorizer(Some(Arc::new(Rules::new().allow("b", b_may().call("axon.watch")))));
+    assert_eq!(number(open.request(Op::Get).await.unwrap()), 3);
+    let spawned = b.cluster.spawn_on::<CounterApi>("a", "counter", seed(0)).await;
+    assert!(matches!(spawned, Err(ClusterError::Call(ref e)) if forbidden(e)), "{spawned:?}");
+
+    // A principal with no rule calls only axon.* endpoints.
+    a.cluster.set_authorizer(Some(Arc::new(Rules::new())));
+    assert!(open.request(Op::Get).await.is_err_and(|e| forbidden(&e)));
 }

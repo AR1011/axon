@@ -402,7 +402,8 @@ impl Inner {
             (OWNS, "axon.owns", owns),
         ];
         for (id, name, admit) in system {
-            let entry = Entry { name: name.into(), protocol: 0, schema: SYSTEM_SCHEMA, lane: Lane::Control, admit };
+            let (protocol, schema, lane) = (CONTROL_PROTOCOL, SYSTEM_SCHEMA, Lane::Control);
+            let entry = Entry { name: name.into(), protocol, schema, lane, admit };
             self.engine.register(Some(id), false, entry)?;
         }
         Ok(())
@@ -2055,8 +2056,8 @@ impl Watcher {
                 body.put_u32(hold.as_millis().try_into().unwrap_or(u32::MAX));
                 put_str(&mut body, &slot.0);
                 put_str(&mut body, &slot.1);
-                let (endpoint, schema, lane) = (WATCH, SYSTEM_SCHEMA, Lane::Control);
-                let target = Target { node: node.clone(), incarnation, endpoint, schema, lane };
+                let (endpoint, protocol, schema, lane) = (WATCH, CONTROL_PROTOCOL, SYSTEM_SCHEMA, Lane::Control);
+                let target = Target { node: node.clone(), incarnation, endpoint, protocol, schema, lane };
                 let mut answer = inner.engine.call(&target, REQUEST, body.freeze()).await?.ok_or(CallError::NoReply)?;
                 if answer.len() != 16 {
                     return Err(CallError::Codec("malformed watch reply".into()));
@@ -2148,7 +2149,7 @@ mod tests {
         let placement = Placement { required: labels(&[("z", "a")]), ..Default::default() };
         let (key, passed, args) = (Some("7".into()), vec!["p".into()], Bytes::from_static(b"x"));
         let request = SpawnRequest { kind: "k".into(), key, placement, passed, args };
-        assert_eq!(axon_net::VERSIONS, 7..=7, "the wire version moved: re-pin the bytes below");
+        assert_eq!(axon_net::VERSIONS, 8..=8, "the wire version moved: re-pin the bytes below");
         assert_eq!(
             &request.encode()[..],
             [1, 0, 1, b'k', 0, 1, b'7', 0, 1, 0, 1, b'z', 0, 1, b'a', 0, 0, 0, 1, 0, 1, b'p', b'x']

@@ -125,8 +125,11 @@ async fn a_call_with_a_short_or_zero_trace_context_is_refused_unrun() {
         axon_net::connect(a.cluster.local_addr(), axon_net::Lane::Control, None, &transport("z")).await.unwrap();
     // REQUEST with TRACED, from the call frame's pinned bytes; the answer is END with the rejection's code.
     let (traced_request, end) = (0x8003, 5);
-    let zero = [&[0; 16][..], b"hi"].concat();
-    for (id, body) in [(1, vec![7; 10]), (2, zero)] {
+    // A call's body starts with its contract's id, so the trace context comes after it.
+    let contract = 0xE2u64.to_be_bytes();
+    let short = [&contract[..], &[7; 10][..]].concat();
+    let zero = [&contract[..], &[0; 16][..], b"hi"].concat();
+    for (id, body) in [(1, short), (2, zero)] {
         let frame = axon_net::Frame {
             kind: traced_request,
             schema: 1,

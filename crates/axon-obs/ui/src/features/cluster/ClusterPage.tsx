@@ -38,6 +38,7 @@ const REFUSALS: Record<string, string> = {
   forbidden: "The authorizer refused the call.",
   invalid_message: "The node could not decode the bytes.",
   stopped: "The actor stopped. This is normal when keys move.",
+  protocol_mismatch: "The call names a different protocol than the endpoint serves.",
 };
 const q = (pick: (s: NonNullable<C["quotas"]>) => number) => (c: C) => (c.quotas ? pick(c.quotas) : undefined);
 const DEFS: Record<Sub, [string, Def[]][]> = {

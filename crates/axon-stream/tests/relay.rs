@@ -498,11 +498,12 @@ async fn start_refuses_a_namespace_on_control_and_a_push_larger_than_its_lanes_f
     let frame = "max_push_bytes exceeds the max_frame of a lane in use";
     let refused = start(256 << 10, "md", Lane::Control).await.err();
     assert!(matches!(refused, Some(ClusterError::Config("a namespace's pushes go on Live or Bulk"))), "{refused:?}");
-    let refused = start((512 << 10) + 1, "md", Lane::Live).await.err();
+    // A push is a call body: the frame less the 8-byte contract id in front of it.
+    let refused = start((512 << 10) - 8 + 1, "md", Lane::Live).await.err();
     assert!(matches!(refused, Some(ClusterError::Config(e)) if e == frame), "Live: {refused:?}");
     let refused = start(300 << 10, "bulk", Lane::Bulk).await.err();
     assert!(matches!(refused, Some(ClusterError::Config(e)) if e == frame), "Bulk: {refused:?}");
-    let node = start(256 << 10, "bulk", Lane::Bulk).await.expect("pushes that fit Live and Bulk");
+    let node = start((256 << 10) - 8, "bulk", Lane::Bulk).await.expect("pushes that fit Live and Bulk");
     drop((node, cluster));
     system.shutdown().await.unwrap();
 }
