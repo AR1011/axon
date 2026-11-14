@@ -31,7 +31,7 @@ async fn boot(
     host: Host,
     discovery: MemoryDiscovery,
     compression: Compression,
-    set: fn(&mut StreamNodeConfig),
+    set: impl Fn(&mut StreamNodeConfig),
 ) -> Node {
     let role = match host.name() {
         "origin" => "origin",
@@ -74,13 +74,13 @@ fn world_with(
     cfg: WorldConfig,
     names: &[&str],
     compression: Compression,
-    set: fn(&mut StreamNodeConfig),
+    set: impl Fn(&mut StreamNodeConfig) + Clone + 'static,
 ) -> (World<Node>, MemoryDiscovery) {
     let discovery = MemoryDiscovery::new();
     let mut w = World::new(cfg);
     for name in names {
-        let discovery = discovery.clone();
-        w.add(name, move |host| boot(host, discovery.clone(), compression, set));
+        let (discovery, set) = (discovery.clone(), set.clone());
+        w.add(name, move |host| boot(host, discovery.clone(), compression, set.clone()));
     }
     w.run_until("every node booted", Duration::from_secs(30), |w| w.nodes().count() == names.len());
     (w, discovery)
@@ -1050,4 +1050,93 @@ fn slow_link(seed: u64) {
 #[test]
 fn a_live_follower_behind_a_link_slower_than_the_origin_is_reset_and_never_skips() {
     check_seeds(seeds(0..16), slow_link).unwrap();
+}
+
+/// The application's own log of the key's generation 1: record `s` is `s`'s bytes, as `publish` writes them. Without a
+/// delay it answers at once; with one, each read answers `Pending` for that long of the World's time, then wakes the
+/// node through `wake`.
+struct Log {
+    delay: Option<Duration>,
+    wake: Arc<tokio::sync::Notify>,
+    /// Each start asked, and whether its read is in.
+    reads: Arc<std::sync::Mutex<BTreeMap<u64, bool>>>,
+}
+
+impl RecoverySource for Log {
+    fn available_range(&self, _: &StreamKey) -> Result<ReplayRange, RecoveryError> {
+        Ok(ReplayRange { generation: 1, first: 1, last: u64::MAX - 1 })
+    }
+
+    fn read_after(
+        &self,
+        _: &StreamKey,
+        after: Cursor,
+        through: u64,
+        bounds: ReadBounds,
+    ) -> Result<Vec<SequencedBatch>, RecoveryError> {
+        if let Some(delay) = self.delay {
+            let mut reads = self.reads.lock().unwrap();
+            match reads.get(&after.sequence) {
+                Some(true) => drop(reads.remove(&after.sequence)),
+                Some(false) => return Err(RecoveryError::Pending),
+                None => {
+                    reads.insert(after.sequence, false);
+                    let (reads, wake, at) = (self.reads.clone(), self.wake.clone(), after.sequence);
+                    drop(tokio::spawn(async move {
+                        tokio::time::sleep(delay).await;
+                        reads.lock().unwrap().insert(at, true);
+                        wake.notify_one();
+                    }));
+                    return Err(RecoveryError::Pending);
+                }
+            }
+        }
+        let last = through.min(after.sequence + bounds.max_records.min(bounds.max_bytes / 8) as u64);
+        let records: Vec<Bytes> =
+            (after.sequence + 1..=last).map(|s| Bytes::copy_from_slice(&s.to_be_bytes())).collect();
+        if records.is_empty() {
+            return Err(RecoveryError::LimitExceeded);
+        }
+        Ok(vec![SequencedBatch::new(1, after.sequence + 1, records)?])
+    }
+}
+
+/// Every ring holds 4 records; the origin's history is the application's log. A leaf that comes back 1000 records
+/// behind replays from the log, through its relay or from the origin, while the origin publishes on, then goes on
+/// live. Seeded: the log answers at once or `Pending` for up to 500 ms; a relay crashes during the replay.
+fn behind_every_ring(seed: u64) {
+    let delay = (!seed.is_multiple_of(3)).then(|| Duration::from_millis(seed * 37 % 500));
+    let wake = Arc::new(tokio::sync::Notify::new());
+    let woken = wake.clone();
+    let set = move |cfg: &mut StreamNodeConfig| {
+        cfg.core.rings = vec![RingLimits { namespace: key().namespace().into(), max_records: 4, max_bytes: 1 << 20 }];
+        if cfg.upstream.is_empty() {
+            let log = Log { delay, wake: woken.clone(), reads: Arc::default() };
+            cfg.history.insert(key().namespace().into(), Arc::new(log));
+        }
+    };
+    let cfg = WorldConfig { seed, ..WorldConfig::default() };
+    let (mut w, _) = world_with(cfg, &["origin", "relay-a", "relay-b", "leaf"], Compression::None, set);
+    drop(w.spawn_on("origin", move |n| async move {
+        loop {
+            wake.notified().await;
+            n.stream.history_ready(&key());
+        }
+    }));
+    publish(&mut w, 1..=1200);
+    let read = collect(&mut w, "leaf", key(), StartPosition::After(Cursor { generation: 1, sequence: 200 }));
+    let wait = Duration::from_millis(w.pick(0..300));
+    w.run_for(wait);
+    if seed % 2 == 1 {
+        let relay = if w.pick(0..2) == 0 { "relay-a" } else { "relay-b" };
+        crash(&mut w, relay);
+    }
+    publish(&mut w, 1201..=1300);
+    read_through(&mut w, seed, &["leaf"], &[read], 1300);
+    println!("world digest behind_every_ring seed {seed}: {:016x}", w.digest());
+}
+
+#[test]
+fn a_subscriber_behind_every_ring_replays_from_the_origins_history_then_goes_live() {
+    check_seeds(seeds(0..64), behind_every_ring).unwrap();
 }

@@ -1,6 +1,6 @@
 # Design — stream continuity
 
-Status: designed, not built. Three gaps in what a stream promises a subscriber that holds a cursor: replay stops at
+Status: §3 and §1 built; §2 designed, not built. Three gaps in what a stream promises a subscriber that holds a cursor: replay stops at
 the in-memory ring (§1), a moved origin starts a new generation and ends every cursor (§2), and a `Live` follower has
 no position of its own, so a relay that forgets its position moves the follower past records or back over them (§3).
 The order to build them is §3, §1, §2: §3 guards the others, and §2 rests on both. All ship in wire v8
@@ -29,7 +29,8 @@ supplies", but no `StreamNodeConfig` field reaches it. Disk history serves only 
 - `StreamNodeConfig::history(namespace, Arc<dyn RecoverySource>)`. It is read only for keys this node originates
   (`originated`, `core.rs:667`). Relays keep their rings and pass a start behind them on as today.
 - For such a key the core gives the hub a `History` source: the ring when it holds `after + 1`, otherwise the
-  namespace's source for the whole span up to the cut. The two never meet inside one replay. The contract on the
+  namespace's source for the whole span up to the cut. The two never meet inside one read: a replay that started on
+  the source moves to the ring once the ring holds its next record. The contract on the
   application: the source holds every record the stream published, at the same position, with the same bytes. An
   application that writes its log before it publishes meets it.
 - One generation for good. An application with its own sequence opens the stream with that sequence as the stream's
@@ -52,7 +53,7 @@ supplies", but no `StreamNodeConfig` field reaches it. Disk history serves only 
 **Wire.** None. `Pending` never leaves the node: a branch that waits on it sends nothing.
 
 **API** (the API page in `crates/axon/README.md`): `StreamNodeConfig::history`, `StreamNode::history_ready`,
-`RecoveryError::Pending`.
+`RecoveryError::Pending`; on a bare hub, `StreamHub::history_ready` and `StreamHub::reads_history`.
 
 **Tests.**
 

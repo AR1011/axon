@@ -76,12 +76,18 @@ pub enum RecoveryError {
     GenerationMismatch,
     HistoryUnavailable,
     InvalidBatch,
-    Gap { expected: u64, actual: u64 },
+    Gap {
+        expected: u64,
+        actual: u64,
+    },
     ConflictingDuplicate,
     PositionOverflow,
     LimitExceeded,
     InvalidSnapshot,
     Adapter(String),
+    /// From `read_after` only: the source started a read and has nothing yet. The subscription stays recovering, and
+    /// is driven again once the source's owner says the read is in (`StreamHub::history_ready`).
+    Pending,
 }
 
 /// A non-empty run of records with their origin positions.
@@ -314,8 +320,8 @@ impl MemoryState {
     }
 }
 
-/// History an application already keeps. Calls are synchronous and bounded; slow storage
-/// belongs behind a cache.
+/// History an application already keeps. Calls are synchronous, bounded and never block: a source that must do I/O
+/// starts the read, answers `read_after` with [`RecoveryError::Pending`], and wakes the hub when the read is in.
 pub trait RecoverySource: Send + Sync {
     fn available_range(&self, key: &StreamKey) -> Result<ReplayRange, RecoveryError>;
 
@@ -567,26 +573,30 @@ impl RecoverySource for MemoryStore {
         if after.sequence == through {
             return Ok(Vec::new());
         }
-        if bounds.max_records == 0 || bounds.max_bytes == 0 {
-            return Err(RecoveryError::LimitExceeded);
-        }
-        let log = &self.logs[key];
-        let (mut page, mut bytes) = (Vec::new(), 0);
-        for record in log.records.iter().skip((after.sequence + 1 - range.first) as usize) {
-            if page.len() as u64 >= through - after.sequence
-                || page.len() >= bounds.max_records
-                || bytes + record.len() > bounds.max_bytes
-            {
-                break;
-            }
-            bytes += record.len();
-            page.push(record.clone());
-        }
-        if page.is_empty() {
-            return Err(RecoveryError::LimitExceeded);
-        }
-        Ok(vec![SequencedBatch::new(range.generation, after.sequence + 1, page)?])
+        page(after, through, bounds, self.logs[key].records.iter().skip((after.sequence + 1 - range.first) as usize))
     }
+}
+
+/// The page of `records`, the ones after `after` in order, that ends by `through` and fits `bounds`; `LimitExceeded`
+/// when not even the first fits.
+pub(crate) fn page<'a>(
+    after: Cursor,
+    through: u64,
+    bounds: ReadBounds,
+    records: impl IntoIterator<Item = &'a Payload>,
+) -> Result<Vec<SequencedBatch>, RecoveryError> {
+    let (mut page, mut bytes) = (Vec::new(), 0);
+    for record in records.into_iter().take(through.saturating_sub(after.sequence) as usize) {
+        if page.len() >= bounds.max_records || bytes + record.len() > bounds.max_bytes {
+            break;
+        }
+        bytes += record.len();
+        page.push(record.clone());
+    }
+    if page.is_empty() {
+        return Err(RecoveryError::LimitExceeded);
+    }
+    Ok(vec![SequencedBatch::new(after.generation, after.sequence + 1, page)?])
 }
 
 /// A store the publisher appends to while subscriptions replay from it.

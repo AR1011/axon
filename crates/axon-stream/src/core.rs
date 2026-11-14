@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use axon::{IdHash, Lane};
 use bytes::Bytes;
 
-use crate::disk::{DiskRead, DiskStats, DiskStore, FileOp, Files, ReadError, Resume};
+use crate::disk::{Asked, DiskRead, DiskStats, DiskStore, FileOp, Files, ReadError, Resume, SegmentRead};
 use crate::hub::*;
 use crate::recovery::*;
 use crate::wire;
@@ -658,6 +658,40 @@ fn earlier(start: StartPosition, than: StartPosition) -> bool {
     }
 }
 
+/// What an origin's subscriptions replay from: the ring where it holds the start, otherwise the namespace's history
+/// for the whole span up to the cut. The two never meet inside one read.
+struct History {
+    ring: Arc<Mutex<MemoryStore>>,
+    behind: Arc<dyn RecoverySource>,
+}
+
+impl RecoverySource for History {
+    fn available_range(&self, key: &StreamKey) -> Result<ReplayRange, RecoveryError> {
+        let ring = lock(&self.ring).available_range(key)?;
+        Ok(match self.behind.available_range(key) {
+            Ok(h) if h.generation == ring.generation && h.first < ring.first && h.last + 1 >= ring.first => {
+                ReplayRange { first: h.first, ..ring }
+            }
+            _ => ring,
+        })
+    }
+
+    fn read_after(
+        &self,
+        key: &StreamKey,
+        after: Cursor,
+        through: u64,
+        bounds: ReadBounds,
+    ) -> Result<Vec<SequencedBatch>, RecoveryError> {
+        let ring = lock(&self.ring);
+        if ring.available_range(key)?.first <= after.sequence + 1 {
+            return ring.read_after(key, after, through, bounds);
+        }
+        drop(ring);
+        self.behind.read_after(key, after, through, bounds)
+    }
+}
+
 pub struct RelayCore<A: Authorizer = AllowAll> {
     cfg: CoreConfig,
     me: Arc<str>,
@@ -666,6 +700,8 @@ pub struct RelayCore<A: Authorizer = AllowAll> {
     store: Arc<Mutex<MemoryStore>>,
     /// Keeps the history of the streams it originates in the store's namespaces on disk.
     pub(crate) disk: Option<DiskStore>,
+    /// The history each namespace's application keeps, behind the ring of the streams this node originates.
+    pub(crate) history: BTreeMap<String, Arc<dyn RecoverySource>>,
     originated: HashSet<StreamKey, IdHash>,
     // Ordered maps keep a run reproducible from its inputs.
     feeds: BTreeMap<StreamKey, Feed>,
@@ -735,6 +771,7 @@ impl<A: Authorizer> RelayCore<A> {
             hub,
             store: Arc::new(Mutex::new(store)),
             disk: None,
+            history: BTreeMap::new(),
             originated: HashSet::default(),
             feeds: BTreeMap::new(),
             parents: BTreeMap::new(),
@@ -1092,7 +1129,20 @@ impl<A: Authorizer> RelayCore<A> {
         Some((disk.files(), disk.take(now_ms)?))
     }
 
-    /// Whether a write waits to be taken.
+    /// The segments starts behind a ring wait on: read them with `disk::read_asked`, without the core, and hand them
+    /// to [`disk_read_in`](Self::disk_read_in).
+    pub(crate) fn take_disk_reads(&self) -> Option<(Arc<dyn Files>, Vec<Asked>)> {
+        self.disk.as_ref()?.take_reads()
+    }
+
+    pub(crate) fn disk_read_in(&mut self, read: Vec<SegmentRead>) {
+        let Some(disk) = &self.disk else { return };
+        for key in disk.read_in(read) {
+            self.history_ready(&key);
+        }
+    }
+
+    /// Whether a write or a segment read waits to be taken.
     pub(crate) fn disk_queued(&self) -> bool {
         self.disk.as_ref().is_some_and(DiskStore::queued)
     }
@@ -1164,6 +1214,23 @@ impl<A: Authorizer> RelayCore<A> {
 
     // ---- local subscribers ----
 
+    /// What a subscription to the key replays from: its ring, with the namespace's history behind it on a key this
+    /// node originates. A relay passes a start behind its ring on as `HistoryUnavailable`.
+    fn history(&self, key: &StreamKey) -> Arc<dyn RecoverySource> {
+        let behind = self.history.get(key.namespace()).cloned().or_else(|| self.disk.as_ref()?.history(key));
+        match behind.filter(|_| self.originated.contains(key)) {
+            Some(behind) => Arc::new(History { ring: self.store.clone(), behind }),
+            None => self.store.clone(),
+        }
+    }
+
+    /// The read a history source answered `Pending` for is in: the subscriptions that wait on it are driven again.
+    pub fn history_ready(&mut self, key: &StreamKey) {
+        if !self.hub.history_ready(key).is_empty() {
+            self.wake_key(key);
+        }
+    }
+
     /// On a relay, subscribing to a stream this node does not have yet starts pulling it.
     pub fn subscribe(&mut self, key: &StreamKey, options: SubscribeOptions) -> Result<u64, StreamError> {
         self.ensure_stream(key)?;
@@ -1177,12 +1244,12 @@ impl<A: Authorizer> RelayCore<A> {
                 id
             }
             StartPosition::SnapshotThenLive => {
-                let id = self.hub.subscribe(&self.local, key, options, Some(self.store.clone()))?;
+                let id = self.hub.subscribe(&self.local, key, options, Some(self.history(key)))?;
                 self.ask_snapshot(key);
                 id
             }
             start => {
-                let id = self.hub.subscribe(&self.local, key, options, Some(self.store.clone()))?;
+                let id = self.hub.subscribe(&self.local, key, options, Some(self.history(key)))?;
                 self.want_from(key, Some((id, start)));
                 id
             }
@@ -1194,7 +1261,7 @@ impl<A: Authorizer> RelayCore<A> {
 
     /// `None` means nothing yet; check [`is_subscribed`](Self::is_subscribed) to tell that from the end.
     pub fn poll(&mut self, id: u64) -> Option<StreamEvent> {
-        if self.hub.is_recovering(id) && !self.hub.pollable(id) {
+        if self.hub.reads_history(id) && !self.hub.pollable(id) {
             let _ = self.hub.drive_recovery(id, ReadBounds { max_records: usize::MAX, max_bytes: usize::MAX });
         }
         let ended = self.hub.subscription(id).filter(|(_, ended)| *ended).map(|(key, _)| key.clone());
@@ -1437,7 +1504,7 @@ impl<A: Authorizer> RelayCore<A> {
             _ => StartPosition::Live,
         };
         let options = SubscribeOptions { start, slow_consumer: SlowConsumerPolicy::Reset, limits: self.cfg.branch };
-        let id = self.hub.subscribe(peer, &want.key, options, Some(self.store.clone())).map_err(|e| match e {
+        let id = self.hub.subscribe(peer, &want.key, options, Some(self.history(&want.key))).map_err(|e| match e {
             StreamError::Forbidden => Status::Forbidden,
             StreamError::Recovery(RecoveryError::HistoryUnavailable) => Status::HistoryUnavailable,
             StreamError::Recovery(RecoveryError::GenerationMismatch) => Status::GenerationMismatch,
@@ -1561,8 +1628,7 @@ impl<A: Authorizer> RelayCore<A> {
                     continue;
                 }
                 let took = charges.get(&id).map_or(0, |c| c.records);
-                let recovering = hub.is_recovering(id);
-                if recovering && !hub.pollable(id) {
+                if hub.reads_history(id) && !hub.pollable(id) {
                     let max_records = (cfg.hub.max_batch_records - took).min(room / 8);
                     if max_records == 0 {
                         stopped.get_or_insert(id);
@@ -1571,7 +1637,7 @@ impl<A: Authorizer> RelayCore<A> {
                     let _ = hub.drive_recovery(id, ReadBounds { max_records, max_bytes: room - 4 * max_records });
                 }
                 let Some((mut size, records)) = hub.next_size(id) else {
-                    if !recovering {
+                    if !hub.reads_history(id) {
                         entry.ready.remove(&id);
                     }
                     continue;

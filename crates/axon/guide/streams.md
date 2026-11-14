@@ -158,9 +158,9 @@ start time in milliseconds is a generation that survives a restart of the publis
 A subscription sees `Ready`, then `Snapshot` if it started `SnapshotThenLive`, replayed batches, `CaughtUp`, live batches, and
 another `Ready` at each restart of the key it follows. It ends with exactly one `ResetRequired(reason)` (continuity
 broke: start over) or `End(reason)`. `CaughtUp` means the prefix
-was emitted, not applied. Admission is not delivery. History is a bounded in-memory ring (`MemoryStore`), or whatever
-`RecoverySource` the application supplies; an origin can also keep it [on disk](#history-on-disk) to resume after a
-crash.
+was emitted, not applied. Admission is not delivery. History is a bounded in-memory ring (`MemoryStore`) on every node
+that carries the key. At the origin, a start behind the ring replays from the history behind it: the files it keeps
+[on disk](#history-on-disk), which also resume it after a crash, or [the application's own](#history-the-application-keeps).
 
 A `Live` subscription that follows the key keeps its own position: the last record it was given, or the position its
 last `Ready` showed. Whatever its node's stream does under it (a close, a reset, a repull from a parent), within a
@@ -493,8 +493,11 @@ use, and can be tried again. The program below drops its node with nothing left 
 After a restart, opening the stream again with the same generation resumes it: the next record follows the last
 durable one, the ring is filled from the files, and a compacted stream has its state again. `node.stored(&key)` names
 the generation and last record the files hold, until the stream is opened. A subscriber that holds a cursor continues
-`After(cursor)` on any node with nothing missed or seen twice. Replay still comes from the rings: the files serve the
-restart, and a start behind the ring is `HistoryUnavailable` as without them. Opening a newer generation,
+`After(cursor)` on any node with nothing missed or seen twice. A start behind the origin's ring replays from the files:
+the node's writer task reads the segment that holds it between two writes, the subscription waits meanwhile, and a
+replay goes to a child a push window at a time. Retention bounds it: a start older than the oldest segment is
+`HistoryUnavailable`. Relays keep only their rings and refuse such a start, so a child that may come back far behind
+needs the origin among its candidates (`upstream_for`). Opening a newer generation,
 `restart_stream` or `close_stream` removes the old files; opening an older one is refused with `GenerationMismatch`.
 
 `StreamNode::start` reads every segment of the listed namespaces once to check it, one at a time, keeping only their
@@ -592,6 +595,103 @@ async fn main() {
     drop(origin);
     system.shutdown().await.unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
+}
+```
+
+## History the application keeps
+
+An application that already keeps a log of what it publishes, a table or files of its own, can serve replay from it:
+`StreamNodeConfig::history(namespace, source)` puts its `RecoverySource` behind the ring of each stream of that
+namespace this node originates. A start behind the ring then replays from the source up to the ring's last record and
+goes on live, and a subscriber that kept a cursor for a day resumes `After(cursor)`. The source is never asked for a key
+the node relays, and takes the place of the [disk](#history-on-disk)'s own history for its namespace.
+
+The contract: the source holds every record the stream published, at the same position, with the same bytes. An
+application that writes its log first and publishes after meets it. Calls are synchronous and run under the node's lock,
+so a source must not block: one that reads answers `read_after` with `RecoveryError::Pending`, starts the read, and
+calls `node.history_ready(&key)` once it is in; the subscriptions it answered `Pending` wait until then, and nothing
+else on the node does. A read is at most what the subscriber's branch, or a child's push window, has room for.
+
+```rust
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+
+use axon::ActorSystem;
+use axon_cluster::{Cluster, ClusterConfig, MemoryDiscovery};
+use axon_net::SharedSecret;
+use axon_stream::{
+    Cursor, DeliveryPolicy, ReadBounds, RecoveryError, RecoverySource, ReplayRange, RingLimits, SequencedBatch,
+    StartPosition, StreamEvent, StreamKey, StreamNode, StreamNodeConfig, SubscribeOptions,
+};
+use bytes::Bytes;
+
+/// The application's own log: every record of generation 1, by position.
+#[derive(Default)]
+struct Log(Mutex<BTreeMap<u64, Bytes>>);
+
+impl RecoverySource for Log {
+    fn available_range(&self, _: &StreamKey) -> Result<ReplayRange, RecoveryError> {
+        let log = self.0.lock().unwrap();
+        let last = log.keys().next_back().copied().unwrap_or(0);
+        Ok(ReplayRange { generation: 1, first: log.keys().next().copied().unwrap_or(last + 1), last })
+    }
+
+    fn read_after(
+        &self,
+        _: &StreamKey,
+        after: Cursor,
+        through: u64,
+        bounds: ReadBounds,
+    ) -> Result<Vec<SequencedBatch>, RecoveryError> {
+        let log = self.0.lock().unwrap();
+        let records: Vec<Bytes> =
+            log.range(after.sequence + 1..=through).take(bounds.max_records).map(|(_, r)| r.clone()).collect();
+        if records.is_empty() {
+            return Err(RecoveryError::HistoryUnavailable);
+        }
+        Ok(vec![SequencedBatch::new(1, after.sequence + 1, records)?])
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    let mut transport = axon_net::Config::new("a", SharedSecret::new("at-least-16-bytes-long").unwrap());
+    transport.allow_plaintext = true;
+    let system = ActorSystem::builder().build().unwrap();
+    let cfg = ClusterConfig::new("127.0.0.1:0".parse().unwrap(), transport, MemoryDiscovery::new());
+    let cluster = Cluster::start(&system, cfg).await.unwrap();
+
+    let log = Arc::new(Log::default());
+    let mut cfg = StreamNodeConfig::new(vec![]).history("events", log.clone());
+    // A ring of 8 records, so the replay below comes from the log.
+    cfg.core.rings = vec![RingLimits { namespace: "events".into(), max_records: 8, max_bytes: 1 << 20 }];
+    let node = StreamNode::start(&cluster, cfg).await.unwrap();
+    let key = StreamKey::new("events", "e-1");
+    node.open_stream(&key, 1, DeliveryPolicy::ReplayRequired).await.unwrap();
+    for i in 1..=100u64 {
+        let record = Bytes::from(format!("event {i}"));
+        log.0.lock().unwrap().insert(i, record.clone()); // the log first
+        node.publish(&key, vec![record]).unwrap();
+    }
+
+    // A cursor stored long ago, 90 records behind the ring's last.
+    let start = StartPosition::After(Cursor { generation: 1, sequence: 10 });
+    let mut events = node.subscribe(&key, SubscribeOptions { start, ..Default::default() }).unwrap();
+    let mut next = 11;
+    while next <= 100 {
+        match events.next().await.expect("subscription open") {
+            StreamEvent::Batch(batch) => {
+                for record in batch.records() {
+                    assert_eq!(&record[..], format!("event {next}").as_bytes(), "nothing missed, nothing twice");
+                    next += 1;
+                }
+            }
+            terminal if terminal.is_terminal() => panic!("stream ended: {terminal:?}"),
+            _ => {} // Ready, CaughtUp
+        }
+    }
+    drop(node);
+    system.shutdown().await.unwrap();
 }
 ```
 

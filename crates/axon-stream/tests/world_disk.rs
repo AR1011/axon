@@ -29,8 +29,9 @@ struct Node {
 /// With the timings of `world_relay.rs`. The origin keeps `md` on its disk and opens the key as generation 1 on every
 /// boot, which resumes what the disk holds. A `relaying` origin also pulls the key from the relay, as every node of
 /// the fault rig does, and on a boot that resumes it opens the key only once the relay has asked it for the key, so
-/// the open takes back a key it relays. With `relay2`, the leaf is fed by `relay2`, fed by `relay`.
-async fn boot(host: Host, discovery: MemoryDiscovery, relaying: bool, relay2: bool) -> Node {
+/// the open takes back a key it relays. With `relay2`, the leaf is fed by `relay2`, fed by `relay`. With a `ring`, the
+/// origin's ring holds that many records, and the leaf may also pull from the origin.
+async fn boot(host: Host, discovery: MemoryDiscovery, relaying: bool, relay2: bool, ring: Option<usize>) -> Node {
     let role = host.name().to_owned();
     let mut cfg = ClusterConfig::new(host.addr(), host.transport(SharedSecret::new(SECRET).unwrap()), discovery);
     common::short_cluster(&mut cfg);
@@ -42,6 +43,7 @@ async fn boot(host: Host, discovery: MemoryDiscovery, relaying: bool, relay2: bo
         "origin" => vec![],
         "relay" => vec![labels(&[("role", "origin")])],
         "leaf" if relay2 => vec![labels(&[("role", "relay2")])],
+        _ if ring.is_some() => vec![labels(&[("role", "relay")]), labels(&[("role", "origin")])],
         _ => vec![labels(&[("role", "relay")])],
     };
     let mut cfg = StreamNodeConfig::new(upstream);
@@ -53,6 +55,9 @@ async fn boot(host: Host, discovery: MemoryDiscovery, relaying: bool, relay2: bo
         // Small, so a run rolls through many segments.
         disk.segment_bytes = 2048;
         cfg.disk = Some(disk);
+        if let Some(ring) = ring {
+            cfg.core.rings = vec![RingLimits { namespace: "md".into(), max_records: ring, max_bytes: 1 << 20 }];
+        }
     }
     let stream = StreamNode::start(&cluster, cfg).await.unwrap();
     if role == "origin" {
@@ -68,16 +73,16 @@ async fn boot(host: Host, discovery: MemoryDiscovery, relaying: bool, relay2: bo
 }
 
 fn world(seed: u64, relaying: bool) -> World<Node> {
-    world_of(seed, relaying, false)
+    world_of(seed, relaying, false, None)
 }
 
-fn world_of(seed: u64, relaying: bool, relay2: bool) -> World<Node> {
+fn world_of(seed: u64, relaying: bool, relay2: bool, ring: Option<usize>) -> World<Node> {
     let discovery = MemoryDiscovery::new();
     let mut w = World::new(WorldConfig { seed, ..WorldConfig::default() });
     let names: &[&str] = if relay2 { &["origin", "relay", "relay2", "leaf"] } else { &["origin", "relay", "leaf"] };
     for &name in names {
         let discovery = discovery.clone();
-        w.add(name, move |host| boot(host, discovery.clone(), relaying, relay2));
+        w.add(name, move |host| boot(host, discovery.clone(), relaying, relay2, ring));
     }
     w.run_until("every node booted", Duration::from_secs(30), |w| w.nodes().count() == names.len());
     w
@@ -232,7 +237,7 @@ fn resumes(seed: u64, relaying: bool, label: &str, crashes: &[Crash], fault: imp
 #[test]
 fn a_follower_two_relays_away_sees_each_record_once_when_the_origin_resumes_after_origin_lost() {
     check_seeds(seeds(0..64), |seed| {
-        let mut w = world_of(seed, true, true);
+        let mut w = world_of(seed, true, true, None);
         let live = collect(&mut w, StartPosition::Live);
         w.run_until("the leaf follows through both relays", Duration::from_secs(30), |w| {
             stream(w, "leaf").parent_of(&key()).as_deref() == Some("relay2")
@@ -723,6 +728,43 @@ fn a_full_disk_refuses_publishes_and_the_stream_keeps_serving() {
         let disk: Vec<_> = told.into_iter().filter(|k| k.starts_with("disk_")).collect();
         assert_eq!(disk, ["disk_failing", "disk_recovered"], "seed {seed}");
         println!("world digest disk_full seed {seed}: {:016x}", w.digest());
+    })
+    .unwrap();
+}
+
+/// The origin's ring holds 4 records, and its files hold the rest in segments of 2 KiB. A leaf that starts far behind
+/// the ring replays from the files, read by the origin's writer task while the origin publishes on, and then goes on
+/// live: each record once, with the bytes published. Seeded: the relay crashes during the replay.
+#[test]
+fn a_subscriber_behind_the_ring_replays_from_the_files() {
+    check_seeds(seeds(0..64), |seed| {
+        let mut w = world_of(seed, false, false, Some(4));
+        let record = |s: u64| Bytes::copy_from_slice(&s.to_be_bytes());
+        let publish = |w: &mut World<Node>, range: std::ops::RangeInclusive<u64>| {
+            let written = w.block_on("origin", move |n| async move {
+                let mut at = None;
+                for s in range {
+                    at = Some(n.stream.publish(&key(), vec![record(s)]).unwrap());
+                }
+                n.stream.wait_cursor(&key(), at.expect("published")).await.unwrap();
+            });
+            written.unwrap();
+        };
+        publish(&mut w, 1..=300);
+        let from = w.pick(0..290);
+        let read = collect(&mut w, StartPosition::After(Cursor { generation: 1, sequence: from }));
+        let wait = Duration::from_millis(w.pick(0..100));
+        w.run_for(wait);
+        if seed % 2 == 1 {
+            w.crash("relay", Crash::Process);
+        }
+        publish(&mut w, 301..=400);
+        w.run_until("the leaf read to the last record", Duration::from_secs(20), |_| {
+            read.borrow().is_err() || last(&read) == 400
+        });
+        let read = read.borrow().clone().unwrap_or_else(|wrong| panic!("seed {seed}: from {from}: {wrong}"));
+        assert_eq!(read, (from + 1..=400).map(|s| (s, record(s))).collect::<BTreeMap<_, _>>(), "seed {seed}");
+        println!("world digest behind_the_ring seed {seed}: {:016x}", w.digest());
     })
     .unwrap();
 }

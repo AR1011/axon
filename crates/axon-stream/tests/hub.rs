@@ -664,6 +664,83 @@ fn a_source_that_skips_records_is_a_reset_not_a_gap() {
     assert_eq!(drain(&mut hub, id, 3), (vec![], Some(StreamEvent::ResetRequired(ResetReason::Gap))));
 }
 
+/// History that must be read before it is served: `Pending` until it has landed.
+struct Reading {
+    log: Store,
+    landed: std::sync::atomic::AtomicBool,
+    asked: std::sync::atomic::AtomicUsize,
+}
+
+impl RecoverySource for Reading {
+    fn available_range(&self, key: &StreamKey) -> Result<ReplayRange, RecoveryError> {
+        self.log.available_range(key)
+    }
+
+    fn read_after(
+        &self,
+        key: &StreamKey,
+        after: Cursor,
+        through: u64,
+        bounds: ReadBounds,
+    ) -> Result<Vec<SequencedBatch>, RecoveryError> {
+        use std::sync::atomic::Ordering::SeqCst;
+        if !self.landed.load(SeqCst) {
+            self.asked.fetch_add(1, SeqCst);
+            return Err(RecoveryError::Pending);
+        }
+        self.log.read_after(key, after, through, bounds)
+    }
+}
+
+#[test]
+fn a_source_that_answers_pending_keeps_the_subscription_recovering_until_woken() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (mut hub, store) = hub();
+    publish(&mut hub, &store, 1..=10, 4);
+    let source = Arc::new(Reading { log: store.clone(), landed: false.into(), asked: 0.into() });
+    let id = hub.subscribe(&me(), &key(), after(0), Some(source.clone())).unwrap();
+    assert_eq!(hub.poll(id), Some(StreamEvent::Ready { start: Some(Cursor { generation: 7, sequence: 0 }) }));
+    let page = ReadBounds { max_records: 100, max_bytes: 1 << 20 };
+    let pending = Err(StreamError::Recovery(RecoveryError::Pending));
+    assert_eq!(hub.drive_recovery(id, page), pending);
+    publish(&mut hub, &store, 11..=12, 2);
+    source.landed.store(true, SeqCst);
+    // Not asked again until it is woken, though the read has landed.
+    assert_eq!(hub.drive_recovery(id, page), pending);
+    assert_eq!((source.asked.load(SeqCst), hub.poll(id)), (1, None));
+    assert!(hub.is_recovering(id) && !hub.reads_history(id));
+    assert_eq!(hub.history_ready(&key()), vec![id]);
+    assert!(hub.reads_history(id));
+    assert_eq!(drain(&mut hub, id, 3), ((1..=12).collect(), None));
+    assert_eq!(hub.history_ready(&key()), Vec::<u64>::new());
+}
+
+#[test]
+fn a_replay_from_the_source_runs_to_the_cut_and_each_live_record_follows_once() {
+    for page in [1, 3, 7, 100] {
+        let (mut hub, _) = hub();
+        // The application writes its log before it publishes, so the log runs ahead of the stream.
+        let mut log = MemoryStore::new(MemoryLimits::default()).unwrap();
+        log.open(&key(), 7).unwrap();
+        log.append(&key(), &batch(7, 1, 30)).unwrap();
+        for n in 1..=20 {
+            hub.publish(&me(), &key(), vec![record(n)]).unwrap();
+        }
+        let id = hub.subscribe(&me(), &key(), after(5), Some(Arc::new(Mutex::new(log)))).unwrap();
+        let mut live = 21..=30;
+        while hub.is_recovering(id) {
+            hub.drive_recovery(id, ReadBounds { max_records: page, max_bytes: 1 << 20 }).unwrap();
+            if let Some(n) = live.next() {
+                hub.publish(&me(), &key(), vec![record(n)]).unwrap();
+            }
+        }
+        for n in live {
+            hub.publish(&me(), &key(), vec![record(n)]).unwrap();
+        }
+        assert_eq!(drain(&mut hub, id, page), ((6..=30).collect(), None), "page {page}");
+    }
+}
+
 struct NoRange;
 
 impl RecoverySource for NoRange {

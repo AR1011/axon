@@ -633,6 +633,61 @@ fn an_open_that_fails_after_letting_a_pulled_key_go_pulls_it_again() {
     assert!(relay.is_subscribed(follower));
 }
 
+/// History that must not be asked.
+struct Never;
+
+impl RecoverySource for Never {
+    fn available_range(&self, _: &StreamKey) -> Result<crate::recovery::ReplayRange, RecoveryError> {
+        unreachable!("asked for a key the node relays")
+    }
+
+    fn read_after(
+        &self,
+        _: &StreamKey,
+        _: Cursor,
+        _: u64,
+        _: crate::recovery::ReadBounds,
+    ) -> Result<Vec<crate::recovery::SequencedBatch>, RecoveryError> {
+        unreachable!("asked for a key the node relays")
+    }
+}
+
+/// The namespace's history serves the streams the node originates. A start behind the ring of a key it relays is
+/// refused, as on a node without one, and the source is not asked.
+#[test]
+fn a_history_source_is_not_asked_for_a_key_the_node_relays() {
+    use crate::core::tests::{ask, deliver, records};
+    use crate::recovery::{MemoryLimits, MemoryStore, RingLimits, SequencedBatch, lock};
+    let key = StreamKey::new("md", "btc");
+    let (o, r) = (PeerId::new("o", 1), PeerId::new("r", 1));
+    let rings = vec![RingLimits { namespace: "md".into(), max_records: 4, max_bytes: 1 << 20 }];
+    let cfg = CoreConfig { rings, ..CoreConfig::default() };
+    let log = Arc::new(std::sync::Mutex::new(MemoryStore::new(MemoryLimits::default()).unwrap()));
+    lock(&log).open(&key, 1).unwrap();
+    let mut origin = RelayCore::new(&o, crate::AllowAll, CoreConfig { relay: false, ..cfg.clone() }).unwrap();
+    let mut relay = RelayCore::new(&r, crate::AllowAll, cfg).unwrap();
+    origin.history.insert("md".into(), log.clone());
+    relay.history.insert("md".into(), Arc::new(Never));
+    origin.open_stream(&key, 1, DeliveryPolicy::ReplayRequired).unwrap();
+    let _follower = relay.subscribe(&key, SubscribeOptions::default()).unwrap();
+    let mut at = Instant::now().into_std();
+    for n in 1..=12u64 {
+        let record = Bytes::copy_from_slice(&n.to_be_bytes());
+        lock(&log).append(&key, &SequencedBatch::new(1, n, vec![record.clone()]).unwrap()).unwrap();
+        origin.publish(&key, vec![record]).unwrap();
+        at += Duration::from_millis(500);
+        ask(&mut origin, &o, &mut relay, &r, at);
+        deliver(&mut origin, &o, &mut relay, &r, at);
+    }
+    assert_eq!(relay.cursor(&key), Some(Cursor { generation: 1, sequence: 12 }));
+    let behind =
+        SubscribeOptions { start: StartPosition::After(Cursor { generation: 1, sequence: 2 }), ..Default::default() };
+    assert_eq!(relay.subscribe(&key, behind).err(), Some(StreamError::Recovery(RecoveryError::HistoryUnavailable)));
+    // A ring of 4 holds 9..=12: the rest came from the history.
+    let id = origin.subscribe(&key, behind).unwrap();
+    assert_eq!(records(&mut origin, id), (3..=12).collect::<Vec<_>>());
+}
+
 /// A push goes to the boot of the child that asked for it. Sent again after that boot went, it never reaches the next
 /// boot, whose links are numbered from 1 again: taken there, it set the new boot to the old one's position and its
 /// follower skipped records the origin still held (the rig's `stream-gap`). The origin gives the old boot up at once.

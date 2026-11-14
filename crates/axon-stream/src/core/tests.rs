@@ -38,7 +38,7 @@ fn follow(origin: &mut RelayCore, child: &PeerId, keys: usize, now: Instant) {
 }
 
 /// The child asks its parent until it has nothing more to ask.
-fn ask(parent: &mut RelayCore, p: &PeerId, child: &mut RelayCore, c: &PeerId, now: Instant) {
+pub(crate) fn ask(parent: &mut RelayCore, p: &PeerId, child: &mut RelayCore, c: &PeerId, now: Instant) {
     for _ in 0..8 {
         let asked = child.reconcile(std::slice::from_ref(p), now);
         if asked.is_empty() {
@@ -69,7 +69,7 @@ pub(crate) fn deliver<A: Authorizer, B: Authorizer>(
     pushes
 }
 
-fn records(core: &mut RelayCore, id: u64) -> Vec<u64> {
+pub(crate) fn records(core: &mut RelayCore, id: u64) -> Vec<u64> {
     let mut seen = Vec::new();
     while let Some(event) = core.poll(id) {
         if let StreamEvent::Batch(batch) = event {
@@ -730,4 +730,57 @@ fn a_relay_asks_again_after_the_position_its_stream_closed_at() {
     let asked = relay.reconcile(std::slice::from_ref(&o), later);
     let starts: Vec<_> = asked.iter().flat_map(|(_, i)| &i.wants).map(|w| w.start).collect();
     assert_eq!(starts, vec![StartPosition::After(Cursor { generation: 1, sequence: 33 })]);
+}
+
+/// A replay from the namespace's history, four branches long, goes to the child a window at a time: the branch is
+/// never asked to hold more than it has room for, so it is not reset as a slow consumer.
+#[test]
+fn a_source_replay_larger_than_the_branch_limit_goes_through_the_push_window_without_a_slow_consumer_reset() {
+    let (o, c, now, rtt) = (PeerId::new("o", 1), PeerId::new("c", 1), Instant::now(), Duration::from_millis(200));
+    let mut cfg = scaled();
+    cfg.branch = BranchLimits { max_bytes: 256 << 10, ..BranchLimits::BRANCH };
+    cfg.rings = vec![RingLimits { namespace: "md".into(), max_records: 16, max_bytes: 16 * RECORD }];
+    let records = 1024;
+    let limits = MemoryLimits {
+        max_records_per_stream: records,
+        max_bytes_per_stream: 2 * records * RECORD,
+        ..Default::default()
+    };
+    let log = Arc::new(Mutex::new(MemoryStore::new(limits).expect("valid limits")));
+    lock(&log).open(&key(0), 1).expect("opens");
+    let mut origin = RelayCore::new(&o, AllowAll, CoreConfig { relay: false, ..cfg.clone() }).expect("a valid config");
+    origin.history.insert("md".into(), log.clone());
+    origin.open_stream(&key(0), 1, DeliveryPolicy::ReplayRequired).expect("opens");
+    let batch = vec![Bytes::from(vec![7u8; RECORD]); 16];
+    for first in (1..=records as u64).step_by(16) {
+        // Written to the log before it is published.
+        lock(&log).append(&key(0), &SequencedBatch::new(1, first, batch.clone()).expect("a batch")).expect("appends");
+        origin.publish(&key(0), batch.clone()).expect("publishes");
+    }
+    let mut child = RelayCore::new(&c, AllowAll, CoreConfig { relay: true, ..cfg }).expect("a valid config");
+    let id = child.subscribe(&key(0), SubscribeOptions { start: StartPosition::First, ..Default::default() });
+    let id = id.expect("subscribes");
+    ask(&mut origin, &o, &mut child, &c, now);
+    let (mut at, mut seen) = (now, Vec::new());
+    for _ in 0..64 {
+        let mut answers = Vec::new();
+        while let Some((push, body)) = origin.next_push("c", Lane::Live, at, Some(rtt)) {
+            let (channel, seq, items) = wire::decode_push(&mut body.slice(1..)).expect("a push decodes");
+            answers.push((push, child.handle_push(&o, Lane::Live, 1, channel, seq, items, at)));
+        }
+        at += rtt;
+        for (push, answer) in answers {
+            origin.push_answered(&c, Lane::Live, push, answer, at);
+        }
+        while let Some(event) = child.poll(id) {
+            match event {
+                StreamEvent::Batch(batch) => seen.extend(batch.first()..batch.first() + batch.len() as u64),
+                StreamEvent::ResetRequired(_) | StreamEvent::End(_) => panic!("{event:?} after {} records", seen.len()),
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(seen, (1..=records as u64).collect::<Vec<_>>());
+    let hub = origin.stats().hub;
+    assert_eq!((hub.resets, hub.replayed_records), ([0; 6], records as u64));
 }

@@ -436,6 +436,8 @@ enum Phase {
         cut: Cursor,
         source: Arc<dyn RecoverySource>,
         with_state: bool,
+        /// The source answered `Pending`: it is not asked again until `history_ready`.
+        waiting: bool,
     },
     Live,
     /// A cursor or `First` (`None` until the generation is known) start on a relay stream that had no position,
@@ -586,7 +588,9 @@ impl Sub {
             self.enqueue(1, StreamEvent::Snapshot(snapshot), total);
         }
         self.phase = match replay {
-            Some((next_after, cut, source)) => Phase::Recovering { next_after, cut, source, with_state },
+            Some((next_after, cut, source)) => {
+                Phase::Recovering { next_after, cut, source, with_state, waiting: false }
+            }
             None => {
                 self.queue.push_back(StreamEvent::CaughtUp { through: start.unwrap_or_default() });
                 Phase::Live
@@ -1499,6 +1503,7 @@ impl<A: Authorizer> StreamHub<A> {
         let limits = self.limits;
         let sub = self.subs.get_mut(&id).ok_or(StreamError::UnknownSubscription)?;
         let (next_after, cut, source) = match &sub.phase {
+            Phase::Recovering { waiting: true, .. } => return Err(RecoveryError::Pending.into()),
             Phase::Recovering { next_after, cut, source, .. } => (*next_after, *cut, source.clone()),
             Phase::Live => return Ok(RecoveryProgress::Live),
             Phase::Waiting(_) | Phase::Snapshot(_) | Phase::Done => return Err(StreamError::NotRecovering),
@@ -1536,6 +1541,12 @@ impl<A: Authorizer> StreamHub<A> {
                     self.terminate(id, StreamEvent::ResetRequired(ResetReason::SlowConsumer));
                 }
                 return Err(RecoveryError::LimitExceeded.into());
+            }
+            Err(RecoveryError::Pending) => {
+                if let Phase::Recovering { waiting, .. } = &mut sub.phase {
+                    *waiting = true;
+                }
+                return Err(RecoveryError::Pending.into());
             }
             Err(error) => {
                 let reason = match error {
@@ -1615,7 +1626,7 @@ impl<A: Authorizer> StreamHub<A> {
             self.terminate(id, StreamEvent::ResetRequired(ResetReason::GlobalCapacity));
         }
         self.check();
-        self.subs.get(&id).is_some_and(|s| s.pollable() || matches!(s.phase, Phase::Recovering { .. }))
+        self.pollable(id) || self.reads_history(id)
     }
 
     /// What the subscription has in flight, by [`poll_charged`](Self::poll_charged).
@@ -1665,6 +1676,27 @@ impl<A: Authorizer> StreamHub<A> {
 
     pub fn is_recovering(&self, id: u64) -> bool {
         self.subs.get(&id).is_some_and(|s| matches!(s.phase, Phase::Recovering { .. }))
+    }
+
+    /// Whether the subscription recovers with history to read now: [`drive_recovery`](Self::drive_recovery) asks its
+    /// source. One whose source answered `Pending` waits for [`history_ready`](Self::history_ready).
+    pub fn reads_history(&self, id: u64) -> bool {
+        self.subs.get(&id).is_some_and(|s| matches!(s.phase, Phase::Recovering { waiting: false, .. }))
+    }
+
+    /// A source's read for `key` is in: each of its subscriptions that waits on a `Pending` is driven again. Returns
+    /// them.
+    pub fn history_ready(&mut self, key: &StreamKey) -> Vec<u64> {
+        let Some(stream) = self.streams.get(key) else { return Vec::new() };
+        let mut woken = Vec::new();
+        for id in &stream.subscribers {
+            if let Some(Phase::Recovering { waiting, .. }) = self.subs.get_mut(id).map(|s| &mut s.phase)
+                && std::mem::take(waiting)
+            {
+                woken.push(*id);
+            }
+        }
+        woken
     }
 
     /// Ends the subscription, leaving `End(Unsubscribed)` to poll.
