@@ -501,7 +501,7 @@ impl Tracer {
             let ring = self.ring.lock();
             let newest = *newest.get_or_insert(ring.next);
             let base = ring.base();
-            let first = (after + 1).max(base).max((ring.next + 1).saturating_sub(self.capacity as u64));
+            let first = after.saturating_add(1).max(base).max((ring.next + 1).saturating_sub(self.capacity as u64));
             let held = ((newest + 1).saturating_sub(first) as usize).min(page);
             let (from, to) = ((first - base) as usize, (first - base) as usize + held);
             let mut at = from;

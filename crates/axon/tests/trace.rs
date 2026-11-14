@@ -423,6 +423,8 @@ fn a_ring_of_any_capacity_keeps_exactly_its_newest_spans_from_any_position() {
             }
         }
         assert_eq!(tracer.trace(root.trace).len(), capacity);
+        // A cursor from a peer, past any span there will be.
+        assert!(tracer.since(u64::MAX, 300).is_empty(), "capacity {capacity}");
     }
 }
 
