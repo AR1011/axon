@@ -188,7 +188,8 @@ Nanoseconds are given in seconds. A histogram is `_bucket`, `_sum` and `_count`,
 ns to 275 s (15 ns, 63 ns, 255 ns, …) and `+Inf`: 19 bounds its buckets hold exactly, so `histogram_quantile` lands in
 the right factor of four and `_sum / _count` is exact. Labels are those of the table: per actor type and message label,
 never per actor except the at most 64 names in `persist_actors`, and per connection only the `sample_connections`
-busiest, one per peer and direction, so the count of series does not grow with the actors or the cluster. A persisted
+busiest, one per peer and direction, so the count of series does not grow with the actors or the cluster; the `link.*`
+counters cover every link, by region pair, lane and protocol, and grow with the regions and protocols only. A persisted
 actor's series are a family of their own, `axon_persisted_actor_processed_total{actor="pinned"}`, since its type's
 `axon_actor_processed_total` already counts it: a `sum` over either family counts each message once. A type's counters
 take in its exited actors and every generation of a supervised one, so they never go back while the node runs, and

@@ -203,7 +203,7 @@ impl Route {
             served.sort_unstable();
             return Err(ClusterError::SchemaMismatch { wanted: schema, served });
         };
-        Ok(Target { node, incarnation: self.incarnation, endpoint, schema, lane })
+        Ok(Target { node, incarnation: self.incarnation, protocol: self.protocol, endpoint, schema, lane })
     }
 
     /// `protocol u64 | (endpoint u64 | schema u16 | lane u8)+`
@@ -326,6 +326,9 @@ pub struct ClusterStats {
     pub ownership: Option<ProviderInfo>,
     /// `None` without [`Quotas`](crate::Quotas).
     pub quotas: Option<crate::QuotaStats>,
+    /// What crossed this node's links, by region pair, lane, direction and protocol, for its life: every link, up or
+    /// down or closed.
+    pub links: Vec<crate::LinkMeter>,
 }
 
 pub(crate) struct Inner {
@@ -681,7 +684,7 @@ impl Cluster {
         }
         let endpoint = self.0.expose(actor, Schema::of::<P>(), name.into(), true)?;
         let (node, incarnation) = (self.0.local_node().into(), self.0.engine.local.identity.incarnation);
-        let target = Target { node, incarnation, endpoint, schema: P::SCHEMA, lane: P::LANE };
+        let target = Target { node, incarnation, protocol: P::ID, endpoint, schema: P::SCHEMA, lane: P::LANE };
         Ok(RemoteRef::new(self.0.engine.clone(), target, None))
     }
 
@@ -939,6 +942,8 @@ impl Cluster {
     pub fn stats(&self) -> ClusterStats {
         let (inner, view) = (&self.0, self.view());
         let (churn, c) = (&inner.engine.membership.churn, &inner.counters);
+        // Copied out, so the record's lock is not held across the read of every link.
+        let region = inner.record.lock().label("region").unwrap_or("").to_owned();
         ClusterStats {
             engine: inner.engine.stats(),
             members: view.members.len(),
@@ -968,6 +973,7 @@ impl Cluster {
             discovery: inner.discovery.describe(),
             ownership: inner.ownership.as_ref().map(|o| o.describe()),
             quotas: inner.quotas.get().map(|q| q.stats()),
+            links: inner.engine.meters.read(&region),
         }
     }
 }

@@ -514,7 +514,13 @@ verify-axon skill: a screenshot of the peer table with three lanes, the detail p
 
 ### 8.1 Link meters (wire v8)
 
-Status: designed, not built.
+Status: built (`crates/axon-cluster/src/engine/meter.rs`). As built: each link holds its own meters, a meter per
+protocol it carried, and folds them into its region's totals when the link is dropped, under the lock a reader takes, so
+no total drops between a close and a read. A link's region is read from the view when the link opens, on each protocol's first
+frame, on each read and at the close, and fixed once found; a link accepted before the view lists its peer is left out
+of the totals until it does, and then counted whole. Only a link whose peer the view named at none of those times is
+filed under `""`. A frame to an endpoint this node does not have, or a reply whose call is
+gone, counts under protocol 0. `wire_bytes` leaves out the handshake (about 110 bytes each way in plaintext).
 
 **Problem.** The `connection.*` series answer "which sessions are busy", not "what crossed this link". Telemetry
 stores series for the `sample_connections` busiest sessions only (32, `crates/axon-obs/src/telemetry.rs:35,62`, sorted

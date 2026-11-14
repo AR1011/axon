@@ -1,0 +1,1 @@
+import{kn as e}from"./atoms-DWNTEJXX.js";import{x as t}from"./index-BY4svfos.js";var n=e();function r(){return(0,n.jsxs)(n.Fragment,{children:[(0,n.jsx)(`h1`,{className:`sr-only-h1`,children:`Events`}),(0,n.jsx)(t,{})]})}export{r as EventsPage};

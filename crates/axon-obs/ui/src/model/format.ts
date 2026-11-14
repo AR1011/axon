@@ -17,6 +17,8 @@ function scaled(n: number, units: string[], step: number): string {
   return `${i === 0 || Math.abs(n) >= 100 ? Math.round(n) : n.toFixed(1)} ${units[i]}`;
 }
 
+/** What a node or a link without a `region` label is shown under. */
+export const NO_REGION = "no region";
 export const bytes = (n?: number | null) => (known(n) ? scaled(n, ["B", "KiB", "MiB", "GiB", "TiB"], 1024) : UNKNOWN);
 
 export function count(n?: number | null): string {

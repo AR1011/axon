@@ -22,7 +22,7 @@ use tokio::sync::OwnedSemaphorePermit;
 use tokio::task::AbortHandle;
 use tokio::time::{Instant, Sleep, sleep, sleep_until};
 
-use super::{Link, Outcome, Reply, ReplyCore, Sink, end, ended};
+use super::{Link, Meter, Outcome, Reply, ReplyCore, Sink, end, ended};
 use crate::wire::{ADMITTED, BODY, CREDIT, END, NO_REPLY, PART, WireProtocol};
 use crate::{CallError, Rejection};
 
@@ -193,12 +193,12 @@ impl Flow {
     }
 }
 
-/// Puts `frame` in the outbox, or, when it is full, waits up to `wait` for room on a task.
-fn submit_soon(link: &Link, frame: Frame, tokio: &Handle, wait: Duration) {
-    let Err(e) = link.sender.try_submit(frame) else { return };
+/// Puts `frame` in `to`'s outbox, or, when it is full, waits up to its `wait` for room on a task.
+fn submit_soon(to: &Grants, frame: Frame) {
+    let Err(e) = to.meter.try_submit(&to.link.sender, frame) else { return };
     if e.reason == SubmitReason::Full {
-        let sender = link.sender.clone();
-        tokio.spawn(async move { drop(sender.submit(e.frame, Some(Instant::now() + wait)).await) });
+        let (link, meter, at) = (to.link.clone(), to.meter.clone(), Instant::now() + to.wait);
+        to.tokio.spawn(async move { drop(meter.submit(&link.sender, e.frame, Some(at)).await) });
     }
 }
 
@@ -206,6 +206,8 @@ fn submit_soon(link: &Link, frame: Frame, tokio: &Handle, wait: Duration) {
 #[derive(Clone)]
 pub(crate) struct Grants {
     pub link: Arc<Link>,
+    /// The call's protocol's, on `link`.
+    pub meter: Arc<Meter>,
     pub id: u64,
     pub tokio: Handle,
     pub wait: Duration,
@@ -227,7 +229,7 @@ impl Grants {
         if more > 0 && !flow.may_grant(more) {
             return;
         }
-        let Err(e) = self.link.sender.try_submit(self.frame(more)) else { return };
+        let Err(e) = self.meter.try_submit(&self.link.sender, self.frame(more)) else { return };
         if e.reason != SubmitReason::Full {
             return;
         }
@@ -238,7 +240,7 @@ impl Grants {
         self.tokio.spawn(async move {
             let mut frame = e.frame;
             loop {
-                let _ = this.link.sender.submit(frame, Some(Instant::now() + this.wait)).await;
+                let _ = this.meter.submit(&this.link.sender, frame, Some(Instant::now() + this.wait)).await;
                 match flow.owed(more > 0) {
                     Some(owed) => frame = this.frame(owed),
                     None => return,
@@ -515,7 +517,7 @@ where
         let core = cut.core.clone();
         let flow = core.flow().expect("a reply in parts");
         let to = match &core.sink {
-            Sink::Remote { link, id, .. } => Some((&**link, *id, PART, core.compress.load(Relaxed))),
+            Sink::Remote { link, meter, id, .. } => Some((&**link, &**meter, *id, PART, core.compress.load(Relaxed))),
             _ => None,
         };
         let ended = pump(flow, parts, encode, to, core.max_payload, core.deadline, None).await?;
@@ -552,7 +554,7 @@ impl Body {
         let Some(code) = self.code.take() else { return };
         match &self.to {
             None => self.flow.end(ended(code)),
-            Some(to) => submit_soon(&to.link, Frame { kind: END | BODY, ..end(to.id, code) }, &to.tokio, to.wait),
+            Some(to) => submit_soon(to, Frame { kind: END | BODY, ..end(to.id, code) }),
         }
     }
 
@@ -562,7 +564,7 @@ impl Body {
     where
         S: Stream<Item = Result<Bytes, CallError>>,
     {
-        let to = self.to.as_ref().map(|to| (&*to.link, to.id, PART | BODY, false));
+        let to = self.to.as_ref().map(|to| (&*to.link, &*to.meter, to.id, PART | BODY, false));
         let max = to.map_or(usize::MAX, |(link, ..)| link.sender.peer().max_frame);
         pump(&self.flow, parts, Ok, to, max, None, Some(starve)).await
     }
@@ -600,15 +602,15 @@ impl Drop for Body {
 }
 
 /// Pulls a part only while the reader has credit, and stops as soon as the reader has gone or `deadline` has passed,
-/// even in the middle of a poll of the stream or of a wait for room in the outbox. `to` is the session, the id, the
-/// kind and whether to compress, `None` on this node. A wait for credit, or for room in the outbox, longer than
-/// `starve` fails with `Timeout`.
+/// even in the middle of a poll of the stream or of a wait for room in the outbox. `to` is the session, the call's
+/// meter, the id, the kind and whether to compress, `None` on this node. A wait for credit, or for room in the outbox,
+/// longer than `starve` fails with `Timeout`.
 /// `Ok(true)` once the stream ended, `Ok(false)` once the reader has gone.
 async fn pump<R, E, S>(
     flow: &Arc<Flow>,
     parts: S,
     encode: fn(R) -> Result<Bytes, CallError>,
-    to: Option<(&Link, u64, u16, bool)>,
+    to: Option<(&Link, &Meter, u64, u16, bool)>,
     max: usize,
     deadline: Option<Instant>,
     starve: Option<Duration>,
@@ -648,13 +650,13 @@ where
         if part.len() > max {
             return Err(CallError::NotSent(SubmitReason::Oversized).into());
         }
-        let Some((link, id, kind, compress)) = to else {
+        let Some((link, meter, id, kind, compress)) = to else {
             flow.push(part);
             continue;
         };
         flow.spend(&part);
         let frame = Frame { kind, id, payload: part, compress, ..Frame::default() };
-        let mut submit = pin!(link.sender.submit(frame, deadline));
+        let mut submit = pin!(meter.submit(&link.sender, frame, deadline));
         // An outbox smaller than the window fills before the credit runs out: no room is as stuck as no credit.
         let mut stalled = starve.map(|starve| Box::pin(sleep(starve)));
         let sent = poll_fn(|cx| match gone(cx) {

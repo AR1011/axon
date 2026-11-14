@@ -14,14 +14,14 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axon::{ActorSystem, SpanKind, TraceContext, TraceId};
+use axon::{ActorSystem, Lane, SpanKind, TraceContext, TraceId};
 use axon_cluster::{
     Cluster, ClusterConfig, KEYED_ENDS, PaxosConfig, PaxosLeases, Placement, SeedConfig, SeedDiscovery, SeedServer,
     SeedServerConfig, SeedTimings, SpawnContext,
 };
 use axon_net::SharedSecret;
 use axon_stream::{DeliveryPolicy, RelayTimings, StreamEvent, StreamNode, StreamNodeConfig, SubscribeOptions};
-use axon_testkit::world::{Crash, Host, Wire, World, WorldConfig};
+use axon_testkit::world::{Carried, Crash, Host, Wire, World, WorldConfig};
 use axon_testkit::{check_seeds, seeds};
 use bytes::{Buf, Bytes};
 
@@ -156,6 +156,7 @@ async fn boot(host: Host, timings: Timings) -> Node {
     let mut cfg = ClusterConfig::new(host.addr(), transport, discovery.clone());
     let origin = host.name() == ORIGIN;
     cfg.labels = role(if origin { "origin" } else { "member" });
+    cfg.labels.insert("region".into(), region(host.name()).into());
     let mut paxos = PaxosConfig::new(SEEDS);
     paxos.store = Some(Arc::new(host.disk().dir("leases")));
     let mut streams = StreamNodeConfig::new(if origin { vec![] } else { vec![role("origin")] });
@@ -635,4 +636,73 @@ fn seed_link_lost_syn(seed: u64) {
 #[test]
 fn a_seed_link_redials_across_a_lost_syn_within_the_connect_timeout_and_keeps_the_node_listed() {
     check_seeds(seeds(0..16), seed_link_lost_syn).unwrap();
+}
+
+/// Sent by each region to each region on each lane: as the nodes' link meters count it, as the World carried it, and
+/// the connections it went on.
+type Pairs = BTreeMap<(String, String, Lane), (u64, u64, u64)>;
+
+fn pairs(w: &World<Node>) -> Pairs {
+    let mut pairs = Pairs::new();
+    for name in NODES {
+        let links = w.read(name, |n| n.cluster.stats().links).unwrap_or_default();
+        for link in links.into_iter().filter(|l| l.direction == "sent" && l.protocol.is_none()) {
+            pairs.entry((link.src_region, link.dst_region, link.lane)).or_default().0 += link.wire_bytes;
+        }
+    }
+    // The seed links are sessions of their own, not the cluster's.
+    for c in w.carried().into_iter().filter(|c| c.port != SEED_PORT) {
+        let (from, to) = (region(&c.from).to_owned(), region(&c.to).to_owned());
+        for (key, bytes) in [((from.clone(), to.clone(), c.lane), c.bytes[0]), ((to, from, c.lane), c.bytes[1])] {
+            let pair = pairs.entry(key).or_default();
+            (pair.1, pair.2) = (pair.1 + bytes, pair.2 + 1);
+        }
+    }
+    pairs
+}
+
+/// What each region's nodes metered as sent to each region on each lane is what the World carried there, less each
+/// connection's handshake, across a partition that closes sin's sessions and the dials after it, and no pair's count
+/// drops at any 100 ms: the closed sessions' bytes stay in.
+fn metered(seed: u64) {
+    /// A connection's handshake one way, at most: 110 bytes or so at wire v7.
+    const HANDSHAKE: u64 = 160;
+    let (mut w, seen) = start(seed, Timings::Wan);
+    let mut last = pairs(&w);
+    let mut never_drop = |w: &World<Node>| {
+        let now = pairs(w);
+        for (pair, (before, ..)) in &last {
+            let after = now.get(pair).map_or(0, |p| p.0);
+            assert!(after >= *before, "seed {seed}: {pair:?} went from {before} to {after} at {:?}", w.now());
+        }
+        last = now;
+    };
+    w.partition(&["sin"], &others("sin"));
+    // Past the 8 s idle timeout: every session to sin closes.
+    let until = w.now() + Duration::from_secs(20);
+    while w.now() < until {
+        run(&mut w, &seen, Duration::from_millis(100));
+        never_drop(&w);
+    }
+    w.heal();
+    let healed = w.now();
+    recovered(&mut w, &NODES, &FOLLOWERS, &seen, healed);
+    never_drop(&w);
+    seen.stop.set(true);
+    run(&mut w, &seen, Duration::from_secs(1));
+    never_drop(&w);
+    let carried = w.carried();
+    let to_sin = |c: &&Carried| c.port != SEED_PORT && (c.from == "sin" || c.to == "sin");
+    let closed = carried.iter().filter(to_sin).filter(|c| !c.open).count();
+    assert!(closed > 0, "seed {seed}: no session to sin closed");
+    for ((src, dst, lane), (metered, carried, connections)) in &last {
+        let what = format!("seed {seed}: {src} to {dst} on {lane:?}: metered {metered}, carried {carried}");
+        assert!(metered <= carried && carried - metered <= connections * HANDSHAKE, "{what} on {connections}");
+    }
+    println!("world digest wan_metered seed {seed}: {closed} of sin's sessions closed: {:016x}", w.digest());
+}
+
+#[test]
+fn each_region_pairs_meter_matches_what_its_sessions_moved_across_cuts() {
+    check_seeds(seeds(0..4), metered).unwrap();
 }

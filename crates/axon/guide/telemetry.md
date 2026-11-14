@@ -21,6 +21,15 @@ Telemetry omits reason-labelled counters and empty histograms until they have a 
 last sample, so their number does not grow with the cluster; `cluster.connections` counts them all. A connection is
 one lane of one peer, so a peer has up to three; a lane that is down is a row of the snapshot (`down_ms`) but has no
 series.
+`link.*` series are stored for every link, not only the busiest: what crossed between this node's region and each
+peer's, on each lane, since the node started. A region is the `region` label, `""` for none; a link counts from the
+moment the view names its peer, all of it, and a link that closes leaves its bytes in its region's, so these counters
+never go back while the node runs (`ClusterStats.links`). `link.wire_bytes` is the sessions' own count after compression,
+above TLS, without the handshake. `link.frames` and `link.frame_bytes` split the same frames by protocol: the header
+(32 bytes) and the payload before compression, exact for what was sent and an upper bound on what crossed when
+compressed. A protocol is its id in 16 hex digits, `axon.control` for the system endpoints, and `0000000000000000` for
+a frame to an endpoint this node does not have, or a reply or part whose call it no longer knows. At most regions² × 3 lanes × 2 directions × (1 + 2 × protocols)
+series a node.
 
 A batch carries a series when its value changed, and again `rewrite_unchanged` (30 s) after it was last carried, so a
 live series is stored at least once a minute (`HELD_MS`) however still it stands. The wait is timed on the batches'
@@ -80,6 +89,8 @@ store knows how far each node has reached even when nothing else moved.
 | `connection.rejected_frames`, sends refused locally; admitted frames are never dropped | counter | `peer`, `direction`, `lane`, `reason` (`full`, `closed`, `deadline`, `oversized`) |
 | `connection.queued_bytes` · `.queued_frames` · `.inbound_queued_bytes` · `.inbound_queued_frames` · `.pending_requests` · `.rtt` · `.tcp.rtt` · `.tcp.cwnd` (kernel `TCP_INFO`, sampled at each keepalive) | gauge | `peer`, `direction`, `lane` |
 | `connection.queue` · `.encode` · `.write` · `.decode` · `.rtt_distribution` · `.request_rtt` | histogram | `peer`, `direction`, `lane` |
+| `link.wire_bytes`, the sessions' bytes after compression | counter | `src_region`, `dst_region`, `lane`, `direction` (`sent`, `received`) |
+| `link.frames` · `.frame_bytes`, the header and the payload before compression | counter | `src_region`, `dst_region`, `lane`, `direction`, `protocol` |
 | `process.rss_bytes` · `.virtual_bytes` · `.cpu_percent` | gauge | |
 | `process.read_bytes` · `.written_bytes` | counter | |
 | `host.total_memory_bytes` · `.available_memory_bytes` · `.cpu_percent` | gauge | |

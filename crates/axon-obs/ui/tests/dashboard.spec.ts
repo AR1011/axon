@@ -238,6 +238,14 @@ test("the overview topology toggles labels and opens the full page", async ({ pa
   await expect(page.getByRole("tab", { name: /^attention/ })).toBeVisible();
 });
 
+test("the topology draws the regions and the bytes per second between them", async ({ page }) => {
+  await live(page, "/overview/topology");
+  const map = page.getByRole("group", { name: "Bytes per second between regions" });
+  await expect(map.locator('[data-region-edge="Reykjavík>Tokyo"]'), "an edge once two overviews have the link meters").toBeAttached();
+  await expect(map, "a node without a region label is in one of its own").toContainText("no region");
+  await expect(map.locator('[data-region-edge="Reykjavík>Tokyo"]')).toHaveAttribute("aria-label", /Reykjavík → Tokyo .*B\/s · Tokyo → Reykjavík .*B\/s/);
+});
+
 test("node tables sort, rows navigate, and history pauses off the chart tabs", async ({ page }) => {
   await live(page, "/nodes");
   await page.getByRole("button", { name: /^Name/ }).click();

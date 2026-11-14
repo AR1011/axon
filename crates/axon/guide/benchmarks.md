@@ -92,6 +92,27 @@ traced message costs what it did. What it costs: the untraced hosted path is 4�
 mailbox entry carries the 25-byte context in 32 bytes (`Option<TraceContext>`) and grew from 56 to 80 bytes; and the
 reader takes 3.4 µs a page rather than 1.5, outside the lock. It does not establish anything on a quiet box.
 
+### Link meters in wire v8
+
+[spec/lanes.md §8.1](../../../spec/lanes.md#81-link-meters-wire-v8) adds, on each frame the engine sends or reads, a
+relaxed add to two counts of its protocol's meter; a call sent, and a request read, find that meter first: a read
+lock on the link's meters, and for a request read a look-up of its endpoint. `perf route` and
+`remote_calls 2000000 5000000` (pinned to cores 0–11) before (b325213, tracing in wire v8) and after (link meters), on the same Ryzen 7 5800X, back to back,
+three rounds each; the range is given. The box was busy with other work: load 19–23 by `uptime` throughout.
+
+| | before | after |
+|---|---|---|
+| `perf route` direct, ns/msg | 101.5–161.1 | 102.7–163.3 |
+| `perf route` hash, ns/msg | 135.2–199.1 | 142.4–225.0 |
+| `remote_calls` sequential request, p50 | 83.0–99.6 µs | 26.3–97.7 µs |
+| `remote_calls` 256 concurrent requests, req/s | 145 657–937 436 | 126 691–863 691 |
+| `remote_calls` tells sent, msg/s | 1.29–2.82 M | 1.19–2.40 M |
+
+What this establishes: with this box's load, no difference shows; the noise is up to a factor of 6 between rounds of
+one build. `perf route` routes in one process and does not run the changed code, so its rows are a measure of that
+noise. It does not establish the cost of the adds, which is below what these runs can see; a quiet box and
+`scripts/bench.sh remote_calls` would.
+
 ## The gate (`scripts/bench.sh`)
 
 `scripts/bench.sh` runs the harnesses below on a bench box and judges each row against the baseline committed for its

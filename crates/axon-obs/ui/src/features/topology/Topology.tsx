@@ -17,6 +17,7 @@ import { connections, useLive } from "../../store";
 import { connectionRef, nodePath, roleOf, useSelectedConnection, useSelectedNode } from "../select";
 import { routeEdges } from "./edgePath";
 import { GraphCard } from "./GraphCard";
+import { RegionMap } from "./RegionMap";
 import { GRAPH_BUTTON, GraphControls } from "./GraphControls";
 import { useCamera } from "./useCamera";
 import { useNodeDrag } from "./useNodeDrag";
@@ -51,6 +52,7 @@ export function Topology({ fullPage = false }: { fullPage?: boolean }) {
   const now = useNow();
   const overview = useLive((s) => s.overview);
   const version = useLive((s) => s.version);
+  const regions = useLive((s) => s.regions);
   const [selectedNode, selectNode] = useSelectedNode();
   const [selectedConnection, selectConnection] = useSelectedConnection(undefined, false);
   const [mode, setMode] = useUrlState<LayoutMode>("layout", "connectivity");
@@ -226,6 +228,8 @@ export function Topology({ fullPage = false }: { fullPage?: boolean }) {
             })}
           </g>
         </svg>
+
+        {regions.length > 0 && <RegionMap edges={regions} />}
 
         <GraphControls k={camera.k} zoom={zoom} fit={fit} drag={drag}>
           <button type="button" disabled={!selectedId || !drag.positions.has(selectedId)} onClick={() => focus(drag.positions.get(selectedId!))} className={GRAPH_BUTTON}>Focus</button>

@@ -1,13 +1,13 @@
 //! Fault loops over an in-memory stream: the same exchange is run again and again with the Nth
 //! read or write of one side failing, for N = 1, 2, ... until a run finishes untouched, in plaintext
-//! and over TLS. Whatever breaks, neither side may hang, what arrived must be an unbroken prefix, and
-//! no credit may stay reserved.
+//! and over TLS. Whatever breaks, neither side may hang, what arrived must be an unbroken prefix, no
+//! counter may go backwards, and no credit may stay reserved.
 
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, ready};
 use std::time::Duration;
@@ -150,6 +150,18 @@ impl AsyncWrite for Faulty {
 /// Sends `FRAMES` frames and reads the peer's. Returns the ids that arrived, and how the session ended.
 async fn exchange(mut session: Session) -> (Vec<u64>, SessionStats) {
     let sender = session.sender.clone();
+    let (watched, done) = (sender.clone(), Arc::new(AtomicBool::new(false)));
+    let watching = tokio::spawn({
+        let done = done.clone();
+        async move {
+            let mut last = counters(&watched.stats());
+            while !done.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                last = forward(last, &watched.stats());
+            }
+            last
+        }
+    });
     let sending = tokio::spawn(async move {
         for id in 0..FRAMES {
             let payload = vec![id as u8; 3000].into();
@@ -187,7 +199,39 @@ async fn exchange(mut session: Session) -> (Vec<u64>, SessionStats) {
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    (seen, session.sender.stats())
+    done.store(true, Ordering::Relaxed);
+    let stats = session.sender.stats();
+    forward(watching.await.unwrap(), &stats);
+    (seen, stats)
+}
+
+/// The counters a session only ever adds to.
+fn counters(s: &SessionStats) -> [u64; 15] {
+    let [r0, r1, r2, r3] = s.tx_rejected;
+    [
+        s.tx_frames,
+        s.tx_wire_bytes,
+        s.tx_payload_bytes,
+        s.tx_compressed_frames,
+        s.tx_batches,
+        r0,
+        r1,
+        r2,
+        r3,
+        s.rx_frames,
+        s.rx_wire_bytes,
+        s.rx_payload_bytes,
+        s.rx_compressed_frames,
+        s.pings,
+        s.pongs,
+    ]
+}
+
+/// A counter that goes backwards: whatever broke the session, what it counted stays counted.
+fn forward(last: [u64; 15], now: &SessionStats) -> [u64; 15] {
+    let now = counters(now);
+    assert!(last.iter().zip(&now).all(|(a, b)| a <= b), "a counter went back from {last:?} to {now:?}");
+    now
 }
 
 fn reserved(s: &SessionStats) -> (usize, usize, usize) {

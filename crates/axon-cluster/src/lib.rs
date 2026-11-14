@@ -33,7 +33,7 @@ pub use discovery::{
     BoxFuture, DRAINING, Discovery, KINDS, LEAVE_REASON, LIFECYCLE, MemoryDiscovery, NodeRecord, ProviderInfo,
     ProviderLink, Snapshot, StaticDiscovery,
 };
-pub use engine::{Action, Authorizer, EngineStats, Parts, PeerStats, REJECTION_NAMES, Reply, Tls, Upload};
+pub use engine::{Action, Authorizer, EngineStats, LinkMeter, Parts, PeerStats, REJECTION_NAMES, Reply, Tls, Upload};
 pub use error::{CallError, ClusterError, DiscoveryError, OwnershipError, Rejection, Retry, SpawnRefusal};
 pub use membership::{
     Member, MemberChange, MembershipEvent, MembershipSubscription, NodeChange, NodeChanges, Nodes, View,

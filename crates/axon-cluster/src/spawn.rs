@@ -2055,8 +2055,8 @@ impl Watcher {
                 body.put_u32(hold.as_millis().try_into().unwrap_or(u32::MAX));
                 put_str(&mut body, &slot.0);
                 put_str(&mut body, &slot.1);
-                let (endpoint, schema, lane) = (WATCH, SYSTEM_SCHEMA, Lane::Control);
-                let target = Target { node: node.clone(), incarnation, endpoint, schema, lane };
+                let (protocol, endpoint, schema, lane) = (CONTROL_PROTOCOL, WATCH, SYSTEM_SCHEMA, Lane::Control);
+                let target = Target { node: node.clone(), incarnation, protocol, endpoint, schema, lane };
                 let mut answer = inner.engine.call(&target, REQUEST, body.freeze()).await?.ok_or(CallError::NoReply)?;
                 if answer.len() != 16 {
                     return Err(CallError::Codec("malformed watch reply".into()));
