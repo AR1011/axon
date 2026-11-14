@@ -968,6 +968,10 @@ impl<A: Authorizer> RelayCore<A> {
                 return Err(StreamError::InvalidOptions);
             }
         }
+        // The key conflicts before its generation does: `restart_stream` it, or close it first.
+        if self.originated.contains(key) {
+            return Err(StreamError::AlreadyExists);
+        }
         // A generation only goes up: the node's followers would move back to an older one.
         if self.hub.newest_generation(key).is_some_and(|newest| newest > generation) {
             return Err(RecoveryError::GenerationMismatch.into());

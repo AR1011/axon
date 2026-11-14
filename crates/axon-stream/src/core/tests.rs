@@ -805,6 +805,32 @@ fn a_parked_follower_in_a_newer_generation_refuses_an_open_of_an_older_one() {
     );
 }
 
+/// An open of a key this node originates is `AlreadyExists` in any generation, with `open_stream` and
+/// `open_stream_after`: in a newer one, where only the key conflicts, and in an older one, where the generation does
+/// too. The stream goes on as it was. Before, the older one was `GenerationMismatch`.
+#[test]
+fn an_open_of_a_key_the_node_originates_is_already_exists_before_its_generation_is_checked() {
+    let mut origin = RelayCore::new(&PeerId::new("o", 1), AllowAll, scaled()).expect("a valid config");
+    let log = MemoryStore::new(MemoryLimits::default()).expect("valid limits");
+    origin.set_history("md", Arc::new(Mutex::new(log)));
+    origin.open_stream(&key(0), 2, DeliveryPolicy::ReplayRequired).expect("opens");
+    let live = origin.subscribe(&key(0), SubscribeOptions::default()).expect("follows");
+    origin.publish(&key(0), vec![Bytes::from_static(b"x"); 3]).expect("publishes");
+    assert_eq!(records(&mut origin, live), vec![1, 2, 3]);
+    let opens = [1, 3].map(|generation| {
+        let after = Cursor { generation, sequence: 10 };
+        let opened = [
+            origin.open_stream(&key(0), generation, DeliveryPolicy::ReplayRequired),
+            origin.open_stream_after(&key(0), after, DeliveryPolicy::ReplayRequired),
+        ];
+        (generation, opened)
+    });
+    origin.publish(&key(0), vec![Bytes::from_static(b"x")]).expect("publishes");
+    let exists = || [Err(StreamError::AlreadyExists), Err(StreamError::AlreadyExists)];
+    assert_eq!(opens, [(1, exists()), (3, exists())]);
+    assert_eq!(seen(&mut origin, live), vec!["2 4..4".to_string()]);
+}
+
 /// Everything, except replay for the node it names.
 struct NoReplayTo(&'static str);
 
