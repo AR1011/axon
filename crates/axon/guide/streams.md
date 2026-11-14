@@ -154,8 +154,9 @@ A stream is a `StreamKey` (namespace + name) and a run of records numbered from 
 is `(generation, sequence)` and names the last record seen. Every hop keeps the origin's numbers, which is what lets
 any parent continue any child.
 
-A generation only goes up: `restart_stream` refuses one that is not above the current one, and a relay refuses a
-parent that shows a generation older than the newest it has seen, since that parent is behind the origin. The
+A generation only goes up: `restart_stream` refuses one that is not above the current one, an open of a key refuses
+one older than the node relays or a follower there holds (`GenerationMismatch`), and a relay refuses a parent that
+shows a generation older than the newest it has seen, since that parent is behind the origin. The
 start time in milliseconds is a generation that survives a restart of the publisher; a stream kept
 [on disk](#history-on-disk) resumes only when it is opened with the generation its files hold instead.
 
@@ -723,7 +724,8 @@ history source, then go on live (a follower denied `Access::Replay` is reset `Hi
 or paused old origin cannot close: its children move once the cluster calls it gone. Let the standby relay the key
 from the origin (its `upstream` names the origin's labels), so taking over is a relay opening a key it pulls.
 `open_stream_after` is refused `InvalidOptions` without a history source for the namespace, for a namespace kept on
-disk, for a `Compacted` policy, and behind the position the node already relays. `tests/world_relay.rs` and
+disk, for a `Compacted` policy, and behind the position the node already relays, and `GenerationMismatch` in a
+generation older than the node relays or its followers hold. `tests/world_relay.rs` and
 `tests/world_wan.rs` move an origin under a crash, a pause and a late close.
 
 ### Consumers

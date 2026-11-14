@@ -651,8 +651,9 @@ impl StreamNode {
     }
 
     /// Makes this node the key's origin. A key it relays becomes its own, and one it already originates is
-    /// `AlreadyExists`: `restart_stream` it, or `close_stream` it first. In a namespace with `open_streams`, the
-    /// stream holds one of its permits until it closes or this node goes.
+    /// `AlreadyExists`: `restart_stream` it, or `close_stream` it first. A generation older than the one this node
+    /// relays, or a follower here holds, is `GenerationMismatch`: a generation only goes up. In a namespace with
+    /// `open_streams`, the stream holds one of its permits until it closes or this node goes.
     ///
     /// It starts nothing until it is polled, and holds the node until it ends. With a
     /// [`disk`](StreamNodeConfig::disk), opening a stream the disk holds reads its newest segments back first, while

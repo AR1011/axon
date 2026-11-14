@@ -891,7 +891,8 @@ impl<A: Authorizer> RelayCore<A> {
     /// Opens the key in `after.generation` from `after.sequence + 1`, with an empty ring and the namespace's
     /// [`history`](Self::set_history) behind it, which serves every position up to `after`. `InvalidOptions` without
     /// one, on a key the disk keeps (it numbers a generation from record 1), for a `Compacted` stream (the history
-    /// holds no state), and `after` this node's own position in its generation, which would number records again.
+    /// holds no state), and `after` this node's own position in its generation, which would number records again;
+    /// `GenerationMismatch` in a generation older than the node or its followers hold, as for `open_stream`.
     pub fn open_stream_after(
         &mut self,
         key: &StreamKey,
@@ -966,6 +967,10 @@ impl<A: Authorizer> RelayCore<A> {
             {
                 return Err(StreamError::InvalidOptions);
             }
+        }
+        // A generation only goes up: the node's followers would move back to an older one.
+        if self.hub.newest_generation(key).is_some_and(|newest| newest > generation) {
+            return Err(RecoveryError::GenerationMismatch.into());
         }
         let pulled = self.feeds.contains_key(key);
         let last = self.cursor(key);

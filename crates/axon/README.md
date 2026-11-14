@@ -164,7 +164,7 @@ axon-stream (feature cluster)
       start records event host_tcp_limits where host_tcp() gives a wmem_max below max_push_window or an rmem_max below twice it ; .core.branch BranchLimits::BRANCH (32 MiB, 65536 records, 4096 events), half of it a stream's in flight to a child ; BranchLimits::default() (17 MiB, 65536, 4096), a subscription's limits, holds that, a push more
     node.stats().downstream[i]   a row per child and lane: .lane .channel .window_bytes .inflight_bytes .inflight_pushes .round_trip_us .delivery_rate .resent ; node.stats() .push_resent .push_skipped [duplicate, gap, retired] .push_capped
   key = StreamKey::new(namespace, name) (.namespace() .name())
-  node.open_stream(&key, generation, DeliveryPolicy::ReplayRequired).await? ; node.publish(&key, Vec<Bytes>)?
+  node.open_stream(&key, generation, DeliveryPolicy::ReplayRequired).await? ; node.publish(&key, Vec<Bytes>)?   GenerationMismatch for a generation older than the node relays or a follower there holds (either open)
     node.open_stream_after(&key, last: Cursor, policy).await?   a new origin goes on in last's generation from the next record, the namespace's history source behind it ; InvalidOptions without one, for a namespace on disk, Compacted, or behind the position the node relays
     DeliveryPolicy::Compacted(CompactLimits { max_keys, max_bytes })   records keyed(key, value), an empty value removes the key ; split_keyed(&record) ; the origin keeps the latest per key, a publish past the limits is Err(StateFull) and changes nothing
   node.subscribe(&key, SubscribeOptions { start: Live | After(cursor) | FollowAfter(cursor) | First | SnapshotThenLive, .. })? ; subscription.next().await -> StreamEvent   on any node

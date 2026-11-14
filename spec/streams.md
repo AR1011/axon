@@ -87,7 +87,9 @@ open "generation g after position p", but it is `pub(crate)` and only disk resum
   source behind it (§1). Without a source it is refused `InvalidOptions`: positions at or before `after` would be
   served by nobody. So is a namespace kept on disk (its files number the key from the disk's own last record), a
   `Compacted` policy (its state is not in the history source), and an `after` behind the position the node already
-  relays in that generation (it would number those records again, against rule 2).
+  relays in that generation (it would number those records again, against rule 2). An `after` in a generation older
+  than the node relays, or than a follower on it holds, parked ones too, is refused `GenerationMismatch`, as is an
+  `open_stream` of one: its followers would move back a generation.
 - The rule the guide gives becomes: a new origin keeps the generation only when it gives every position the same
   record. The application holds it with two rules, which [tla/OriginMove.tla](tla/OriginMove.tla) checks:
   1. publish a record only once the node that may take over holds it (publish after commit);
@@ -170,6 +172,9 @@ has no followers of its own behind the open (the fourth case above is tested in 
 - `crates/axon-stream/tests/hub.rs::a_follow_after_subscription_parks_at_a_close_and_goes_on_at_a_reopen_of_its_generation`
 - `crates/axon-stream/tests/hub.rs::a_follow_after_subscription_ends_generation_changed_at_a_new_generation`
 - `crates/axon-stream/src/node/tests.rs::open_stream_after_without_a_history_source_is_refused`
+- `crates/axon-stream/src/core/tests.rs::an_open_of_a_generation_older_than_the_node_holds_is_refused`: while the
+  relay holds a position in the newer generation, and after its parent closed the key, where only its follower holds
+  one. Before, the open took the key and the follower back a generation.
 - The rig: `move/m0` and `move/m1` in `examples/rig/src/streams.rs` (`Mover`). The owner of the eager key `mov`, which
   only b1 and b2 serve, opens both with `open_stream_after` after the record due last, or after the position its node
   relays where that is later, and closes them when it stops (drained or fenced). A record is a function of its position

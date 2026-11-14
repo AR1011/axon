@@ -738,6 +738,45 @@ fn a_relay_asks_again_after_the_position_its_stream_closed_at() {
     assert_eq!(starts, vec![StartPosition::After(Cursor { generation: 1, sequence: 33 })]);
 }
 
+/// A node opens a key it relays only in a generation no older than its own: an `open_stream` or an
+/// `open_stream_after` of an older one is refused `GenerationMismatch`, while the relay holds a position in the newer
+/// one and after its parent closed the key, where only its follower holds one. The node goes on relaying, and the
+/// follower stays in its generation. Before, the open took the key, and the follower, back a generation.
+#[test]
+fn an_open_of_a_generation_older_than_the_node_holds_is_refused() {
+    let rows = ["relaying", "closed"].map(|row| {
+        let now = Instant::now();
+        let (o, r) = (PeerId::new("o", 1), PeerId::new("r", 1));
+        let mut origin = RelayCore::new(&o, AllowAll, CoreConfig { relay: false, ..scaled() }).expect("a valid config");
+        origin.open_stream(&key(0), 2, DeliveryPolicy::ReplayRequired).expect("opens");
+        let mut relay = RelayCore::new(&r, AllowAll, CoreConfig { relay: true, ..scaled() }).expect("a valid config");
+        let log = MemoryStore::new(MemoryLimits::default()).expect("valid limits");
+        relay.set_history("md", Arc::new(Mutex::new(log)));
+        let live = relay.subscribe(&key(0), SubscribeOptions::default()).expect("follows");
+        ask(&mut origin, &o, &mut relay, &r, now);
+        origin.publish(&key(0), vec![Bytes::from_static(b"x"); 10]).expect("publishes");
+        deliver(&mut origin, &o, &mut relay, &r, now);
+        assert_eq!(records(&mut relay, live), (1..=10).collect::<Vec<_>>());
+        if row == "closed" {
+            origin.close_stream(&key(0)).expect("closes");
+            deliver(&mut origin, &o, &mut relay, &r, now);
+        }
+        let older = Cursor { generation: 1, sequence: 5 };
+        let refused = [
+            relay.open_stream(&key(0), 1, DeliveryPolicy::ReplayRequired),
+            relay.open_stream_after(&key(0), older, DeliveryPolicy::ReplayRequired),
+        ];
+        if row == "relaying" {
+            origin.publish(&key(0), vec![Bytes::from_static(b"x")]).expect("publishes");
+            deliver(&mut origin, &o, &mut relay, &r, now);
+        }
+        (row, refused, seen(&mut relay, live), relay.is_subscribed(live))
+    });
+    let mismatch = || Err(StreamError::Recovery(RecoveryError::GenerationMismatch));
+    let refused = [mismatch(), mismatch()];
+    assert_eq!(rows, [("relaying", refused.clone(), vec!["2 11..11".into()], true), ("closed", refused, vec![], true)]);
+}
+
 /// Everything, except replay for the node it names.
 struct NoReplayTo(&'static str);
 

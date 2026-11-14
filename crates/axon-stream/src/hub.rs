@@ -1777,6 +1777,14 @@ impl<A: Authorizer> StreamHub<A> {
         ids.iter().filter_map(start).collect()
     }
 
+    /// The newest generation the key's stream, or a follower of it, parked ones too, holds a position in.
+    pub(crate) fn newest_generation(&self, key: &StreamKey) -> Option<u64> {
+        let stream = self.streams.get(key);
+        let ids = stream.map_or(&[][..], |s| &s.subscribers).iter().chain(self.parked.get(key).into_iter().flatten());
+        let followers = ids.filter_map(|id| self.subs.get(id).filter(|s| s.follow)?.at);
+        stream.and_then(|s| s.cursor).into_iter().chain(followers).map(|c| c.generation).max()
+    }
+
     pub fn is_recovering(&self, id: u64) -> bool {
         self.subs.get(&id).is_some_and(|s| matches!(s.phase, Phase::Recovering { .. }))
     }
