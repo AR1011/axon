@@ -298,3 +298,38 @@ async fn a_links_meters_take_in_the_sessions_it_closed() {
     }
     settled(&b).await;
 }
+
+/// A tell to an endpoint that has gone, and the verdict that says so, count under its protocol at the node that
+/// withdrew it, not under 0. The sender keeps nothing of a tell it sent, so the verdict counts under 0 there.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tell_to_an_endpoint_that_has_gone_counts_under_its_protocol() {
+    let discovery = MemoryDiscovery::new();
+    let (a, b) = (node("a", &discovery).await, node("b", &discovery).await);
+    sees(&a, 2).await;
+    sees(&b, 2).await;
+    let actor = a.system.spawn(Counter { total: 0, tag: "a".into() }).start().unwrap();
+    let published = a.cluster.publish::<CounterApi>(&actor, "counter").unwrap();
+    let remote = b.cluster.resolve::<CounterApi>("counter").await.unwrap();
+    a.cluster.unpublish(&published);
+    remote.tell(Op::Add(1)).await.unwrap();
+    // Counts by direction and protocol, over every lane.
+    let counts = |node: &Node| {
+        let mut counts = BTreeMap::new();
+        for ((.., direction, protocol), [n, ..]) in meters(node) {
+            if let Some(protocol) = protocol {
+                *counts.entry((direction, protocol)).or_insert(0) += n;
+            }
+        }
+        counts
+    };
+    let (counter, zero) = ("00000000000000c0".to_owned(), "0000000000000000".to_owned());
+    let verdict = ("received", zero.clone());
+    eventually("b hears that the endpoint has gone", async || counts(&b).contains_key(&verdict)).await;
+    let (at_a, at_b) = (counts(&a), counts(&b));
+    let at =
+        |counts: &BTreeMap<_, u64>, direction, protocol: &String| counts.get(&(direction, protocol.clone())).copied();
+    assert_eq!((at(&at_a, "received", &counter), at(&at_a, "sent", &counter)), (Some(1), Some(1)), "{at_a:?}");
+    assert!(at_a.keys().all(|(_, protocol)| *protocol != zero), "{at_a:?}");
+    assert_eq!((at(&at_b, "sent", &counter), at(&at_b, "received", &zero)), (Some(1), Some(1)), "{at_b:?}");
+    settled(&b).await;
+}

@@ -144,7 +144,14 @@ pub(crate) struct Registry {
     by_name: HashMap<Arc<str>, Vec<u64>>,
     /// Here, under the lock every admission already takes, so that swapping it costs a call nothing.
     authorizer: Option<Arc<dyn Authorizer>>,
+    /// The id and protocol of the endpoint withdrawn last in each of `RETIRED` slots, by `id % RETIRED`: what still
+    /// comes for one counts under its protocol.
+    retired: HashMap<u64, (u64, u64)>,
 }
+
+/// Slots of `Registry::retired`. Dynamic ids are handed out in turn, so an endpoint is remembered until one withdrawn
+/// after it lands in its slot.
+const RETIRED: u64 = 256;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Target {
@@ -977,9 +984,9 @@ impl Engine {
     /// A fence: once this returns, no admission through `id` is running or can start.
     pub fn unregister(&self, id: u64) {
         let mut registry = self.registry.write();
-        if let Some(entry) = registry.by_id.remove(&id)
-            && let Some(ids) = registry.by_name.get_mut(&entry.name)
-        {
+        let Some(entry) = registry.by_id.remove(&id) else { return };
+        registry.retired.insert(id % RETIRED, (id, entry.protocol));
+        if let Some(ids) = registry.by_name.get_mut(&entry.name) {
             ids.retain(|i| *i != id);
             if ids.is_empty() {
                 registry.by_name.remove(&entry.name);
@@ -1160,11 +1167,16 @@ impl Engine {
         }
     }
 
-    /// The meter a call to `endpoint` counts under, whichever lane it came on: 0 for an endpoint that is not here.
+    /// The meter a call to `endpoint` counts under, whichever lane it came on: a withdrawn endpoint's protocol while
+    /// `Registry::retired` holds it, else 0 for an endpoint that is not here.
     fn protocol_of(&self, endpoint: u64) -> u64 {
-        match endpoint {
-            ..FIRST_DYNAMIC => CONTROL_PROTOCOL,
-            _ => self.registry.read().by_id.get(&endpoint).map_or(0, |entry| entry.protocol),
+        if endpoint < FIRST_DYNAMIC {
+            return CONTROL_PROTOCOL;
+        }
+        let registry = self.registry.read();
+        match registry.by_id.get(&endpoint) {
+            Some(entry) => entry.protocol,
+            None => registry.retired.get(&(endpoint % RETIRED)).filter(|(id, _)| *id == endpoint).map_or(0, |r| r.1),
         }
     }
 

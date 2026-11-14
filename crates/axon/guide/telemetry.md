@@ -27,8 +27,11 @@ moment the view names its peer, all of it, and a link that closes leaves its byt
 never go back while the node runs (`ClusterStats.links`). `link.wire_bytes` is the sessions' own count after compression,
 above TLS, without the handshake. `link.frames` and `link.frame_bytes` split the same frames by protocol: the header
 (32 bytes) and the payload before compression, exact for what was sent and an upper bound on what crossed when
-compressed. A protocol is its id in 16 hex digits, `axon.control` for the system endpoints, and `0000000000000000` for
-a frame to an endpoint this node does not have, or a reply or part whose call it no longer knows. At most regions² × 3 lanes × 2 directions × (1 + 2 × protocols)
+compressed. A protocol is its id in 16 hex digits, `axon.control` for the system endpoints, and `0000000000000000` where
+the node does not know the protocol: for an endpoint it does not have, a reply or part whose call it no longer knows,
+and at a tell's sender the verdict that its endpoint has gone. A message to an endpoint the node withdrew,
+such as a tell to an actor that has gone, still counts under its protocol while the node holds it: the last endpoint
+withdrawn in each of 256 slots by id. At most regions² × 3 lanes × 2 directions × (1 + 2 × protocols)
 series a node.
 
 A batch carries a series when its value changed, and again `rewrite_unchanged` (30 s) after it was last carried, so a

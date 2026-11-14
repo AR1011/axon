@@ -1069,7 +1069,8 @@ fault into that feature.
 Every link's frames and bytes by region pair, lane and protocol, never reset ([lanes.md §8.1](lanes.md#81-link-meters-wire-v8)).
 The session counters under `wire_bytes` are checked never to go back in each run of the transport's fault loops.
 Gaps: no test fills a session to show that a refused send is not counted (overload), and none sends a frame to an
-endpoint the node does not have, which counts under protocol 0 (hostile input).
+endpoint the node never had, which counts under protocol 0 (hostile input). One to an endpoint it withdrew counts
+under that endpoint's protocol: `crates/axon-cluster/tests/cluster/lanes.rs::a_tell_to_an_endpoint_that_has_gone_counts_under_its_protocol`.
 
 | Fault | Covered by |
 |---|---|

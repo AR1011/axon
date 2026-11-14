@@ -519,8 +519,11 @@ protocol it carried, and folds them into its region's totals when the link is dr
 no total drops between a close and a read. A link's region is read from the view when the link opens, on each protocol's first
 frame, on each read and at the close, and fixed once found; a link accepted before the view lists its peer is left out
 of the totals until it does, and then counted whole. Only a link whose peer the view named at none of those times is
-filed under `""`. A frame to an endpoint this node does not have, or a reply whose call is
-gone, counts under protocol 0. `wire_bytes` leaves out the handshake (about 110 bytes each way in plaintext).
+filed under `""`. A message to an endpoint this node withdrew counts under that endpoint's protocol while the node still
+holds it: the last withdrawn in each of 256 slots by id, so a tell to an actor that has gone and the verdict that says
+so count under the tell's protocol where it was refused. A message to an endpoint this node does not have and does not
+hold, a reply whose call is gone, and the verdict at the node that sent the tell, which keeps nothing of a tell once it
+is sent, count under protocol 0. `wire_bytes` leaves out the handshake (about 110 bytes each way in plaintext).
 
 **Problem.** The `connection.*` series answer "which sessions are busy", not "what crossed this link". Telemetry
 stores series for the `sample_connections` busiest sessions only (32, `crates/axon-obs/src/telemetry.rs:35,62`, sorted

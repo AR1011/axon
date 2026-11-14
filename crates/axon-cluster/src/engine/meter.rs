@@ -66,7 +66,8 @@ pub(crate) struct LinkMeters {
 }
 
 impl LinkMeters {
-    /// The meter of `protocol`'s frames on this link; 0 for frames whose call has gone or whose endpoint is not here. A
+    /// The meter of `protocol` on this link; 0 where the protocol is unknown: a call that has gone, an endpoint that is
+    /// not here and was not withdrawn lately, and the verdict on a tell to an endpoint that has gone, at its sender. A
     /// protocol's first frame also looks for the peer's region, so that a link the view named while it was up keeps it.
     pub fn meter(&self, protocol: u64) -> Arc<Meter> {
         // Read-locked on the path every frame takes, so the callers on one link do not queue on each other.
@@ -187,7 +188,7 @@ impl Meters {
     }
 }
 
-/// `axon.control` for the system endpoints, else the id as 16 hex digits. 0 counts frames whose call had gone.
+/// `axon.control` for the system endpoints, else the id as 16 hex digits. 0 counts what went under no known protocol.
 fn label(protocol: u64) -> String {
     match protocol {
         CONTROL_PROTOCOL => "axon.control".into(),
