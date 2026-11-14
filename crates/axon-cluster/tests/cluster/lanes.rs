@@ -287,6 +287,8 @@ async fn a_links_meters_take_in_the_sessions_it_closed() {
     let echoes = Some("0000000000000007".to_owned());
     let row = |direction| (String::new(), String::new(), Lane::Live, direction, echoes.clone());
     let wire = |direction| (String::new(), String::new(), Lane::Live, direction, None);
+    // A frame is counted sent once it is in the outbox, so b can read a's last reply before a counts it.
+    eventually("a counts its last reply sent", async || meters(&a)[&row("sent")][0] == 10).await;
     let (at_a, at_b) = (meters(&a), meters(&b));
     assert_eq!(at_b[&row("sent")][0], 10, "b's requests");
     assert_eq!(at_b[&row("received")], [10, 10 * (32 + 100), 0], "b's replies");
@@ -324,7 +326,12 @@ async fn a_tell_to_an_endpoint_that_has_gone_counts_under_its_protocol() {
     };
     let (counter, zero) = ("00000000000000c0".to_owned(), "0000000000000000".to_owned());
     let verdict = ("received", zero.clone());
-    eventually("b hears that the endpoint has gone", async || counts(&b).contains_key(&verdict)).await;
+    // A frame is counted sent once it is in the outbox, so the peer can read it before its sender counts it.
+    let sent = ("sent", counter.clone());
+    eventually("b hears that the endpoint has gone, and a counts it sent", async || {
+        counts(&b).contains_key(&verdict) && counts(&a).get(&sent) == Some(&1)
+    })
+    .await;
     let (at_a, at_b) = (counts(&a), counts(&b));
     let at =
         |counts: &BTreeMap<_, u64>, direction, protocol: &String| counts.get(&(direction, protocol.clone())).copied();
