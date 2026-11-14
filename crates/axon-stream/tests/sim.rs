@@ -2,7 +2,9 @@
 //! namespaces, each with relay timings of its own. Relays are killed and restarted, links are cut and healed, answers
 //! are lost, and a request the child timed out can reach its parent late, behind the child's newer ones, its answer
 //! later still. Several pushes are in flight to each child; one can be lost, come twice, or come before one sent
-//! ahead of it. Every leaf subscriber must still see each record exactly once, in order.
+//! ahead of it. The origin closes its keys and opens them again after their last record, at once or later, as a
+//! producer that moves does: relays see the close and go on in the same generation. Every leaf subscriber must still
+//! see each record exactly once, in order.
 #![expect(
     clippy::disallowed_methods,
     reason = "single-threaded and seeded: Instant::now is only the base of the virtual clock"
@@ -14,8 +16,11 @@ use std::time::{Duration, Instant};
 use axon::Lane;
 use axon_stream::*;
 use bytes::Bytes;
+use numbered::Numbered;
 use push::{answer, decode, deliver};
 
+#[path = "common/numbered.rs"]
+mod numbered;
 mod push;
 
 const RELAYS: [&str; 2] = ["r1", "r2"];
@@ -82,13 +87,19 @@ struct Sim {
     published: u64,
     subs: HashMap<Sub, u64>,
     seen: HashMap<Sub, Vec<u64>>,
-    readied: HashSet<Sub>,
+    /// The last position each subscription was given, by a `Ready` or a batch.
+    readied: HashMap<Sub, Cursor>,
     /// The record each leaf's subscription must take next, from its last `Ready` or record; 0 after a `Ready` that
     /// names no position, which another must follow.
     next: HashMap<Sub, u64>,
     resets: usize,
     /// Leaves that subscribe from the first record once this many are out.
     late: Vec<(&'static str, u64)>,
+    /// The origin closes its keys and opens them again.
+    moves: bool,
+    /// The origin's keys are closed: nothing is published until they are opened again.
+    closed: bool,
+    closes: usize,
 }
 
 impl Sim {
@@ -120,10 +131,13 @@ impl Sim {
             published: 0,
             subs: HashMap::new(),
             seen: HashMap::new(),
-            readied: HashSet::new(),
+            readied: HashMap::new(),
             next: HashMap::new(),
             resets: 0,
             late: Vec::new(),
+            moves: false,
+            closed: false,
+            closes: 0,
         };
         if keys > KEYS / 2 {
             // The second namespace waits on its parents by timings of its own, drawn from the seed.
@@ -275,6 +289,9 @@ impl Sim {
     }
 
     fn publish(&mut self, count: u64) {
+        if self.closed {
+            return;
+        }
         let records: Vec<Bytes> =
             (1..=count).map(|n| Bytes::copy_from_slice(&(self.published + n).to_be_bytes())).collect();
         for k in 0..self.keys {
@@ -285,7 +302,7 @@ impl Sim {
         let (due, late): (Vec<_>, Vec<_>) = late.into_iter().partition(|(_, at)| *at <= self.published);
         self.late = late;
         for (leaf, _) in due {
-            self.subscribe(leaf, StartPosition::First);
+            self.subscribe(leaf, from_record_1(self.moves));
         }
     }
 
@@ -304,6 +321,7 @@ impl Sim {
         while let Some(event) = core.poll(id) {
             match event {
                 StreamEvent::Batch(batch) => {
+                    self.readied.insert(sub, batch.cursor());
                     let next = self.next.insert(sub, batch.first() + batch.len() as u64);
                     assert!(
                         next.is_none_or(|n| n == batch.first()),
@@ -334,14 +352,17 @@ impl Sim {
                 }
                 StreamEvent::Ready { start } => {
                     self.next.insert(sub, start.map_or(0, |s| s.sequence + 1));
-                    if start.is_some() && !self.readied.insert(sub) {
+                    // Another position is a move, unless it is where the subscription already is.
+                    if let Some(s) = start
+                        && self.readied.insert(sub, s).is_some_and(|was| was != s)
+                    {
                         assert!(may_reset, "{leaf} was moved");
                         self.resets += 1;
                     }
                 }
                 StreamEvent::End(reason) => panic!("{leaf} ended: {reason:?}"),
-                // The origin never goes: a close is not a loss.
-                StreamEvent::OriginLost => panic!("{leaf} was told its origin is lost"),
+                // The origin never goes: only a key closed for long is told as lost.
+                StreamEvent::OriginLost => assert!(self.closes > 0, "{leaf} was told its origin is lost"),
                 _ => {}
             }
         }
@@ -350,7 +371,7 @@ impl Sim {
     fn step(&mut self, chaos: bool, may_reset: bool) {
         self.now_ms += self.pick(40) as u64;
         let names: Vec<&'static str> = self.nodes.keys().copied().collect();
-        match self.pick(if chaos { 14 } else { 10 }) {
+        match self.pick(if chaos { 15 } else { 10 }) {
             0 | 1 => {
                 let name = names[self.pick(names.len())];
                 self.reconcile(name);
@@ -404,13 +425,42 @@ impl Sim {
                 }
             }
             12 => self.now_ms += self.pick(4000) as u64,
+            13 if self.moves => {
+                if !self.closed {
+                    self.close();
+                }
+                if self.closed && self.pick(2) == 0 {
+                    self.reopen();
+                }
+            }
             _ => {}
         }
+    }
+
+    fn close(&mut self) {
+        for k in 0..self.keys {
+            self.origin().close_stream(&key_of(k)).unwrap();
+        }
+        (self.closed, self.closes) = (true, self.closes + 1);
+    }
+
+    /// Opened again after the last record, as the node a producer moved to opens it.
+    fn reopen(&mut self) {
+        let after = Cursor { generation: 1, sequence: self.published };
+        for k in 0..self.keys {
+            // The application's log, which serves what the ring of the key opened again does not hold.
+            self.origin().set_history(key_of(k).namespace(), std::sync::Arc::new(Numbered(0)));
+            self.origin().open_stream_after(&key_of(k), after, DeliveryPolicy::ReplayRequired).unwrap();
+        }
+        self.closed = false;
     }
 
     /// Heals everything and runs rounds until the tree has long settled.
     fn settle(&mut self, may_reset: bool) {
         self.cut.clear();
+        if self.closed {
+            self.reopen();
+        }
         for relay in RELAYS {
             if !self.nodes[relay].up {
                 let incarnation = self.nodes[relay].incarnation + 1;
@@ -442,24 +492,33 @@ impl Sim {
     }
 }
 
-fn run(seed: u64, cfg: CoreConfig, may_reset: bool) -> Sim {
-    faults(Sim::new(seed, cfg, KEYS), seed, may_reset)
+/// With `moves`, the origin closes its keys and opens them again after their last record among the faults.
+fn run(seed: u64, cfg: CoreConfig, may_reset: bool, moves: bool) -> Sim {
+    let mut sim = Sim::new(seed, cfg, KEYS);
+    sim.moves = moves;
+    faults(sim, seed, may_reset)
 }
 
 /// The origin has published 40 records before any leaf subscribes, and every leaf starts from the first: two at
 /// once, the other two only once more are out, while relays fail and return.
-fn late(seed: u64, cfg: CoreConfig, may_reset: bool) -> Sim {
+fn late(seed: u64, cfg: CoreConfig, may_reset: bool, moves: bool) -> Sim {
     let mut sim = Sim::empty(seed, cfg, KEYS);
+    sim.moves = moves;
     for _ in 0..10 {
         sim.publish(4);
     }
     for leaf in ["l1", "l2"] {
-        sim.subscribe(leaf, StartPosition::First);
+        sim.subscribe(leaf, from_record_1(moves));
     }
     sim.late = vec![("l3", 41 + sim.pick(100) as u64), ("l4", 41 + sim.pick(200) as u64)];
     let sim = faults(sim, seed, may_reset);
     assert!(sim.late.is_empty(), "seed {seed}: a leaf never subscribed");
     sim
+}
+
+/// From record 1: `First` where the origin never closes its keys, else followed, as a plain `First` ends at a close.
+fn from_record_1(moves: bool) -> StartPosition {
+    if moves { StartPosition::FollowAfter(Cursor { generation: 1, sequence: 0 }) } else { StartPosition::First }
 }
 
 /// A calm start, then faults, then the checks that hold once everything has healed.
@@ -506,7 +565,7 @@ fn every_record_once(sim: &Sim, seed: u64) {
 fn every_leaf_sees_every_record_once_while_relays_fail_and_return() {
     let (mut switches, mut lost, mut deepest) = (0, 0, 0);
     for seed in 0..300 {
-        let sim = run(seed, CoreConfig::default(), false);
+        let sim = run(seed, CoreConfig::default(), false, true);
         every_record_once(&sim, seed);
         for leaf in LEAVES {
             let stats = sim.nodes[leaf].core.stats();
@@ -524,7 +583,7 @@ fn every_leaf_sees_every_record_once_while_relays_fail_and_return() {
 fn pushes_resent_after_a_lost_answer_are_applied_once() {
     let (mut resent, mut duplicates, mut gaps) = (0, 0, 0);
     for seed in 0..100 {
-        let sim = run(seed, CoreConfig::default(), false);
+        let sim = run(seed, CoreConfig::default(), false, true);
         every_record_once(&sim, seed);
         for node in sim.nodes.values() {
             let stats = node.core.stats();
@@ -539,14 +598,15 @@ fn pushes_resent_after_a_lost_answer_are_applied_once() {
 #[test]
 fn a_late_leaf_that_starts_from_the_first_record_gets_the_origin_history_through_relays() {
     for seed in 0..150 {
-        every_record_once(&late(seed, CoreConfig::default(), false), seed);
+        // Half the seeds start `First` with no moves, half `FollowAfter` record 0 with them.
+        every_record_once(&late(seed, CoreConfig::default(), false, seed % 2 == 0), seed);
     }
 }
 
 #[test]
 fn the_same_seed_gives_the_same_run() {
     for schedule in [run, late] {
-        let (a, b) = (schedule(11, CoreConfig::default(), true), schedule(11, CoreConfig::default(), true));
+        let (a, b) = (schedule(11, CoreConfig::default(), true, true), schedule(11, CoreConfig::default(), true, true));
         assert_eq!((&a.seen, a.published, a.resets), (&b.seen, b.published, b.resets));
         for name in a.nodes.keys() {
             let stats = |sim: &Sim| format!("{:?}", sim.nodes[name].core.stats());
@@ -563,9 +623,13 @@ fn history_that_nobody_holds_is_an_explicit_reset_never_a_silent_gap() {
     cfg.branch.max_records = 8;
     let mut resets = 0;
     for seed in 0..150 {
-        resets += run(seed, cfg.clone(), true).resets;
+        // The origin keeps no history beyond its ring: it never moves.
+        resets += run(seed, cfg.clone(), true, false).resets;
         // No ring holds the first of the 40 records the late leaves ask for.
-        assert!(late(seed, cfg.clone(), true).resets >= LEAVES.len(), "seed {seed}: a first start was not reset");
+        assert!(
+            late(seed, cfg.clone(), true, false).resets >= LEAVES.len(),
+            "seed {seed}: a first start was not reset"
+        );
     }
     assert!(resets > 0, "the schedule never lost history");
 }
@@ -1038,7 +1102,7 @@ fn a_new_generation_its_parent_cannot_give_from_record_1_comes_from_the_live_edg
     drive(&mut cores, tree, &mut now, 10);
     let events = leaf(&mut cores);
     assert_eq!(events[events.len() - 2..], [ready(2, 3), "2 4..5".into()], "{events:?}");
-    assert_eq!(cores["l"].1.stats().refusals[Status::Forbidden as usize], 1);
+    assert_eq!(cores["l"].1.stats().refusals[Status::HistoryUnavailable as usize], 1, "the replay it may not have");
 
     let tree: Tree = &[("l", &["o", "x"])];
     let rings = vec![RingLimits { namespace: "md".into(), max_records: 4, max_bytes: 1 << 20 }];

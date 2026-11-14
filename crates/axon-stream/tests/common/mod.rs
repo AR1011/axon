@@ -14,6 +14,8 @@ use axon_stream::{StreamKey, StreamNodeConfig};
 use axon_testkit::world::Host;
 use bytes::{Buf, Bytes};
 
+pub mod numbered;
+
 pub const SECRET: &str = "at-least-16-bytes-long";
 
 pub fn labels(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {

@@ -38,13 +38,22 @@ b1..b5 (nodes):      unit rig-node: rig node → cluster :7400, seed server :700
   TLS with the CA rotated mid-run; `SEEDS=n` for seed servers on b1..bn only).
 - **Shell for mechanisms, Python 3.9 stdlib for the schedule and the checker, Rust for the workload.** No new crate
   dependency.
-- **One box** (`RIG_BOX=<ip>`, `setup.sh --netns`): the five nodes are network namespaces `b1..b5` at 10.77.0.1..5
-  on bridge `rig0`, units `rig-node@bN` on CPUs 1-7, the store, nemesis and checker on CPU 0, `~/rig/in.sh` in place
-  of ssh, and every per-node name (unit, dm device, mount, env, fault state) suffixed by `ops/node.sh`. The box shares
+- **One box** (`RIG_BOX=<ip>`, `setup.sh --netns`): the five nodes b1..b5 are network namespaces `axrig-b1..5` at
+  10.77.0.1..5 on bridge `axrig0` (names no other work on a shared box uses), units `rig-node@axrig-bN` on CPUs 1 to
+  the last, the store, nemesis and checker on CPU 0, `~/rig/in.sh` in place of ssh, and every per-node name (unit, dm
+  device, mount, env, fault state) suffixed by `ops/node.sh`. The box shares
   one clock and one kernel, so it runs the 57 classes not tagged `five-box-only` or `global`; its timings are rerun on
   five boxes before they are written up. With `RIG_BOX` unset every name is the plain one and plans are the same bytes.
   Each namespace gets [wan.md § 8](wan.md#8-host-tcp-settings)'s TCP settings (bbr, no slow start after idle,
   `tcp_wmem` and `tcp_rmem` to 64 and 128 MiB), which Linux keeps per namespace; `doctor` prints them per node.
+- **The boxes.** The five boxes are gone, so runs are one box: build-1 (24 threads, 62 GB), with other jobs' builds and
+  namespaces beside the rig. Its root disk is small, so the ten 4 GiB images are links from
+  `/var/lib/rig-{journal,streams}-axrig-bN.img` to its data disk, made before `setup` (`teardown` removes the links, not
+  their targets). `rig.sh build` as ubuntu waits for a build slot it cannot take there (`/tmp/box-slots` belongs to the
+  box's build user), so the rig is built as that user through `scripts/box.sh` and its two binaries are copied into
+  `~/rig` with `build.json` as `build` writes it. The devbox and the third box run other projects' containers, so the
+  rig stays off them. Their load reaches every node at once: a quiet window where all five nodes' p99 passes 1 s
+  together fails `latency-quiet` without a fault behind it.
 
 Runs land in `~/rig/runs/<run>/` on b1 and `target/rig/<run>/` on the laptop, never committed; `<run>` is
 `<mode>-<yyyymmdd-hhmm>-s<seed>`. `meta.json` records seed, mode, commit, binary and plan sha256, plan version, nodes,
@@ -110,7 +119,7 @@ writing `LOG_DIR/<w>.jsonl` and bumping the tick that `heartbeat` watches. The d
 | Workload | What it runs |
 |---|---|
 | `accounts` | kind `acct`, keys `k0..`, through the store and a journal per node, and a client task per key on every node |
-| `streams` | `STREAMS` (4) streams per node, 20 records a second each, followed by every other node through the next node as relay; even followers `Live`, odd ones `After` their cursor and dropping it every 10 to 30 s |
+| `streams` | `STREAMS` (4) streams per node, 20 records a second each, followed by every other node through the next node as relay; even followers `Live`, odd ones `After` their cursor and dropping it every 10 to 30 s; and `move/m0`, `move/m1`, opened by the owner of an eager key that only b1 and b2 serve, after the last position either holds, and closed when it stops, followed by every node (`m0` `Live`, `m1` `FollowAfter` its cursor) ([streams.md § 2](streams.md#2-moving-an-origin)) |
 | `quota` | before `streams`: `Quotas` rates `q0`, `q1`, `r0` and permits `p0`, `p1` across the nodes, and the stream node's limits on namespace `lim` |
 | `disk` | after `streams`: streams `disk-<node>/s0..1` kept on the streams disk (`DiskConfig`, 8 MiB retention), resumed after each crash |
 | `compacted` | after `streams`: one `Compacted` stream per node (32 keys at most), followed by `SnapshotThenLive` rounds |
@@ -340,9 +349,9 @@ read a node's clock leave out nodes with a clock fault. Every invariant has a pl
 | `causality` | no second of a node's clock has a `send` after its record or an `ack` before it by over 2 ms (§ The clock map), away from a clock fault |
 | `growth` | no incarnation keeps growing in memory or fds, and threads stay under a ceiling (§ Resource growth) |
 | `stream-dup`, `stream-reorder`, `stream-gap` | no follower logged one: every record once, in order, or an announced reset (no clock: fail inside a probe too) |
-| `stream-liveness` | a follower's silence on a stream whose origin is up ends by max(start, episode end) + `B` |
+| `stream-liveness` | a follower's silence on a stream whose origin is up (on a `move/` stream: b1 or b2) ends by max(start, episode end) + `B` |
 | `stream-publish-err` | no origin's publish failed |
-| `stream-reset-kind` | no end for `Gap`, `InvalidRecovery`, `Revoked`, no refused or broken subscribe, `SlowConsumer` or `GlobalCapacity` only where the path was starved or the follower restarted in the `B` before |
+| `stream-reset-kind` | no end for `Gap`, `InvalidRecovery`, `Revoked`, no refused or broken subscribe, `SlowConsumer` or `GlobalCapacity` only where the path was starved or the follower restarted in the `B` before; on a `move/` stream no `GenerationChanged` or `StreamClosed` either, so every cursor goes on across a move |
 | `stream-quiet` | no reset, failed subscribe or `origin_lost` in a quiet window, unless the origin's disk lied in the 120 s before (or until it publishes past where it was) or refuses every publish |
 | `stream-generation` | each origin opens each stream above its last generation |
 | `disk-durable` | no follower logged `rewritten` (a restart went back over a record it had), unless the origin's streams disk lied in between |
@@ -522,9 +531,6 @@ Each is axon's, not the rig's, and reproduces on one box with every workload
 
 | Finding | Invariant | Reproduce |
 |---|---|---|
-| A `Live` follower is sent its generation again from record 1 after the origin resumes that generation from disk | `stream-dup` | `SMOKE_MIX=0 smoke 51`, episode 1 (`acceptors-rolling`); its replay hit 1 of 3 |
-| A `Live` follower skips the last durable record when the origin resumes from disk | `stream-gap` | `chaos 62 5`, episode 4 (`splitdelay` then a kill of the origin); its replay hit 0 of 3 |
-| A `Live` follower skips records after `OriginLost`, with no `Ready` or reset, when its relay restarted or it lost the origin during a cut | `stream-gap` | `chaos 52 8`; `ONLY=roll,cfgdrift,scale,cold-restart,acceptors-restart,acceptors-rolling,leave-minority,leave-slowdisk smoke 7`, episode 3, some runs |
 | A late first use of a permit key can exceed [quotas.md § 5](quotas.md)'s new-key bound: 16 of 12 against 15 when every node took its fallback share at once and one took a second before releasing | `quota-permit-over` | `pairs 53 8`, before any fault |
 | An isolated node answered `/readyz` 200 through an `isolate` (once) | `readyz-isolated` (probe) | `chaos 47 8` |
 
@@ -532,9 +538,22 @@ Each is axon's, not the rig's, and reproduces on one box with every workload
 
 | Finding | Seen | Test that now holds it |
 |---|---|---|
+| A `Live` follower was sent its generation again from record 1 after the origin resumed that generation from disk: a follower now keeps its own position and is never given a record twice, and a relay whose stream closed asks again after the position it closed at ([streams.md § 3](streams.md#3-follower-positions)) | `SMOKE_MIX=0 smoke 51`, episode 1, `stream-dup` | `hub.rs::a_follower_never_sees_a_position_twice_or_moves_past_one_whatever_its_relay_adopts` (a), `core/tests.rs::a_relay_asks_again_after_the_position_its_stream_closed_at`, the `stream_core` fuzz oracle |
+| A `Live` follower skipped the last durable record when the origin resumed from disk: a position past the next one now ends a follower with `ResetRequired(HistoryUnavailable)`, and its relay asks after its own position first | `chaos 62 5`, episode 4, `stream-gap` | `hub.rs::a_follower_never_sees_a_position_twice_or_moves_past_one_whatever_its_relay_adopts` (b), `core/tests.rs::a_relay_asks_again_after_the_position_its_stream_closed_at`, the `stream_core` fuzz oracle |
+| A `Live` follower skipped records after `OriginLost`, with no `Ready` or reset: a batch past its position ends it with `ResetRequired(HistoryUnavailable)`, and a new generation reaches it after a `Ready` | `chaos 52 8`, `stream-gap` | `hub.rs::a_follower_never_sees_a_position_twice_or_moves_past_one_whatever_its_relay_adopts` (c), the `stream_core` fuzz oracle |
 | After a partition healed, a caller waited up to the redial backoff's 30 s cap to reach an owner; `ClusterConfig::backoff` now caps it at 2 s. Every World test had shortened the cap, hence `scripts/check.sh timing` | night 2609, `liveness-after` | `world_faults.rs::calls_resume_within_the_redial_cap_once_a_long_cut_heals`, the shipped timings in `crates/axon-stream/tests/world.rs` |
 | A node that took a paused owner's keys handed them back only at its next discovery resync: a stale view now asks for a snapshot on each heartbeat | smoke 501, `liveness-after` | `world_leases.rs::every_op_answers_within_two_leases_of_a_paused_owners_resume`, `tests/cluster/discovery.rs::a_stale_view_is_fresh_again_once_its_watched_provider_answers_and_a_hung_one_holds_no_heartbeat_back` |
 | A key started elsewhere while its owner restarted stayed where no caller looked | smoke 31, `liveness-after` | `world_leases.rs::a_key_started_elsewhere_while_its_owner_restarted_goes_back_to_it` |
 | Eager keys lost for good while their node stayed a member: a key whose actor saw its lease lapse before the renew loop did was released and forgotten; a key handed back at a heal, whose new owner had answered and then could not take the lease in time, was let go by both nodes; and keys still to start again were dropped when their node left | chaos-20261001-1931-s1001, `SMOKE_MIX=0 smoke 61` (after a `bridge`), `eager-restart` | `world_eager.rs::an_eager_key_fenced_by_its_own_turn_on_a_node_that_stays_a_member_starts_again`, `::an_eager_key_handed_back_to_a_node_whose_start_then_fails_starts_again`, `::an_eager_key_lost_just_before_its_node_leaves_runs_on_a_survivor` |
 | Eager keys were not started again after every acceptor restarted at once: the restarted acceptors listed no key as anyone's. Each acceptor now logs who holds each key (`PaxosConfig::store`, the node's `LEASE_DIR`), and a node where a kind turns eager restarts every lapsed lease nobody released ([paxos-leases.md § 4.1](paxos-leases.md#41-the-lease-log)) | `WORKLOADS=accounts,eager ONLY=acceptors-restart smoke 43` (all 100 keys down), `eager-restart` | `world_eager.rs::every_eager_key_runs_again_after_every_acceptor_restarts_at_once`, `::every_eager_key_runs_again_after_a_cold_restart`, `::the_eager_keys_of_a_node_that_never_returns_from_a_cold_restart_run_on_the_others`, the restarts of every acceptor in `paxos/sim.rs` |
 | A clean leave behind a slow disk let the actors' drain spend all of `shutdown_timeout`; actors now drain until a quarter is left | `leave-slowdisk`, `shutdown-bounded` | `crates/axon/src/system.rs` `coordinate` |
+
+The three stream rows' seeds, rerun on build-1 with the move streams (2026-11-14). With the default workloads
+`SMOKE_MIX=0 smoke 51` and `chaos 62 5` passed, and `chaos 52 8` failed only `latency-quiet`, every node at once before
+the first episode. With every workload
+(`WORKLOADS=accounts,quota,streams,disk,compacted,eager,watch,idle,echo,blob,local`, so disk streams resume from disk:
+74, 24 and 16 judged) every stream and disk invariant held in all three, and all three
+failed on quotas: `quota-retry` 369, 495 and 1426 times (a rate refusal told to wait 127 ms to 1 s where its bucket is
+126 ms; on `q0`, `q1`, `lim`, and `r0` in the chaos runs), with `quota-rate-over`, `quota-permit-over`, `lim-rate` and
+`lim-open`; and `chaos 52 8` on `eager-restart` (e6, e62 and e92 fenced in episode 3 and not run again). Those are not
+looked into yet.

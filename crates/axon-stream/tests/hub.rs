@@ -298,6 +298,118 @@ fn a_relay_that_lost_its_position_resets_a_follower_rather_than_move_it_within_t
     assert_eq!(drain(&mut hub, id, 8), (vec![4], None));
 }
 
+/// A follower holds its own position: whatever position its relay stream takes after a close or a reset, it is given
+/// each record once, or reset where it would move past one.
+#[test]
+fn a_follower_never_sees_a_position_twice_or_moves_past_one_whatever_its_relay_adopts() {
+    let at = |sequence| Cursor { generation: 7, sequence };
+    let reset = Some(StreamEvent::ResetRequired(ResetReason::HistoryUnavailable));
+    type Then = fn(&mut StreamHub, &Store);
+    type Drained = (Vec<u64>, Option<StreamEvent>);
+    let cases: [(&str, Then, Drained); 3] = [
+        (
+            "a close, a reopen from record 1",
+            |hub, store| {
+                hub.close_stream(&me(), &key(), EndReason::StreamClosed).unwrap();
+                hub.open_relay_stream(&me(), &key(), DeliveryPolicy::ReplayRequired).unwrap();
+                hub.adopt_relay_stream(&me(), &key(), Cursor { generation: 7, sequence: 0 }).unwrap();
+                store.lock().unwrap().remove(&key());
+                store.lock().unwrap().open(&key(), 7).unwrap();
+                accept(hub, store, 1, 8);
+            },
+            (vec![6, 7, 8], None),
+        ),
+        (
+            "a reset, a position past the follower's",
+            |hub, _| {
+                hub.reset_relay_stream(&me(), &key(), ResetReason::GenerationChanged).unwrap();
+                hub.adopt_relay_stream(&me(), &key(), Cursor { generation: 7, sequence: 8 }).unwrap();
+            },
+            (vec![], reset.clone()),
+        ),
+        (
+            "a reset, a batch past the follower's position",
+            |hub, _| {
+                hub.reset_relay_stream(&me(), &key(), ResetReason::GenerationChanged).unwrap();
+                hub.accept_batch(&me(), &key(), batch(7, 9, 2)).unwrap();
+            },
+            (vec![], reset),
+        ),
+    ];
+    let (mut want, mut got) = (Vec::new(), Vec::new());
+    for (case, then, wanted) in cases {
+        let (mut hub, store) = relay_hub();
+        let id = hub.follow(&me(), &key(), SubscribeOptions::default()).unwrap();
+        hub.adopt_relay_stream(&me(), &key(), at(0)).unwrap();
+        accept(&mut hub, &store, 1, 5);
+        assert_eq!(drain(&mut hub, id, 8).0, [1, 2, 3, 4, 5], "{case}");
+        then(&mut hub, &store);
+        let ended = wanted.1.is_some();
+        got.push((case, drain(&mut hub, id, 8), ended.then(|| (hub.stats().subscriptions, hub.total_queued()))));
+        want.push((case, wanted, ended.then_some((0, (0, 0)))));
+    }
+    assert_eq!(got, want);
+}
+
+/// A `FollowAfter` subscription replays from its cursor, then waits through a close with its position and goes on when
+/// the key is opened again in its generation: here, relayed from the node that took the key over after 5. A plain
+/// `After` ends at the close.
+#[test]
+fn a_follow_after_subscription_parks_at_a_close_and_goes_on_at_a_reopen_of_its_generation() {
+    let at = |sequence| Cursor { generation: 7, sequence };
+    let (mut hub, store) = hub();
+    publish(&mut hub, &store, 1..=5, 2);
+    let follow = SubscribeOptions { start: StartPosition::FollowAfter(at(2)), ..Default::default() };
+    let follows = hub.subscribe(&me(), &key(), follow, Some(store.clone())).unwrap();
+    let plain = hub.subscribe(&me(), &key(), after(2), Some(store.clone())).unwrap();
+    assert_eq!(drain(&mut hub, follows, 2), (vec![3, 4, 5], None));
+    assert_eq!(drain(&mut hub, plain, 2), (vec![3, 4, 5], None));
+
+    hub.close_stream(&me(), &key(), EndReason::StreamClosed).unwrap();
+    assert_eq!(drain(&mut hub, plain, 2), (vec![], Some(StreamEvent::End(EndReason::StreamClosed))));
+    assert_eq!((drain(&mut hub, follows, 2), hub.demand_count(&key())), ((vec![], None), 1));
+    hub.open_relay_stream(&me(), &key(), DeliveryPolicy::ReplayRequired).unwrap();
+    hub.adopt_relay_stream(&me(), &key(), at(5)).unwrap();
+    hub.accept_batch(&me(), &key(), batch(7, 6, 3)).unwrap();
+    let readies = [hub.poll(follows), hub.poll(follows)];
+    assert_eq!(readies, [None, Some(at(5))].map(|start| Some(StreamEvent::Ready { start })));
+    assert_eq!(drain(&mut hub, follows, 2), (vec![6, 7, 8], None));
+}
+
+/// A `FollowAfter` subscription keeps its generation: a restart, or an open of the next one here or relayed, ends it
+/// `ResetRequired(GenerationChanged)` where a `Live` follower would go on.
+#[test]
+fn a_follow_after_subscription_ends_generation_changed_at_a_new_generation() {
+    type Then = fn(&mut StreamHub);
+    let cases: [(&str, Then); 3] = [
+        ("a restart", |hub| hub.restart_stream(&me(), &key(), 8).unwrap()),
+        ("a close, an open of the next", |hub| {
+            hub.close_stream(&me(), &key(), EndReason::StreamClosed).unwrap();
+            hub.open_stream(&me(), &key(), 8, DeliveryPolicy::ReplayRequired).unwrap();
+        }),
+        ("a close, a relay that adopts the next", |hub| {
+            hub.close_stream(&me(), &key(), EndReason::StreamClosed).unwrap();
+            hub.open_relay_stream(&me(), &key(), DeliveryPolicy::ReplayRequired).unwrap();
+            hub.adopt_relay_stream(&me(), &key(), Cursor { generation: 8, sequence: 0 }).unwrap();
+        }),
+    ];
+    let (mut want, mut got) = (Vec::new(), Vec::new());
+    for (case, then) in cases {
+        let (mut hub, store) = hub();
+        publish(&mut hub, &store, 1..=3, 3);
+        let follow = SubscribeOptions {
+            start: StartPosition::FollowAfter(Cursor { generation: 7, sequence: 1 }),
+            ..Default::default()
+        };
+        let id = hub.subscribe(&me(), &key(), follow, Some(store.clone())).unwrap();
+        assert_eq!(drain(&mut hub, id, 8), (vec![2, 3], None), "{case}");
+        then(&mut hub);
+        got.push((case, drain(&mut hub, id, 8), hub.stats().subscriptions));
+        want.push((case, (vec![], Some(StreamEvent::ResetRequired(ResetReason::GenerationChanged))), 0));
+    }
+    assert_eq!(got, want);
+}
+
 /// The follower a lost position would skip ends alone, with what it had queued: the stream and a follower that came
 /// after the give-up carry on.
 #[test]
@@ -609,6 +721,83 @@ fn a_source_that_skips_records_is_a_reset_not_a_gap() {
     publish(&mut hub, &store, 1..=10, 5);
     let id = hub.subscribe(&me(), &key(), after(2), Some(Arc::new(Lying(store)))).unwrap();
     assert_eq!(drain(&mut hub, id, 3), (vec![], Some(StreamEvent::ResetRequired(ResetReason::Gap))));
+}
+
+/// History that must be read before it is served: `Pending` until it has landed.
+struct Reading {
+    log: Store,
+    landed: std::sync::atomic::AtomicBool,
+    asked: std::sync::atomic::AtomicUsize,
+}
+
+impl RecoverySource for Reading {
+    fn available_range(&self, key: &StreamKey) -> Result<ReplayRange, RecoveryError> {
+        self.log.available_range(key)
+    }
+
+    fn read_after(
+        &self,
+        key: &StreamKey,
+        after: Cursor,
+        through: u64,
+        bounds: ReadBounds,
+    ) -> Result<Vec<SequencedBatch>, RecoveryError> {
+        use std::sync::atomic::Ordering::SeqCst;
+        if !self.landed.load(SeqCst) {
+            self.asked.fetch_add(1, SeqCst);
+            return Err(RecoveryError::Pending);
+        }
+        self.log.read_after(key, after, through, bounds)
+    }
+}
+
+#[test]
+fn a_source_that_answers_pending_keeps_the_subscription_recovering_until_woken() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (mut hub, store) = hub();
+    publish(&mut hub, &store, 1..=10, 4);
+    let source = Arc::new(Reading { log: store.clone(), landed: false.into(), asked: 0.into() });
+    let id = hub.subscribe(&me(), &key(), after(0), Some(source.clone())).unwrap();
+    assert_eq!(hub.poll(id), Some(StreamEvent::Ready { start: Some(Cursor { generation: 7, sequence: 0 }) }));
+    let page = ReadBounds { max_records: 100, max_bytes: 1 << 20 };
+    let pending = Err(StreamError::Recovery(RecoveryError::Pending));
+    assert_eq!(hub.drive_recovery(id, page), pending);
+    publish(&mut hub, &store, 11..=12, 2);
+    source.landed.store(true, SeqCst);
+    // Not asked again until it is woken, though the read has landed.
+    assert_eq!(hub.drive_recovery(id, page), pending);
+    assert_eq!((source.asked.load(SeqCst), hub.poll(id)), (1, None));
+    assert!(hub.is_recovering(id) && !hub.reads_history(id));
+    assert_eq!(hub.history_ready(&key()), vec![id]);
+    assert!(hub.reads_history(id));
+    assert_eq!(drain(&mut hub, id, 3), ((1..=12).collect(), None));
+    assert_eq!(hub.history_ready(&key()), Vec::<u64>::new());
+}
+
+#[test]
+fn a_replay_from_the_source_runs_to_the_cut_and_each_live_record_follows_once() {
+    for page in [1, 3, 7, 100] {
+        let (mut hub, _) = hub();
+        // The application writes its log before it publishes, so the log runs ahead of the stream.
+        let mut log = MemoryStore::new(MemoryLimits::default()).unwrap();
+        log.open(&key(), 7).unwrap();
+        log.append(&key(), &batch(7, 1, 30)).unwrap();
+        for n in 1..=20 {
+            hub.publish(&me(), &key(), vec![record(n)]).unwrap();
+        }
+        let id = hub.subscribe(&me(), &key(), after(5), Some(Arc::new(Mutex::new(log)))).unwrap();
+        let mut live = 21..=30;
+        while hub.is_recovering(id) {
+            hub.drive_recovery(id, ReadBounds { max_records: page, max_bytes: 1 << 20 }).unwrap();
+            if let Some(n) = live.next() {
+                hub.publish(&me(), &key(), vec![record(n)]).unwrap();
+            }
+        }
+        for n in live {
+            hub.publish(&me(), &key(), vec![record(n)]).unwrap();
+        }
+        assert_eq!(drain(&mut hub, id, page), ((6..=30).collect(), None), "page {page}");
+    }
 }
 
 struct NoRange;

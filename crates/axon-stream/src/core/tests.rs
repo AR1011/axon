@@ -38,7 +38,13 @@ fn follow(origin: &mut RelayCore, child: &PeerId, keys: usize, now: Instant) {
 }
 
 /// The child asks its parent until it has nothing more to ask.
-fn ask(parent: &mut RelayCore, p: &PeerId, child: &mut RelayCore, c: &PeerId, now: Instant) {
+pub(crate) fn ask<A: Authorizer, B: Authorizer>(
+    parent: &mut RelayCore<A>,
+    p: &PeerId,
+    child: &mut RelayCore<B>,
+    c: &PeerId,
+    now: Instant,
+) {
     for _ in 0..8 {
         let asked = child.reconcile(std::slice::from_ref(p), now);
         if asked.is_empty() {
@@ -69,7 +75,7 @@ pub(crate) fn deliver<A: Authorizer, B: Authorizer>(
     pushes
 }
 
-fn records(core: &mut RelayCore, id: u64) -> Vec<u64> {
+pub(crate) fn records<A: Authorizer>(core: &mut RelayCore<A>, id: u64) -> Vec<u64> {
     let mut seen = Vec::new();
     while let Some(event) = core.poll(id) {
         if let StreamEvent::Batch(batch) = event {
@@ -708,4 +714,418 @@ fn a_default_subscriber_holds_the_pushes_of_a_round_trip_applied_back_to_back() 
     println!("at most {peak} bytes of one stream in a round trip");
     assert!(peak > half, "never past half the branch in flight: {peak}");
     assert_eq!(seen, (1..=records as u64).collect::<Vec<_>>());
+}
+
+/// A relay whose stream closed asks its parent again after the position it closed at, so an open of the same
+/// generation goes on from there for its followers, and not from record 1.
+#[test]
+fn a_relay_asks_again_after_the_position_its_stream_closed_at() {
+    let now = Instant::now();
+    let (o, r) = (PeerId::new("o", 1), PeerId::new("r", 1));
+    let mut origin = origin(&scaled(), 1, 32);
+    let mut relay = RelayCore::new(&r, AllowAll, CoreConfig { relay: true, ..scaled() }).expect("a valid config");
+    let follower = relay.subscribe(&key(0), SubscribeOptions::default()).expect("follows");
+    ask(&mut origin, &o, &mut relay, &r, now);
+    origin.publish(&key(0), vec![Bytes::from_static(b"x")]).expect("publishes");
+    deliver(&mut origin, &o, &mut relay, &r, now);
+    assert_eq!(records(&mut relay, follower), vec![33]);
+    origin.close_stream(&key(0)).expect("closes");
+    deliver(&mut origin, &o, &mut relay, &r, now);
+    // Past any refusal backoff: the relay asks for the key again.
+    let later = now + Duration::from_secs(60);
+    let asked = relay.reconcile(std::slice::from_ref(&o), later);
+    let starts: Vec<_> = asked.iter().flat_map(|(_, i)| &i.wants).map(|w| w.start).collect();
+    assert_eq!(starts, vec![StartPosition::After(Cursor { generation: 1, sequence: 33 })]);
+}
+
+/// A node opens a key it relays only in a generation no older than its own: an `open_stream` or an
+/// `open_stream_after` of an older one is refused `GenerationMismatch`, while the relay holds a position in the newer
+/// one and after its parent closed the key, where only its follower holds one. The node goes on relaying, and the
+/// follower stays in its generation. Before, the open took the key, and the follower, back a generation.
+#[test]
+fn an_open_of_a_generation_older_than_the_node_holds_is_refused() {
+    let rows = ["relaying", "closed"].map(|row| {
+        let now = Instant::now();
+        let (o, r) = (PeerId::new("o", 1), PeerId::new("r", 1));
+        let mut origin = RelayCore::new(&o, AllowAll, CoreConfig { relay: false, ..scaled() }).expect("a valid config");
+        origin.open_stream(&key(0), 2, DeliveryPolicy::ReplayRequired).expect("opens");
+        let mut relay = RelayCore::new(&r, AllowAll, CoreConfig { relay: true, ..scaled() }).expect("a valid config");
+        let log = MemoryStore::new(MemoryLimits::default()).expect("valid limits");
+        relay.set_history("md", Arc::new(Mutex::new(log)));
+        let live = relay.subscribe(&key(0), SubscribeOptions::default()).expect("follows");
+        ask(&mut origin, &o, &mut relay, &r, now);
+        origin.publish(&key(0), vec![Bytes::from_static(b"x"); 10]).expect("publishes");
+        deliver(&mut origin, &o, &mut relay, &r, now);
+        assert_eq!(records(&mut relay, live), (1..=10).collect::<Vec<_>>());
+        if row == "closed" {
+            origin.close_stream(&key(0)).expect("closes");
+            deliver(&mut origin, &o, &mut relay, &r, now);
+        }
+        let older = Cursor { generation: 1, sequence: 5 };
+        let refused = [
+            relay.open_stream(&key(0), 1, DeliveryPolicy::ReplayRequired),
+            relay.open_stream_after(&key(0), older, DeliveryPolicy::ReplayRequired),
+        ];
+        if row == "relaying" {
+            origin.publish(&key(0), vec![Bytes::from_static(b"x")]).expect("publishes");
+            deliver(&mut origin, &o, &mut relay, &r, now);
+        }
+        (row, refused, seen(&mut relay, live), relay.is_subscribed(live))
+    });
+    let mismatch = || Err(StreamError::Recovery(RecoveryError::GenerationMismatch));
+    let refused = [mismatch(), mismatch()];
+    assert_eq!(rows, [("relaying", refused.clone(), vec!["2 11..11".into()], true), ("closed", refused, vec![], true)]);
+}
+
+/// A follower parked on a node that closed a key it originated holds the node's generation: an `open_stream` or an
+/// `open_stream_after` of an older one is refused `GenerationMismatch`, and an open of a newer one goes on, with the
+/// follower in it. Without the parked follower counted, the open of generation 1 took it back a generation.
+#[test]
+fn a_parked_follower_in_a_newer_generation_refuses_an_open_of_an_older_one() {
+    let mut origin = RelayCore::new(&PeerId::new("o", 1), AllowAll, scaled()).expect("a valid config");
+    let log = MemoryStore::new(MemoryLimits::default()).expect("valid limits");
+    origin.set_history("md", Arc::new(Mutex::new(log)));
+    origin.open_stream(&key(0), 2, DeliveryPolicy::ReplayRequired).expect("opens");
+    let live = origin.subscribe(&key(0), SubscribeOptions::default()).expect("follows");
+    origin.publish(&key(0), vec![Bytes::from_static(b"x"); 10]).expect("publishes");
+    assert_eq!(records(&mut origin, live), (1..=10).collect::<Vec<_>>());
+    origin.close_stream(&key(0)).expect("closes");
+    let parked = (origin.hub.has_stream(&key(0)), origin.hub.newest_generation(&key(0)));
+    let older = Cursor { generation: 1, sequence: 5 };
+    let refused = [
+        origin.open_stream(&key(0), 1, DeliveryPolicy::ReplayRequired),
+        origin.open_stream_after(&key(0), older, DeliveryPolicy::ReplayRequired),
+    ];
+    let newer = origin.open_stream(&key(0), 3, DeliveryPolicy::ReplayRequired);
+    origin.publish(&key(0), vec![Bytes::from_static(b"x")]).expect("publishes");
+    let mismatch = || Err(StreamError::Recovery(RecoveryError::GenerationMismatch));
+    assert_eq!(
+        (parked, refused, newer, seen(&mut origin, live)),
+        ((false, Some(2)), [mismatch(), mismatch()], Ok(()), vec!["3 1..1".to_string()])
+    );
+}
+
+/// An open of a key this node originates is `AlreadyExists` in any generation, with `open_stream` and
+/// `open_stream_after`: in a newer one, where only the key conflicts, and in an older one, where the generation does
+/// too. The stream goes on as it was. Before, the older one was `GenerationMismatch`.
+#[test]
+fn an_open_of_a_key_the_node_originates_is_already_exists_before_its_generation_is_checked() {
+    let mut origin = RelayCore::new(&PeerId::new("o", 1), AllowAll, scaled()).expect("a valid config");
+    let log = MemoryStore::new(MemoryLimits::default()).expect("valid limits");
+    origin.set_history("md", Arc::new(Mutex::new(log)));
+    origin.open_stream(&key(0), 2, DeliveryPolicy::ReplayRequired).expect("opens");
+    let live = origin.subscribe(&key(0), SubscribeOptions::default()).expect("follows");
+    origin.publish(&key(0), vec![Bytes::from_static(b"x"); 3]).expect("publishes");
+    assert_eq!(records(&mut origin, live), vec![1, 2, 3]);
+    let opens = [1, 3].map(|generation| {
+        let after = Cursor { generation, sequence: 10 };
+        let opened = [
+            origin.open_stream(&key(0), generation, DeliveryPolicy::ReplayRequired),
+            origin.open_stream_after(&key(0), after, DeliveryPolicy::ReplayRequired),
+        ];
+        (generation, opened)
+    });
+    origin.publish(&key(0), vec![Bytes::from_static(b"x")]).expect("publishes");
+    let exists = || [Err(StreamError::AlreadyExists), Err(StreamError::AlreadyExists)];
+    assert_eq!(opens, [(1, exists()), (3, exists())]);
+    assert_eq!(seen(&mut origin, live), vec!["2 4..4".to_string()]);
+}
+
+/// Everything, except replay for the node it names.
+struct NoReplayTo(&'static str);
+
+impl Authorizer for NoReplayTo {
+    fn authorize(&self, peer: &PeerId, _: &StreamKey, access: Access) -> bool {
+        access != Access::Replay || &*peer.node != self.0
+    }
+}
+
+/// What a subscription is given, a batch as its generation and range, without the `Ready`s.
+fn seen<A: Authorizer>(core: &mut RelayCore<A>, id: u64) -> Vec<String> {
+    std::iter::from_fn(|| core.poll(id))
+        .filter_map(|event| match event {
+            StreamEvent::Batch(b) => Some(format!("{} {}..{}", b.generation(), b.first(), b.last())),
+            StreamEvent::Ready { .. } => None,
+            other => Some(format!("{other:?}")),
+        })
+        .collect()
+}
+
+/// A relay its parent may not replay to asks again after the position its stream closed at. A parent that has gone
+/// past it refuses the start as `HistoryUnavailable`, not `Forbidden`, so the relay takes the stream live and its
+/// follower, which missed records, is reset. Before, the relay asked after the position forever and the follower
+/// heard nothing.
+#[test]
+fn a_relay_its_parent_may_not_replay_to_goes_on_live_after_a_close() {
+    // Records the origin publishes before the relay asks again, and what the relay's follower then sees.
+    let reset = format!("{:?}", StreamEvent::ResetRequired(ResetReason::HistoryUnavailable));
+    let rows: [(usize, Vec<String>); 2] = [(0, vec!["1 34..34".into()]), (2, vec![reset])];
+    for (early, expected) in rows {
+        let now = Instant::now();
+        let (o, r) = (PeerId::new("o", 1), PeerId::new("r", 1));
+        let mut origin =
+            RelayCore::new(&o, NoReplayTo("r"), CoreConfig { relay: false, ..scaled() }).expect("a valid config");
+        let log = MemoryStore::new(MemoryLimits::default()).expect("valid limits");
+        origin.set_history("md", Arc::new(Mutex::new(log)));
+        origin.open_stream(&key(0), 1, DeliveryPolicy::ReplayRequired).expect("opens");
+        origin.publish(&key(0), vec![Bytes::from_static(b"x"); 32]).expect("publishes");
+        let mut relay = RelayCore::new(&r, AllowAll, CoreConfig { relay: true, ..scaled() }).expect("a valid config");
+        let follower = relay.subscribe(&key(0), SubscribeOptions::default()).expect("follows");
+        ask(&mut origin, &o, &mut relay, &r, now);
+        origin.publish(&key(0), vec![Bytes::from_static(b"x")]).expect("publishes");
+        deliver(&mut origin, &o, &mut relay, &r, now);
+        assert_eq!(records(&mut relay, follower), vec![33]);
+        origin.close_stream(&key(0)).expect("closes");
+        deliver(&mut origin, &o, &mut relay, &r, now);
+        origin
+            .open_stream_after(&key(0), Cursor { generation: 1, sequence: 33 }, DeliveryPolicy::ReplayRequired)
+            .expect("opens after");
+        for _ in 0..early {
+            origin.publish(&key(0), vec![Bytes::from_static(b"x")]).expect("publishes");
+        }
+        // Past any refusal backoff and the upstream timeout, twice: the relay asks, then gives up the position.
+        let mut at = now;
+        for _ in 0..4 {
+            at += Duration::from_secs(60);
+            ask(&mut origin, &o, &mut relay, &r, at);
+            deliver(&mut origin, &o, &mut relay, &r, at);
+        }
+        origin.publish(&key(0), vec![Bytes::from_static(b"x")]).expect("publishes");
+        deliver(&mut origin, &o, &mut relay, &r, at);
+        assert_eq!(seen(&mut relay, follower), expected, "{early} records published before the relay asked again");
+    }
+}
+
+/// A standby that takes a key up after its origin, from the history it keeps, opens it at the last record the history
+/// holds, past what reached it as a relay. Its own followers behind the open replay the rest from that history and go
+/// on live, each record once, a follower still replaying its start too. Before, both were reset as if the records
+/// were lost.
+#[test]
+fn a_follower_on_the_standby_behind_the_open_replays_the_rest_from_the_history() {
+    let now = Instant::now();
+    let (o, s) = (PeerId::new("o", 1), PeerId::new("s", 1));
+    let cfg = CoreConfig { relay: false, ..scaled() };
+    let mut origin = RelayCore::new(&o, AllowAll, cfg).expect("a valid config");
+    origin.open_stream(&key(0), 1, DeliveryPolicy::ReplayRequired).expect("opens");
+    let mut standby = RelayCore::new(&s, AllowAll, CoreConfig { relay: true, ..scaled() }).expect("a valid config");
+    // The history the standby keeps: every record the origin committed, ahead of what it relayed.
+    let log = Arc::new(Mutex::new(MemoryStore::new(MemoryLimits::default()).expect("valid limits")));
+    lock(&log).open(&key(0), 1).expect("opens");
+    let batch = SequencedBatch::new(1, 1, vec![Bytes::from_static(b"x"); 20]).expect("a batch");
+    lock(&log).append(&key(0), &batch).expect("appends");
+    standby.set_history("md", log);
+    let live = standby.subscribe(&key(0), SubscribeOptions::default()).expect("follows");
+    ask(&mut origin, &o, &mut standby, &s, now);
+    origin.publish(&key(0), vec![Bytes::from_static(b"x"); 10]).expect("publishes");
+    deliver(&mut origin, &o, &mut standby, &s, now);
+    assert_eq!(records(&mut standby, live), (1..=10).collect::<Vec<_>>());
+    // Subscribed from record 1 and not polled: it is still replaying its start from the ring.
+    let start = StartPosition::FollowAfter(Cursor { generation: 1, sequence: 0 });
+    let after = standby.subscribe(&key(0), SubscribeOptions { start, ..Default::default() }).expect("follows after");
+    // Records 11 to 20 never reach the standby as a relay.
+    origin.publish(&key(0), vec![Bytes::from_static(b"x"); 10]).expect("publishes");
+    let through = Cursor { generation: 1, sequence: 20 };
+    standby.open_stream_after(&key(0), through, DeliveryPolicy::ReplayRequired).expect("opens after the history");
+    standby.publish(&key(0), vec![Bytes::from_static(b"x")]).expect("publishes");
+    assert_eq!(records(&mut standby, live), (11..=21).collect::<Vec<_>>());
+    assert_eq!(records(&mut standby, after), (1..=21).collect::<Vec<_>>());
+    assert!(standby.is_subscribed(live) && standby.is_subscribed(after), "neither was reset");
+}
+
+/// A follower on the standby that may not replay is reset at the open, as it would be at a subscribe behind it: it
+/// is not given the records it missed, nor anything after.
+#[test]
+fn a_follower_on_the_standby_behind_the_open_that_may_not_replay_is_reset() {
+    // The standby's own subscriptions are `local:s` to its authorizer.
+    let (mut standby, live) = a_standby_catching_up(NoReplayTo("local:s"));
+    standby.publish(&key(0), vec![Bytes::from_static(b"x")]).expect("publishes");
+    let reset = format!("{:?}", StreamEvent::ResetRequired(ResetReason::HistoryUnavailable));
+    assert_eq!(seen(&mut standby, live), vec![reset]);
+    assert!(!standby.is_subscribed(live));
+}
+
+/// A standby with a `Live` follower that read records 1 to 10 as a relay, opened after the 20 its history holds, and
+/// the follower not polled since.
+fn a_standby_catching_up<A: Authorizer>(authorizer: A) -> (RelayCore<A>, u64) {
+    let now = Instant::now();
+    let (o, s) = (PeerId::new("o", 1), PeerId::new("s", 1));
+    let mut origin = origin(&scaled(), 1, 0);
+    let cfg = CoreConfig { relay: true, ..scaled() };
+    let mut standby = RelayCore::new(&s, authorizer, cfg).expect("a valid config");
+    let log = Arc::new(Mutex::new(MemoryStore::new(MemoryLimits::default()).expect("valid limits")));
+    lock(&log).open(&key(0), 1).expect("opens");
+    let batch = SequencedBatch::new(1, 1, vec![Bytes::from_static(b"x"); 20]).expect("a batch");
+    lock(&log).append(&key(0), &batch).expect("appends");
+    standby.set_history("md", log);
+    let live = standby.subscribe(&key(0), SubscribeOptions::default()).expect("follows");
+    ask(&mut origin, &o, &mut standby, &s, now);
+    origin.publish(&key(0), vec![Bytes::from_static(b"x"); 10]).expect("publishes");
+    deliver(&mut origin, &o, &mut standby, &s, now);
+    assert_eq!(records(&mut standby, live), (1..=10).collect::<Vec<_>>());
+    let through = Cursor { generation: 1, sequence: 20 };
+    standby.open_stream_after(&key(0), through, DeliveryPolicy::ReplayRequired).expect("opens after the history");
+    (standby, live)
+}
+
+/// A `Live` follower whose replay from the history stops at a new generation, a restart or a close and an open of
+/// the next, follows the new generation from its first record, as any `Live` follower does. Its `CaughtUp`: the test
+/// below.
+#[test]
+fn a_follower_whose_catch_up_stops_at_a_new_generation_follows_it_from_its_first_record() {
+    let rows = ["restart", "close and open"].map(|row| {
+        let (mut standby, live) = a_standby_catching_up(AllowAll);
+        if row == "restart" {
+            standby.restart_stream(&key(0), 2).expect("restarts");
+        } else {
+            standby.close_stream(&key(0)).expect("closes");
+            standby.open_stream(&key(0), 2, DeliveryPolicy::ReplayRequired).expect("opens generation 2");
+        }
+        standby.publish(&key(0), vec![Bytes::from_static(b"x"); 20]).expect("publishes");
+        let mut events = seen(&mut standby, live);
+        events.retain(|e| !e.starts_with("CaughtUp"));
+        (row, events, standby.is_subscribed(live))
+    });
+    assert_eq!(rows, [("restart", vec!["2 1..20".into()], true), ("close and open", vec!["2 1..20".into()], true)]);
+}
+
+/// A `Live` follower is told `CaughtUp` once for each catch-up, where it goes on live: at the end of its replay, or,
+/// when a restart or a close stops the replay, at the last position it was given. Before, one whose replay stopped
+/// was never told.
+#[test]
+fn a_follower_whose_catch_up_stops_is_told_it_caught_up_once_where_it_goes_on() {
+    let caught_up = |sequence| format!("{:?}", StreamEvent::CaughtUp { through: Cursor { generation: 1, sequence } });
+    let rows = ["finishes", "restart", "close and open"].map(|row| {
+        let (mut standby, live) = a_standby_catching_up(AllowAll);
+        let mut events = if row == "finishes" { seen(&mut standby, live) } else { Vec::new() };
+        if row == "close and open" {
+            standby.close_stream(&key(0)).expect("closes");
+            standby.open_stream(&key(0), 2, DeliveryPolicy::ReplayRequired).expect("opens generation 2");
+        } else {
+            standby.restart_stream(&key(0), 2).expect("restarts");
+        }
+        standby.publish(&key(0), vec![Bytes::from_static(b"x"); 20]).expect("publishes");
+        events.extend(seen(&mut standby, live));
+        (row, events)
+    });
+    let new = "2 1..20".to_string();
+    assert_eq!(
+        rows,
+        [
+            ("finishes", vec!["1 11..20".into(), caught_up(20), new.clone()]),
+            ("restart", vec![caught_up(10), new.clone()]),
+            ("close and open", vec![caught_up(10), new]),
+        ]
+    );
+}
+
+/// `OriginLost` told to a follower still replaying its start waits behind the live records held behind the replay:
+/// each record still comes once and in order.
+#[test]
+fn origin_lost_told_to_a_follower_still_replaying_comes_after_the_records_it_holds() {
+    let now = Instant::now();
+    let (o, r) = (PeerId::new("o", 1), PeerId::new("r", 1));
+    let mut origin = origin(&scaled(), 1, 0);
+    let mut relay = RelayCore::new(&r, AllowAll, CoreConfig { relay: true, ..scaled() }).expect("a valid config");
+    let live = relay.subscribe(&key(0), SubscribeOptions::default()).expect("follows");
+    ask(&mut origin, &o, &mut relay, &r, now);
+    origin.publish(&key(0), vec![Bytes::from_static(b"x"); 10]).expect("publishes");
+    deliver(&mut origin, &o, &mut relay, &r, now);
+    let start = StartPosition::FollowAfter(Cursor { generation: 1, sequence: 0 });
+    let after = relay.subscribe(&key(0), SubscribeOptions { start, ..Default::default() }).expect("follows after");
+    for _ in 0..2 {
+        origin.publish(&key(0), vec![Bytes::from_static(b"x")]).expect("publishes");
+        deliver(&mut origin, &o, &mut relay, &r, now);
+    }
+    // No parent is left: once the key is orphaned, the relay tells its followers it lost the origin.
+    for later in [60, 120] {
+        relay.reconcile(&[], now + Duration::from_secs(later));
+    }
+    let lost = format!("{:?}", StreamEvent::OriginLost);
+    assert_eq!(seen(&mut relay, live).last(), Some(&lost));
+    let caught_up = format!("{:?}", StreamEvent::CaughtUp { through: Cursor { generation: 1, sequence: 10 } });
+    assert_eq!(seen(&mut relay, after), vec!["1 1..10".into(), caught_up, "1 11..11".into(), "1 12..12".into(), lost]);
+}
+
+/// A relay whose follower was parked in the generation that closed asks for a subscriber that came after the reopen in
+/// the next: the parent holds it, so that subscriber goes on, and neither is reset.
+#[test]
+fn a_subscriber_in_the_new_generation_goes_on_beside_a_follower_parked_in_the_old() {
+    let now = Instant::now();
+    let (o, r) = (PeerId::new("o", 1), PeerId::new("r", 1));
+    let mut origin = origin(&scaled(), 1, 0);
+    let mut relay = RelayCore::new(&r, AllowAll, CoreConfig { relay: true, ..scaled() }).expect("a valid config");
+    let live = relay.subscribe(&key(0), SubscribeOptions::default()).expect("follows");
+    ask(&mut origin, &o, &mut relay, &r, now);
+    origin.publish(&key(0), vec![Bytes::from_static(b"x"); 10]).expect("publishes");
+    deliver(&mut origin, &o, &mut relay, &r, now);
+    assert_eq!(records(&mut relay, live), (1..=10).collect::<Vec<_>>());
+    origin.close_stream(&key(0)).expect("closes");
+    deliver(&mut origin, &o, &mut relay, &r, now);
+    origin.open_stream(&key(0), 2, DeliveryPolicy::ReplayRequired).expect("opens generation 2");
+    origin.publish(&key(0), vec![Bytes::from_static(b"x"); 20]).expect("publishes");
+    let start = StartPosition::After(Cursor { generation: 2, sequence: 10 });
+    let after = relay.subscribe(&key(0), SubscribeOptions { start, ..Default::default() }).expect("subscribes");
+    let mut at = now;
+    for _ in 0..4 {
+        at += Duration::from_secs(60);
+        ask(&mut origin, &o, &mut relay, &r, at);
+        deliver(&mut origin, &o, &mut relay, &r, at);
+    }
+    let mut events = seen(&mut relay, after);
+    events.retain(|e| !e.starts_with("CaughtUp"));
+    assert_eq!(events, vec!["2 11..20"]);
+    assert!(relay.is_subscribed(after) && relay.is_subscribed(live), "{:?}", seen(&mut relay, live));
+}
+
+/// A replay from the namespace's history, four branches long, goes to the child a window at a time: the branch is
+/// never asked to hold more than it has room for, so it is not reset as a slow consumer.
+#[test]
+fn a_source_replay_larger_than_the_branch_limit_goes_through_the_push_window_without_a_slow_consumer_reset() {
+    let (o, c, now, rtt) = (PeerId::new("o", 1), PeerId::new("c", 1), Instant::now(), Duration::from_millis(200));
+    let mut cfg = scaled();
+    cfg.branch = BranchLimits { max_bytes: 256 << 10, ..BranchLimits::BRANCH };
+    cfg.rings = vec![RingLimits { namespace: "md".into(), max_records: 16, max_bytes: 16 * RECORD }];
+    let records = 1024;
+    let limits = MemoryLimits {
+        max_records_per_stream: records,
+        max_bytes_per_stream: 2 * records * RECORD,
+        ..Default::default()
+    };
+    let log = Arc::new(Mutex::new(MemoryStore::new(limits).expect("valid limits")));
+    lock(&log).open(&key(0), 1).expect("opens");
+    let mut origin = RelayCore::new(&o, AllowAll, CoreConfig { relay: false, ..cfg.clone() }).expect("a valid config");
+    origin.set_history("md", log.clone());
+    origin.open_stream(&key(0), 1, DeliveryPolicy::ReplayRequired).expect("opens");
+    let batch = vec![Bytes::from(vec![7u8; RECORD]); 16];
+    for first in (1..=records as u64).step_by(16) {
+        // Written to the log before it is published.
+        lock(&log).append(&key(0), &SequencedBatch::new(1, first, batch.clone()).expect("a batch")).expect("appends");
+        origin.publish(&key(0), batch.clone()).expect("publishes");
+    }
+    let mut child = RelayCore::new(&c, AllowAll, CoreConfig { relay: true, ..cfg }).expect("a valid config");
+    let id = child.subscribe(&key(0), SubscribeOptions { start: StartPosition::First, ..Default::default() });
+    let id = id.expect("subscribes");
+    ask(&mut origin, &o, &mut child, &c, now);
+    let (mut at, mut seen) = (now, Vec::new());
+    for _ in 0..64 {
+        let mut answers = Vec::new();
+        while let Some((push, body)) = origin.next_push("c", Lane::Live, at, Some(rtt)) {
+            let (channel, seq, items) = wire::decode_push(&mut body.slice(1..)).expect("a push decodes");
+            answers.push((push, child.handle_push(&o, Lane::Live, 1, channel, seq, items, at)));
+        }
+        at += rtt;
+        for (push, answer) in answers {
+            origin.push_answered(&c, Lane::Live, push, answer, at);
+        }
+        while let Some(event) = child.poll(id) {
+            match event {
+                StreamEvent::Batch(batch) => seen.extend(batch.first()..batch.first() + batch.len() as u64),
+                StreamEvent::ResetRequired(_) | StreamEvent::End(_) => panic!("{event:?} after {} records", seen.len()),
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(seen, (1..=records as u64).collect::<Vec<_>>());
+    let hub = origin.stats().hub;
+    assert_eq!((hub.resets, hub.replayed_records), ([0; 6], records as u64));
 }

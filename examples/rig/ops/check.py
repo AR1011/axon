@@ -92,6 +92,9 @@ HEAL_LAG = 45 * S  # a heal or reset logs after it restarted the unit: systemd's
 GIVE_UP = 120 * S  # src/load.rs
 STREAM_BAD_RESET = {"Gap", "InvalidRecovery", "Revoked"}  # no fault explains these: the relay broke its guarantee
 STREAM_SLOW_RESET = {"SlowConsumer", "GlobalCapacity"}  # only while a node on the path is starved
+# A move stream (src/streams.rs) keeps its generation across every move of its origin: no follower of it ends for one.
+MOVE_BAD_RESET = {"GenerationChanged", "StreamClosed"}
+MOVERS = ("b1", "b2")  # the nodes that can originate a move stream
 STREAM_STARVED = {"rate", "cpu", "memhigh", "pause", "freeze"}
 STARVES = {"cpu", "memhigh", "reclaim", "swap", "threadstarve"}  # a thread runs late: its line comes after the work
 STREAM_BAD_SUBSCRIBE = ("Forbidden", "InvalidOptions", "LimitExceeded", "Recovery(Gap", "Recovery(ConflictingDuplicate",
@@ -190,6 +193,11 @@ disk_of = nemesis.disk_of
 def origin_of(s):
     """A stream's origin: b1 of b1/s0 and of disk-b1/s0."""
     return s.split("/")[0].rpartition("-")[2]
+
+
+def origins_of(s):
+    """The nodes that can originate a stream: its origin, or for a move stream either mover."""
+    return MOVERS if s.startswith("move/") else (origin_of(s),)
 
 
 def evidence(f):
@@ -947,7 +955,8 @@ class Run:
                     # A follower's clock fault moves its lines off the timeline, as for the keys' liveness. A follower
                     # ahead of an origin whose disk lost synced records waits, silent, until it publishes past them;
                     # one whose disk refuses every publish publishes nothing.
-                    if due < min(b, nxt) and (node, s) not in flagged and up(origin_of(s), due - self.B, b + WINDOW) \
+                    if due < min(b, nxt) and (node, s) not in flagged and any(
+                            up(o, due - self.B, b + WINDOW) for o in origins_of(s)) \
                             and not self.fault_on(node, CLOCK, a - WINDOW, b) and not self.lied(s, a, b) \
                             and not self.refusing(s, a, b):
                         flagged.add((node, s))
@@ -966,7 +975,8 @@ class Run:
         # A follower ahead of what the disk lost, or of an origin that cannot publish, is refused.
         if self.quiet(t, t) and not self.lied(s, t, t) and not self.refusing(s, t - WINDOW, t + WINDOW):
             self.flag("stream-quiet", t, node=node, s=s, r=x.get("r"), why=why)
-        if (x.get("r") == "reset" and kind in STREAM_BAD_RESET or x.get("r") == "subscribe_err" and why.startswith(
+        bad = STREAM_BAD_RESET | (MOVE_BAD_RESET if s.startswith("move/") else set())
+        if (x.get("r") == "reset" and kind in bad or x.get("r") == "subscribe_err" and why.startswith(
                 STREAM_BAD_SUBSCRIBE)) and not self.lied(s, t, t):
             self.flag("stream-reset-kind", t, node=node, s=s, r=x.get("r"), why=why)
         # Or the follower itself just started again: it takes back its keys and replays its followers at once.
@@ -1684,12 +1694,12 @@ class Run:
     def check_kernel(self):
         """kernel: a message of KERNEL outside the windows of the classes that explain it (from 1 s before their on to
         60 s after their off) on its node, named by the unit in it or the file's; on one box the kernel is every node's.
-        An OOM kill of anything but the rig (`rig`, `exe`, or `exe-bN` on one box, which names the node)."""
+        An OOM kill of anything but the rig (`rig`, `exe`, or `exe-axrig-bN` on one box, which names the node)."""
         files = [(n, os.path.join(nd["dir"], "kernel.jsonl")) for n, nd in sorted(self.nodes.items())]
         for node, p in files + [(None, os.path.join(self.dir, "kernel.jsonl"))]:
             for x in self.read(p):
                 t0, msg = self.unit_line(x)
-                m = re.search(r"rig-node@(b\d+)|\(exe-(b\d+)\)", msg)
+                m = re.search(r"rig-node@(?:axrig-)?(b\d+)|\(exe-(?:axrig-)?(b\d+)\)", msg)
                 who = m.group(1) or m.group(2) if m else node
                 t = self.to_store(who, t0) if who else t0
                 if t < self.t0:  # the log starts a minute early: the box before the run, another run's heal
@@ -1698,7 +1708,7 @@ class Run:
                 for text, why in KERNEL:
                     if text not in msg:
                         continue
-                    if text == "Killed process" and not re.search(r"\((rig|exe(-b\d+)?)\)", msg) or not why or not any(
+                    if text == "Killed process" and not re.search(r"\((rig|exe(-(axrig-)?b\d+)?)\)", msg) or not why or not any(
                             self.fault_on(n, why, t - 60 * S, t + S) for n in ([who] if who else self.windows)):
                         self.flag("kernel", t, probe=False, node=who, msg=msg[:300])
                     break
@@ -3720,6 +3730,8 @@ def p_stream_liveness_open(f, i):
 
 # b1 silent on b3/s1 from 25 s to 60 s, past B in the steady time before the first episode.
 plant_line("stream-liveness-steady", "b1/stream.jsonl", 60, ["stream-liveness"], r="resume", s="b3/s1", quiet_ms=35000)
+# A move stream is judged while either node that can originate it is up.
+plant_line("stream-liveness-move", "b3/stream.jsonl", 60, ["stream-liveness"], r="resume", s="move/m0", quiet_ms=35000)
 # b1 silent on b2/s0 from 5 s before the diskdrop to 8 s into it: the next episode began inside B.
 plant_line("stream-next-episode", "b1/stream.jsonl", (2, "on", 8), [], r="resume", s="b2/s0", quiet_ms=13000)
 # b3, under skew-restart, silent on b1/s0 past B after it: its lines are off the timeline, as for keys.
@@ -4098,6 +4110,11 @@ plant_line("stream-publish-err", "b1/stream.jsonl", 61, r="publish_err", s="b1/s
 plant_line("stream-reset-kind", "b3/stream.jsonl", (2, "on", 5), r="reset", s="b1/s0", why="Gap", start="after")
 plant_line("stream-subscribe-err", "b3/stream.jsonl", (2, "on", 5), ["stream-reset-kind"], r="subscribe_err",
            s="b1/s0", err="Recovery(ConflictingDuplicate)")
+# A move stream's follower ended by a move during the diskdrop; a fixed origin's restart may end one.
+plant_line("stream-move-reset", "b3/stream.jsonl", (2, "on", 5), ["stream-reset-kind"], r="reset", s="move/m1",
+           why="GenerationChanged", start="follow")
+plant_line("stream-generation-changed", "b3/stream.jsonl", (2, "on", 5), [], r="reset", s="b1/s1",
+           why="GenerationChanged", start="after")
 # A slow consumer during b1's diskdrop: nothing starved b3, b2 or b2's relay b3.
 plant_line("stream-slow", "b3/stream.jsonl", (2, "on", 5), ["stream-reset-kind"], r="reset", s="b2/s0",
            why="SlowConsumer", start="live")
@@ -5475,10 +5492,10 @@ plant_log("kernel-oom", "kernel.jsonl", 100, "Out of memory: Killed process 4242
 
 @plant(want=["fault-effect"])
 def p_kernel_oom_rig(f, i):
-    """On one box the OOM killer names b2's rig by its unit's binary, exe-b2, inside b2's oom window, and on its own box
+    """On one box the OOM killer names b2's rig by its unit's binary, exe-axrig-b2, inside b2's oom window, and on its own box
     as exe (the synthetic b2 does not start again, hence fault-effect)."""
     add_episode(f, i, 4, "oom", ["b2"], 240, 250)
-    log_line(f, "kernel.jsonl", i["T0"] + 245 * S, "Memory cgroup out of memory: Killed process 42 (exe-b2) x")
+    log_line(f, "kernel.jsonl", i["T0"] + 245 * S, "Memory cgroup out of memory: Killed process 42 (exe-axrig-b2) x")
     log_line(f, "b2/kernel.jsonl", i["T0"] + 246 * S, "Out of memory: Killed process 44 (exe) x")
 
 
@@ -5486,7 +5503,7 @@ def p_kernel_oom_rig(f, i):
 def p_kernel_oom_other(f, i):
     """The OOM killer took b3's rig inside b2's oom window only."""
     add_episode(f, i, 4, "oom", ["b2"], 240, 250)
-    log_line(f, "kernel.jsonl", i["T0"] + 245 * S, "Memory cgroup out of memory: Killed process 43 (exe-b3) x")
+    log_line(f, "kernel.jsonl", i["T0"] + 245 * S, "Memory cgroup out of memory: Killed process 43 (exe-axrig-b3) x")
 
 
 @plant(want=["causality"])

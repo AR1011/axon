@@ -25,12 +25,12 @@ use crate::core::{
     CoreConfig, Item, Parents, Push, PushAnswer, PushId, RelayCore, RelayEvent, RelayStats, RelayTimings, Reply,
     StreamInfo, Wake,
 };
-use crate::disk::{DiskConfig, DiskStore, RETAIN_EVERY, RETRY_WRITE};
+use crate::disk::{self, DiskConfig, DiskStore, RETAIN_EVERY, RETRY_WRITE};
 use crate::hub::{
     Access, Authorizer, DeliveryPolicy, NamespaceLimit, NamespaceLimits, PeerId, PublishError, StreamError,
     StreamEvent, SubscribeOptions,
 };
-use crate::recovery::{Cursor, Payload, StreamKey};
+use crate::recovery::{Cursor, Payload, RecoverySource, StreamKey};
 use crate::wire;
 
 /// Interests, from a child to its parent.
@@ -85,6 +85,8 @@ pub struct StreamNodeConfig {
     pub downstream_expiry: Duration,
     /// Where the streams this node originates in some namespaces keep their history, so they survive a restart.
     pub disk: Option<DiskConfig>,
+    /// The history the application keeps of some namespaces: see [`history`](Self::history).
+    pub history: BTreeMap<String, Arc<dyn RecoverySource>>,
     /// Holds the namespaces' rates and open streams across the cluster; `start` refuses such a limit without it.
     pub quotas: Option<Quotas>,
 }
@@ -99,8 +101,19 @@ impl StreamNodeConfig {
             tick: Duration::from_millis(200),
             downstream_expiry: Duration::from_secs(10),
             disk: None,
+            history: BTreeMap::new(),
             quotas: None,
         }
+    }
+
+    /// A subscription that starts behind the ring of a stream in `namespace` this node originates replays from
+    /// `source`, up to the ring, then goes on live. The source must hold every record the stream published, at the
+    /// same position, with the same bytes: an application that writes its log before it publishes does. One that reads
+    /// answers `Pending` and calls [`StreamNode::history_ready`] once the read is in. It is never asked for a key this
+    /// node relays, and takes the place of the [`disk`](Self::disk)'s own history for the namespace.
+    pub fn history(mut self, namespace: impl Into<String>, source: Arc<dyn RecoverySource>) -> Self {
+        self.history.insert(namespace.into(), source);
+        self
     }
 
     /// Holds the streams of `namespace` to `limits`.
@@ -473,35 +486,48 @@ impl Inner {
 
 /// Writes what was published to the streams kept on disk, one write at a time: each starts as soon as the last has
 /// landed and something waits, and takes all of it, so a record waits for one write in progress at most, never for a
-/// tick. A failed write is tried again after `RETRY_WRITE`.
+/// tick. A failed write is tried again after `RETRY_WRITE`. After each write it reads the segments that starts behind
+/// a ring asked for, and it wakes when one read in and not read from may give up its place.
 async fn write_disk(node: Weak<Inner>, writes: Arc<Notify>) {
     loop {
         let Some(inner) = node.upgrade() else { return };
-        let (taken, aging) = {
+        let (taken, reads, aging, expires) = {
             let mut core = inner.core.lock();
-            (core.take_disk_writes(axon::trace::unix_micros() / 1000), core.disk_may_retain())
+            let taken = core.take_disk_writes(axon::trace::unix_micros() / 1000);
+            (taken, core.take_disk_reads(Instant::now().into_std()), core.disk_may_retain(), core.disk_unread_ages())
         };
         drop(inner);
-        let Some((files, ops)) = taken else {
-            if aging {
-                let _ = tokio::time::timeout(RETAIN_EVERY, writes.notified()).await;
-            } else {
-                writes.notified().await;
+        if taken.is_none() && reads.is_none() {
+            let retain = aging.then(|| Instant::now() + RETAIN_EVERY);
+            match expires.map(Instant::from_std).into_iter().chain(retain).min() {
+                Some(at) => {
+                    let _ = tokio::time::timeout_at(at, writes.notified()).await;
+                }
+                None => writes.notified().await,
             }
             continue;
-        };
-        // Its own task: a store that panics fails this write, which is taken again, and not the writer. It holds the
-        // files, and so their directory, until the write lands, after the node is dropped.
-        let write = tokio::spawn(async move { files.apply(ops).await });
-        let written = write.await.unwrap_or_else(|e| Err(std::io::Error::other(e)));
-        let failed = written.is_err();
-        let Some(inner) = node.upgrade() else { return };
-        let told = inner.with(|core| core.disk_written(written));
-        inner.cursors.notify_waiters();
-        if let Some((kind, detail)) = told {
-            inner.cluster.events().record(kind, "", detail);
         }
-        drop(inner);
+        let mut failed = false;
+        if let Some((files, ops)) = taken {
+            // Its own task: a store that panics fails this write, which is taken again, and not the writer. It holds
+            // the files, and so their directory, until the write lands, after the node is dropped.
+            let write = tokio::spawn(async move { files.apply(ops).await });
+            let written = write.await.unwrap_or_else(|e| Err(std::io::Error::other(e)));
+            failed = written.is_err();
+            let Some(inner) = node.upgrade() else { return };
+            let told = inner.with(|core| core.disk_written(written));
+            inner.cursors.notify_waiters();
+            if let Some((kind, detail)) = told {
+                inner.cluster.events().record(kind, "", detail);
+            }
+        }
+        if let Some((files, asked)) = reads {
+            // A store that panics reads nothing, and the starts that waited on it are reset.
+            let unread: Vec<_> = asked.iter().map(|a| (a.clone(), None)).collect();
+            let read = tokio::spawn(disk::read_asked(files, asked)).await.unwrap_or(unread);
+            let Some(inner) = node.upgrade() else { return };
+            inner.with(|core| core.disk_read_in(read, Instant::now().into_std()));
+        }
         if failed {
             tokio::time::sleep(RETRY_WRITE).await;
         }
@@ -534,6 +560,12 @@ impl StreamNode {
         if cfg.downstream_expiry <= lost_interest {
             return Err(ClusterError::Config("downstream_expiry must outlast one lost interest"));
         }
+        if cfg.disk.as_ref().is_some_and(|d| d.max_read_segments == 0) {
+            return Err(ClusterError::Config("DiskConfig::max_read_segments must be at least 1"));
+        }
+        if cfg.disk.as_ref().is_some_and(|d| d.unread_expiry.is_zero()) {
+            return Err(ClusterError::Config("DiskConfig::unread_expiry must be above 0"));
+        }
         let cluster_wide =
             cfg.core.namespaces.values().any(|l| l.records_per_sec.or(l.bytes_per_sec).or(l.open_streams).is_some());
         if cluster_wide && cfg.quotas.is_none() {
@@ -545,6 +577,7 @@ impl StreamNode {
         // Interests go on Control.
         core.max_interest_bytes = core.max_interest_bytes.min(cluster.max_frame(Lane::Control));
         let mut core = RelayCore::new(&me, cfg.authorizer, core).map_err(|_| ClusterError::Config("stream limits"))?;
+        core.history = cfg.history;
         let writer = cfg.disk.is_some();
         if let Some(disk) = cfg.disk {
             let error = |e| ClusterError::Control(format!("the stream disk could not be read: {e}"));
@@ -635,8 +668,9 @@ impl StreamNode {
     }
 
     /// Makes this node the key's origin. A key it relays becomes its own, and one it already originates is
-    /// `AlreadyExists`: `restart_stream` it, or `close_stream` it first. In a namespace with `open_streams`, the
-    /// stream holds one of its permits until it closes or this node goes.
+    /// `AlreadyExists` in any generation: `restart_stream` it, or `close_stream` it first. A generation older than the
+    /// one this node relays, or a follower here holds, is `GenerationMismatch`: a generation only goes up. In a
+    /// namespace with `open_streams`, the stream holds one of its permits until it closes or this node goes.
     ///
     /// It starts nothing until it is polled, and holds the node until it ends. With a
     /// [`disk`](StreamNodeConfig::disk), opening a stream the disk holds reads its newest segments back first, while
@@ -648,9 +682,42 @@ impl StreamNode {
         generation: u64,
         policy: DeliveryPolicy,
     ) -> impl Future<Output = Result<(), StreamError>> + Send + 'static {
+        self.open(key, generation, policy, None)
+    }
+
+    /// Makes this node the key's origin in `after.generation`, going on from `after.sequence + 1`: the stream of a
+    /// producer that moved here, which subscribers holding a cursor of that generation follow on with no reset. Its
+    /// ring starts empty, and the namespace's [`history`](StreamNodeConfig::history) serves every position up to
+    /// `after`, so it must hold them, the same records the old origin published. `InvalidOptions` without one, in a
+    /// namespace the [`disk`](StreamNodeConfig::disk) keeps, for a `Compacted` stream, and behind the position this
+    /// node already relays in that generation, which would number records again. Otherwise as
+    /// [`open_stream`](Self::open_stream).
+    ///
+    /// The generation goes on only when every position keeps its record: publish a record only once the node that
+    /// may take over holds it, and open after the last record this node holds, never writing a position again. The
+    /// old origin [`close_stream`](Self::close_stream)s the key once it knows it may no longer publish.
+    pub fn open_stream_after(
+        &self,
+        key: &StreamKey,
+        after: Cursor,
+        policy: DeliveryPolicy,
+    ) -> impl Future<Output = Result<(), StreamError>> + Send + 'static {
+        self.open(key, after.generation, policy, Some(after))
+    }
+
+    fn open(
+        &self,
+        key: &StreamKey,
+        generation: u64,
+        policy: DeliveryPolicy,
+        after: Option<Cursor>,
+    ) -> impl Future<Output = Result<(), StreamError>> + Send + 'static {
         let (node, key) = (self.0.clone(), key.clone());
         async move {
-            let reader = node.core.lock().disk_read(&key, generation, policy)?;
+            let reader = match after {
+                Some(_) => None,
+                None => node.core.lock().disk_read(&key, generation, policy)?,
+            };
             let read = match reader {
                 Some(reader) => Some(reader.read().await),
                 None => None,
@@ -665,7 +732,10 @@ impl StreamNode {
                     }
                     _ => None,
                 };
-                core.open_read(&key, generation, policy, read)?;
+                match after {
+                    Some(after) => core.open_stream_after(&key, after, policy)?,
+                    None => core.open_read(&key, generation, policy, read)?,
+                }
                 if let Some(permit) = permit {
                     node.permits.lock().insert(key.clone(), permit);
                 }
@@ -706,6 +776,12 @@ impl StreamNode {
         span.failed = published.is_err();
         self.0.cluster.tracer().record(span);
         published
+    }
+
+    /// A [`history`](StreamNodeConfig::history) source's read for `key` is in: the subscriptions it answered
+    /// `Pending` are driven again.
+    pub fn history_ready(&self, key: &StreamKey) {
+        self.0.with(|core| core.history_ready(key));
     }
 
     pub fn restart_stream(&self, key: &StreamKey, generation: u64) -> Result<(), StreamError> {

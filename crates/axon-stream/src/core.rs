@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use axon::{IdHash, Lane};
 use bytes::Bytes;
 
-use crate::disk::{DiskRead, DiskStats, DiskStore, FileOp, Files, ReadError, Resume};
+use crate::disk::{Asked, DiskRead, DiskStats, DiskStore, FileOp, Files, ReadError, Resume, SegmentRead};
 use crate::hub::*;
 use crate::recovery::*;
 use crate::wire;
@@ -461,8 +461,10 @@ struct Feed {
     wanted_from: StartPosition,
     /// The start each subscription and branch on this node asked for, by id, while it had no position.
     wants: BTreeMap<u64, StartPosition>,
-    /// A new generation is asked from its record 1 on top of `wanted_from`, until a parent cannot give that.
-    fresh: bool,
+    /// A start asked on top of `wanted_from`, a best effort: `After` the position the stream closed at here, so a
+    /// reopen of its generation goes on from it, then `First`, so a new generation is taken from its record 1. A
+    /// parent that cannot give one moves it to the next.
+    first: Option<StartPosition>,
     /// This node gave up the key's history after taking a generation: a newer one is taken from its record 1 too.
     gave_up: bool,
     /// The newest generation this node took up. A parent that shows an older one is behind the origin.
@@ -656,6 +658,40 @@ fn earlier(start: StartPosition, than: StartPosition) -> bool {
     }
 }
 
+/// What an origin's subscriptions replay from: the ring where it holds the start, otherwise the namespace's history
+/// for the whole span up to the cut. The two never meet inside one read.
+struct History {
+    ring: Arc<Mutex<MemoryStore>>,
+    behind: Arc<dyn RecoverySource>,
+}
+
+impl RecoverySource for History {
+    fn available_range(&self, key: &StreamKey) -> Result<ReplayRange, RecoveryError> {
+        let ring = lock(&self.ring).available_range(key)?;
+        Ok(match self.behind.available_range(key) {
+            Ok(h) if h.generation == ring.generation && h.first < ring.first && h.last + 1 >= ring.first => {
+                ReplayRange { first: h.first, ..ring }
+            }
+            _ => ring,
+        })
+    }
+
+    fn read_after(
+        &self,
+        key: &StreamKey,
+        after: Cursor,
+        through: u64,
+        bounds: ReadBounds,
+    ) -> Result<Vec<SequencedBatch>, RecoveryError> {
+        let ring = lock(&self.ring);
+        if ring.available_range(key)?.first <= after.sequence + 1 {
+            return ring.read_after(key, after, through, bounds);
+        }
+        drop(ring);
+        self.behind.read_after(key, after, through, bounds)
+    }
+}
+
 pub struct RelayCore<A: Authorizer = AllowAll> {
     cfg: CoreConfig,
     me: Arc<str>,
@@ -664,6 +700,8 @@ pub struct RelayCore<A: Authorizer = AllowAll> {
     store: Arc<Mutex<MemoryStore>>,
     /// Keeps the history of the streams it originates in the store's namespaces on disk.
     pub(crate) disk: Option<DiskStore>,
+    /// The history each namespace's application keeps, behind the ring of the streams this node originates.
+    pub(crate) history: BTreeMap<String, Arc<dyn RecoverySource>>,
     originated: HashSet<StreamKey, IdHash>,
     // Ordered maps keep a run reproducible from its inputs.
     feeds: BTreeMap<StreamKey, Feed>,
@@ -733,6 +771,7 @@ impl<A: Authorizer> RelayCore<A> {
             hub,
             store: Arc::new(Mutex::new(store)),
             disk: None,
+            history: BTreeMap::new(),
             originated: HashSet::default(),
             feeds: BTreeMap::new(),
             parents: BTreeMap::new(),
@@ -849,16 +888,40 @@ impl<A: Authorizer> RelayCore<A> {
         self.open_read(key, generation, policy, None)
     }
 
-    /// What an open of the key reads from disk first, without the core: `None` when it reads nothing.
+    /// Opens the key in `after.generation` from `after.sequence + 1`, with an empty ring and the namespace's
+    /// [`history`](Self::set_history) behind it, which serves every position up to `after`. `InvalidOptions` without
+    /// one, on a key the disk keeps (it numbers a generation from record 1), for a `Compacted` stream (the history
+    /// holds no state), and `after` this node's own position in its generation, which would number records again;
+    /// `GenerationMismatch` in a generation older than the node or its followers hold, as for `open_stream`.
+    pub fn open_stream_after(
+        &mut self,
+        key: &StreamKey,
+        after: Cursor,
+        policy: DeliveryPolicy,
+    ) -> Result<(), StreamError> {
+        let on_disk = self.disk.as_ref().is_some_and(|d| d.holds(key));
+        let behind = self.cursor(key).is_some_and(|c| c.generation == after.generation && c.sequence > after.sequence);
+        let refused = on_disk || behind || after.sequence == u64::MAX || compacted(policy).is_some();
+        if refused || !self.history.contains_key(key.namespace()) {
+            return Err(StreamError::InvalidOptions);
+        }
+        self.open(key, after.generation, policy, None, Some(after))
+    }
+
+    /// The history the application keeps of a namespace, behind the ring of the streams this node originates in it.
+    pub fn set_history(&mut self, namespace: impl Into<String>, source: Arc<dyn RecoverySource>) {
+        self.history.insert(namespace.into(), source);
+    }
+
+    /// What an open of the key reads from disk first, without the core: `None` when it reads nothing. An open the
+    /// node refuses reads nothing.
     pub(crate) fn disk_read(
         &self,
         key: &StreamKey,
         generation: u64,
         policy: DeliveryPolicy,
     ) -> Result<Option<DiskRead>, StreamError> {
-        if self.originated.contains(key) {
-            return Err(StreamError::AlreadyExists);
-        }
+        self.may_open(key, generation)?;
         match self.disk.as_ref().filter(|d| d.holds(key)) {
             Some(disk) => disk.reader(key, generation, policy, lock(&self.store).ring_limits(key)),
             None => Ok(None),
@@ -873,6 +936,30 @@ impl<A: Authorizer> RelayCore<A> {
         generation: u64,
         policy: DeliveryPolicy,
         read: Option<Result<Resume, ReadError>>,
+    ) -> Result<(), StreamError> {
+        self.open(key, generation, policy, read, None)
+    }
+
+    fn may_open(&self, key: &StreamKey, generation: u64) -> Result<(), StreamError> {
+        // The key conflicts before its generation does: `restart_stream` it, or close it first.
+        if self.originated.contains(key) {
+            return Err(StreamError::AlreadyExists);
+        }
+        // A generation only goes up: the node's followers would move back to an older one.
+        if self.hub.newest_generation(key).is_some_and(|newest| newest > generation) {
+            return Err(RecoveryError::GenerationMismatch.into());
+        }
+        Ok(())
+    }
+
+    /// An open at record 1 of `generation`, or after the disk's `read`, or `after` a position.
+    fn open(
+        &mut self,
+        key: &StreamKey,
+        generation: u64,
+        policy: DeliveryPolicy,
+        read: Option<Result<Resume, ReadError>>,
+        after: Option<Cursor>,
     ) -> Result<(), StreamError> {
         // Opening a key this node pulls makes it the origin: the producer moved here, after a crash its old node
         // never closed the key, or followers of a key this node closed, its own or its children's, made it pull the
@@ -892,7 +979,9 @@ impl<A: Authorizer> RelayCore<A> {
                 return Err(StreamError::InvalidOptions);
             }
         }
+        self.may_open(key, generation)?;
         let pulled = self.feeds.contains_key(key);
+        let last = self.cursor(key);
         if pulled {
             self.wake_key(key);
             // Not a close to the children: the same generation resumed from disk goes on where each was, and another
@@ -902,10 +991,10 @@ impl<A: Authorizer> RelayCore<A> {
             lock(&self.store).remove(key);
             self.unfeed(key);
         }
-        let opened = self.originate(key, generation, policy, read);
+        let opened = self.originate(key, generation, policy, read, after);
         if opened.is_err() && pulled {
             // A refused open leaves the key pulled for its followers, as a close does.
-            self.repull(key);
+            self.repull(key, last);
         }
         opened
     }
@@ -916,6 +1005,7 @@ impl<A: Authorizer> RelayCore<A> {
         generation: u64,
         policy: DeliveryPolicy,
         read: Option<Result<Resume, ReadError>>,
+        after: Option<Cursor>,
     ) -> Result<(), StreamError> {
         if self.hub.has_stream(key) {
             return Err(StreamError::AlreadyExists);
@@ -924,9 +1014,13 @@ impl<A: Authorizer> RelayCore<A> {
         let read = self.disk_read(key, generation, policy)?.map(|_| read.expect("the disk only gives up keys it held"));
         let resume =
             read.map(|r| r.map_err(|e| self.disk.as_mut().expect("read from it").read_failed(e))).transpose()?;
+        // An open after a position is a resume with nothing read: the history source holds what came before.
+        let empty = |through: Cursor| Resume { through, first: through.sequence + 1, batches: vec![], latest: vec![] };
+        let resume = resume.or(after.map(empty));
         let mut store = lock(&self.store);
         store.remove(key);
-        store.open_origin(key, Cursor { generation, sequence: resume.as_ref().map_or(0, |r| r.first - 1) })?;
+        let start = resume.as_ref().map_or(0, |r| r.first - 1);
+        store.open_origin(key, Cursor { generation, sequence: start })?;
         if let Some(r) = &resume {
             // A resumed state is held to the namespace's budget as a published one: past it, the open is refused.
             let state = r.latest.iter().map(Payload::len).sum();
@@ -943,7 +1037,7 @@ impl<A: Authorizer> RelayCore<A> {
         drop(store);
         // Followers hear of the open last, so a refusal shows them nothing.
         let opened = match &resume {
-            Some(r) => self.hub.resume_stream(&self.local, key, r.through, policy, &r.latest),
+            Some(r) => self.hub.resume_stream(&self.local, key, r.through, policy, &r.latest, self.origin_history(key)),
             None => self.hub.open_stream(&self.local, key, generation, policy),
         };
         if let Err(error) = opened {
@@ -1050,16 +1144,18 @@ impl<A: Authorizer> RelayCore<A> {
     /// Closes the key's stream here, whether this node originated or pulled it.
     fn end_stream(&mut self, key: &StreamKey) -> Result<(), StreamError> {
         self.wake_key(key);
+        let last = self.cursor(key);
         self.hub.close_stream(&self.local, key, EndReason::StreamClosed)?;
         lock(&self.store).remove(key);
-        self.repull(key);
+        self.repull(key, last);
         Ok(())
     }
 
     /// For a key this node has no stream of: local followers that still want it wait on an empty relay stream for it
-    /// to be opened again, here or on another node. It is asked of the parents at the refusal backoff, and from its
-    /// record 1, as the sequence domain died with the close and the next generation may be any number.
-    fn repull(&mut self, key: &StreamKey) {
+    /// to be opened again, here or on another node. It is asked of the parents at the refusal backoff, after `last`,
+    /// the position it closed at, so an open of the same generation goes on from there; then from its record 1, as
+    /// the next generation may be any number.
+    fn repull(&mut self, key: &StreamKey, last: Option<Cursor>) {
         if self.hub.demand_count(key) == 0 || !self.cfg.relay {
             if self.feeds.contains_key(key) {
                 self.unfeed(key);
@@ -1068,9 +1164,11 @@ impl<A: Authorizer> RelayCore<A> {
         }
         let _ = self.hub.open_relay_stream(&self.local, key, DeliveryPolicy::ReplayRequired);
         let feed = self.feeds.entry(key.clone()).or_default();
-        (feed.current, feed.wanted_from, feed.fresh, feed.gave_up, feed.generation) =
-            (None, StartPosition::Live, true, false, 0);
-        feed.wants.clear();
+        (feed.current, feed.wanted_from, feed.gave_up, feed.generation) = (None, StartPosition::Live, false, 0);
+        feed.first = Some(last.map_or(StartPosition::First, StartPosition::After));
+        // What the followers parked at the close hold is asked for, so they go on without a gap.
+        feed.wants = self.hub.waiting(key).into_iter().collect();
+        self.want_from(key, None);
         self.touch(key);
     }
 
@@ -1087,7 +1185,25 @@ impl<A: Authorizer> RelayCore<A> {
         Some((disk.files(), disk.take(now_ms)?))
     }
 
-    /// Whether a write waits to be taken.
+    /// The segments starts behind a ring wait on: read them with `disk::read_asked`, without the core, and hand them
+    /// to [`disk_read_in`](Self::disk_read_in). Take them again at [`disk_unread_ages`](Self::disk_unread_ages).
+    pub(crate) fn take_disk_reads(&self, now: Instant) -> Option<(Arc<dyn Files>, Vec<Asked>)> {
+        self.disk.as_ref()?.take_reads(now)
+    }
+
+    pub(crate) fn disk_read_in(&mut self, read: Vec<SegmentRead>, now: Instant) {
+        let Some(disk) = &self.disk else { return };
+        for key in disk.read_in(read, now) {
+            self.history_ready(&key);
+        }
+    }
+
+    /// When a segment read in that no start has read from may give up its place to the starts waiting for one.
+    pub(crate) fn disk_unread_ages(&self) -> Option<Instant> {
+        self.disk.as_ref()?.unread_ages()
+    }
+
+    /// Whether a write or a segment read waits to be taken.
     pub(crate) fn disk_queued(&self) -> bool {
         self.disk.as_ref().is_some_and(DiskStore::queued)
     }
@@ -1159,29 +1275,47 @@ impl<A: Authorizer> RelayCore<A> {
 
     // ---- local subscribers ----
 
+    /// What a subscription to the key replays from: its ring, with the namespace's history behind it on a key this
+    /// node originates. A relay passes a start behind its ring on as `HistoryUnavailable`.
+    fn history(&self, key: &StreamKey) -> Arc<dyn RecoverySource> {
+        if self.originated.contains(key) { self.origin_history(key) } else { self.store.clone() }
+    }
+
+    /// What subscriptions to a key this node originates, or opens, replay from.
+    fn origin_history(&self, key: &StreamKey) -> Arc<dyn RecoverySource> {
+        match self.history.get(key.namespace()).cloned().or_else(|| self.disk.as_ref()?.history(key)) {
+            Some(behind) => Arc::new(History { ring: self.store.clone(), behind }),
+            None => self.store.clone(),
+        }
+    }
+
+    /// The read a history source answered `Pending` for is in: the subscriptions that wait on it are driven again.
+    pub fn history_ready(&mut self, key: &StreamKey) {
+        if !self.hub.history_ready(key).is_empty() {
+            self.wake_key(key);
+        }
+    }
+
     /// On a relay, subscribing to a stream this node does not have yet starts pulling it.
     pub fn subscribe(&mut self, key: &StreamKey, options: SubscribeOptions) -> Result<u64, StreamError> {
         self.ensure_stream(key)?;
         let id = match options.start {
-            StartPosition::Live => {
-                let id = self.hub.follow(&self.local, key, options)?;
-                // A follower that comes after the loss is told it too.
-                if self.feeds.get(key).is_some_and(|f| f.lost_told) {
-                    self.hub.origin_lost(id);
-                }
-                id
-            }
+            StartPosition::Live => self.hub.follow(&self.local, key, options)?,
             StartPosition::SnapshotThenLive => {
-                let id = self.hub.subscribe(&self.local, key, options, Some(self.store.clone()))?;
+                let id = self.hub.subscribe(&self.local, key, options, Some(self.history(key)))?;
                 self.ask_snapshot(key);
                 id
             }
             start => {
-                let id = self.hub.subscribe(&self.local, key, options, Some(self.store.clone()))?;
-                self.want_from(key, Some((id, start)));
+                let id = self.hub.subscribe(&self.local, key, options, Some(self.history(key)))?;
+                self.want_from(key, Some((id, start.upstream())));
                 id
             }
         };
+        // A follower, `Live` or `FollowAfter`, that comes after the loss is told it too.
+        if self.feeds.get(key).is_some_and(|f| f.lost_told) {
+            self.hub.origin_lost(id);
+        }
         self.watchers.entry(key.clone()).or_default().push(id);
         self.wakes.push(Wake::Reconcile);
         Ok(id)
@@ -1189,7 +1323,7 @@ impl<A: Authorizer> RelayCore<A> {
 
     /// `None` means nothing yet; check [`is_subscribed`](Self::is_subscribed) to tell that from the end.
     pub fn poll(&mut self, id: u64) -> Option<StreamEvent> {
-        if self.hub.is_recovering(id) && !self.hub.pollable(id) {
+        if self.hub.reads_history(id) && !self.hub.pollable(id) {
             let _ = self.hub.drive_recovery(id, ReadBounds { max_records: usize::MAX, max_bytes: usize::MAX });
         }
         let ended = self.hub.subscription(id).filter(|(_, ended)| *ended).map(|(key, _)| key.clone());
@@ -1432,8 +1566,11 @@ impl<A: Authorizer> RelayCore<A> {
             _ => StartPosition::Live,
         };
         let options = SubscribeOptions { start, slow_consumer: SlowConsumerPolicy::Reset, limits: self.cfg.branch };
-        let id = self.hub.subscribe(peer, &want.key, options, Some(self.store.clone())).map_err(|e| match e {
-            StreamError::Forbidden => Status::Forbidden,
+        let id = self.hub.subscribe(peer, &want.key, options, Some(self.history(&want.key))).map_err(|e| match e {
+            // Subscribe and Snapshot passed above, and the start is `After` or `First`: only Replay was denied. A start
+            // this node may not replay is one it cannot give, so the child takes the stream live, as from a parent
+            // without the history, and does not ask for the position forever.
+            StreamError::Forbidden => Status::HistoryUnavailable,
             StreamError::Recovery(RecoveryError::HistoryUnavailable) => Status::HistoryUnavailable,
             StreamError::Recovery(RecoveryError::GenerationMismatch) => Status::GenerationMismatch,
             StreamError::LimitExceeded | StreamError::QuotaExceeded { .. } => Status::LimitExceeded,
@@ -1556,8 +1693,7 @@ impl<A: Authorizer> RelayCore<A> {
                     continue;
                 }
                 let took = charges.get(&id).map_or(0, |c| c.records);
-                let recovering = hub.is_recovering(id);
-                if recovering && !hub.pollable(id) {
+                if hub.reads_history(id) && !hub.pollable(id) {
                     let max_records = (cfg.hub.max_batch_records - took).min(room / 8);
                     if max_records == 0 {
                         stopped.get_or_insert(id);
@@ -1566,7 +1702,7 @@ impl<A: Authorizer> RelayCore<A> {
                     let _ = hub.drive_recovery(id, ReadBounds { max_records, max_bytes: room - 4 * max_records });
                 }
                 let Some((mut size, records)) = hub.next_size(id) else {
-                    if !recovering {
+                    if !hub.reads_history(id) {
                         entry.ready.remove(&id);
                     }
                     continue;
@@ -1822,7 +1958,8 @@ impl<A: Authorizer> RelayCore<A> {
         let _ = self.hub.reset_relay_stream(&self.local, key, reason);
         if let Some(feed) = self.feeds.get_mut(key) {
             // A new generation is fetched from its record 1, as the origin's own followers see it.
-            (feed.wanted_from, feed.fresh) = (StartPosition::Live, reason == ResetReason::GenerationChanged);
+            feed.wanted_from = StartPosition::Live;
+            feed.first = (reason == ResetReason::GenerationChanged).then_some(StartPosition::First);
             feed.wants.clear();
             feed.gave_up = reason == ResetReason::HistoryUnavailable && feed.generation > 0;
         }
@@ -1836,13 +1973,14 @@ impl<A: Authorizer> RelayCore<A> {
         let Some(feed) = self.feeds.get_mut(key) else { return };
         let link = Link { peer: peer.clone(), epoch };
         let followed = feed.links().any(|l| *l == link);
-        // Record 1 of a new generation is a best effort: a parent that cannot give it is asked for what is wanted.
-        if feed.fresh
-            && matches!(status, Status::Forbidden | Status::HistoryUnavailable)
-            && followed
-            && self.hub.cursor(key) == Ok(None)
+        // The position closed at, then record 1 of a new generation, are a best effort: a parent that cannot give one
+        // is asked for the next, then for what is wanted.
+        if followed
+            && at.is_none()
+            && let Some(tried) = feed.first
+            && matches!(status, Status::Forbidden | Status::HistoryUnavailable | Status::GenerationMismatch)
         {
-            feed.fresh = false;
+            feed.first = matches!(tried, StartPosition::After(_)).then_some(StartPosition::First);
             return self.rebranch(key, &link);
         }
         // Perhaps only the state was refused: its waits end, and the records are asked for without it.
@@ -1989,7 +2127,8 @@ impl<A: Authorizer> RelayCore<A> {
                         self.rebranch(&key, &link);
                     } else if current && feed.gave_up && start.generation > feed.generation && start.sequence > 0 {
                         // Given up, the position is not continued: a newer generation is, from its record 1.
-                        (feed.fresh, feed.gave_up, feed.generation) = (true, false, start.generation);
+                        (feed.first, feed.gave_up, feed.generation) =
+                            (Some(StartPosition::First), false, start.generation);
                         self.rebranch(&key, &link);
                     } else if self.hub.adopt_relay_stream(&self.local, &key, start) == Ok(true) {
                         self.adopt_ring(&key, start);
@@ -2270,7 +2409,7 @@ impl<A: Authorizer> RelayCore<A> {
             }
             let linked = |feed: &Feed| feed.links().find(|l| l.peer == *peer).map(|l| l.epoch);
             let want = |key: &StreamKey, feed: &Feed, epoch| {
-                let from = if feed.fresh { StartPosition::First } else { feed.wanted_from };
+                let from = feed.first.filter(|s| !earlier(feed.wanted_from, *s)).unwrap_or(feed.wanted_from);
                 let start = hub.cursor(key).ok().flatten().map_or(from, StartPosition::After);
                 Want { key: key.clone(), epoch, start, snapshot: feed.wants_snapshot }
             };
@@ -2428,10 +2567,13 @@ impl<A: Authorizer> RelayCore<A> {
         }
         for ((key, epoch), Answer { status, path }) in sent.wants.into_iter().zip(answers) {
             let link = Link { peer: parent.clone(), epoch };
-            let current = self.feeds.get(&key).is_some_and(|f| f.current.as_ref() == Some(&link));
+            let feed = self.feeds.get(&key);
+            let current = feed.is_some_and(|f| f.current.as_ref() == Some(&link));
+            // A best-effort start of a stream with no position is refused as any other: the next one is asked.
+            let tries_first = feed.is_some_and(|f| f.first.is_some());
             match status {
                 Status::Ok => self.learn_path(&key, parent, epoch, path, now),
-                Status::GenerationMismatch if current => {
+                Status::GenerationMismatch if current && !(tries_first && self.cursor(&key).is_none()) => {
                     self.local_reset(&key, ResetReason::GenerationChanged, now);
                     self.rebranch(&key, &link);
                 }

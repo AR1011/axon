@@ -106,6 +106,8 @@ async fn main() {
   so the same generation resumed from disk goes on for their followers where they were, with no record twice and none
   skipped. Give it a generation above the last one: a cursor names a position in one generation, and a new origin that
   reuses the number gives the same positions to other records, which a cursor from the old one then takes as its own.
+  The one exception is a new origin that gives every position the same record, which
+  [`open_stream_after`](#moving-an-origin) is for.
   Keeping one origin at a time is the application's part, for example a keyed actor under a lease. When no parent
   reaches the origin any more (every parent lacks the key or has lost its own upstream, or none has fed it for
   `upstream_timeout`), a follower on another node gets `StreamEvent::OriginLost`, once per loss, and one that
@@ -117,7 +119,9 @@ async fn main() {
   `ResetRequired(HistoryUnavailable)`. A subscription that starts from a cursor, `First` or `SnapshotThenLive` holds a
   position in one generation: it goes on through an origin that resumes that generation [from disk](#history-on-disk),
   and ends with `ResetRequired(GenerationChanged)` at a new generation or `End(StreamClosed)` at a close, because its
-  position, or the state it built, is meaningless afterwards. Subscribe again to start over.
+  position, or the state it built, is meaningless afterwards. Subscribe again to start over. `FollowAfter(cursor)`
+  starts strictly after the cursor and then follows the key: at a close it waits with its position and goes on at the
+  next open of its generation, and only a new generation ends it.
 - Put a middle tier in by giving nodes more `upstream` label sets, tried in order:
   `vec![{role: relay, region: eu}, {role: origin}]`. Relays fetch one copy of a stream however many subscribers they
   have, and children move to another parent when theirs fails.
@@ -150,17 +154,25 @@ A stream is a `StreamKey` (namespace + name) and a run of records numbered from 
 is `(generation, sequence)` and names the last record seen. Every hop keeps the origin's numbers, which is what lets
 any parent continue any child.
 
-A generation only goes up: `restart_stream` refuses one that is not above the current one, and a relay refuses a
-parent that shows a generation older than the newest it has seen, since that parent is behind the origin. The
-start time in milliseconds is a generation that survives a restart of the publisher; a stream kept
-[on disk](#history-on-disk) resumes only when it is opened with the generation its files hold instead.
+A generation only goes up: `restart_stream` refuses one that is not above the current one, an open of a key refuses
+one older than the node relays or a follower there holds (`GenerationMismatch`), and a relay refuses a parent that
+shows a generation older than the newest it has seen, since that parent is behind the origin. A follower parked at a
+close counts: a node that closed its key still refuses an older generation while one waits there. The start time in
+milliseconds is a generation that survives a restart of the publisher; a stream kept [on disk](#history-on-disk) resumes only when it is opened with the generation its files hold instead.
 
 A subscription sees `Ready`, then `Snapshot` if it started `SnapshotThenLive`, replayed batches, `CaughtUp`, live batches, and
 another `Ready` at each restart of the key it follows. It ends with exactly one `ResetRequired(reason)` (continuity
 broke: start over) or `End(reason)`. `CaughtUp` means the prefix
-was emitted, not applied. Admission is not delivery. History is a bounded in-memory ring (`MemoryStore`), or whatever
-`RecoverySource` the application supplies; an origin can also keep it [on disk](#history-on-disk) to resume after a
-crash.
+was emitted, not applied. Admission is not delivery. History is a bounded in-memory ring (`MemoryStore`) on every node
+that carries the key. At the origin, a start behind the ring replays from the history behind it: the files it keeps
+[on disk](#history-on-disk), which also resume it after a crash, or [the application's own](#history-the-application-keeps).
+
+A `Live` subscription that follows the key keeps its own position: the last record it was given, or the position its
+last `Ready` showed. Whatever its node's stream does under it (a close, a reset, a repull from a parent), within a
+generation it is never given a record twice, a record past the next one ends it with
+`ResetRequired(HistoryUnavailable)`, and another generation reaches it after a `Ready` for it. Its relay asks its
+parents again after the position it was at when its stream closed, so a generation resumed from disk goes on where it
+was.
 
 A batch published inside a trace carries it to every live subscriber (`SequencedBatch::trace_context`), and each
 node it crosses records a span ([tracing](tracing.md)).
@@ -246,7 +258,9 @@ event as a message; see the sources section of the actors guide.
   old one still feeds the stream; overlap is dropped by position, and the old branch is released when the new one
   reports `CaughtUp`. A parent that refuses a stream is retried with exponential backoff from `retry_refused`.
 - **Per-stream fallthrough.** A parent that lacks a stream, or the history a child needs, refuses that stream only;
-  the child asks the next candidate for it. If every candidate lacks the history, and none has appeared for
+  the child asks the next candidate for it. A parent that denies the child `Access::Replay` refuses a start behind
+  its own position as lacking the history (`HistoryUnavailable`), so the child takes the stream live rather than
+  asking for the position again and again. If every candidate lacks the history, and none has appeared for
   `upstream_timeout` (3 s), counting one that left the view and came back however briefly, the stream rejoins live:
   local subscribers get `ResetRequired(HistoryUnavailable)`, a `Live` one a new `Ready` when the stream comes back in a
   newer generation and `ResetRequired(HistoryUnavailable)` when it comes back in the same one, past what the node
@@ -486,9 +500,18 @@ use, and can be tried again. The program below drops its node with nothing left 
 After a restart, opening the stream again with the same generation resumes it: the next record follows the last
 durable one, the ring is filled from the files, and a compacted stream has its state again. `node.stored(&key)` names
 the generation and last record the files hold, until the stream is opened. A subscriber that holds a cursor continues
-`After(cursor)` on any node with nothing missed or seen twice. Replay still comes from the rings: the files serve the
-restart, and a start behind the ring is `HistoryUnavailable` as without them. Opening a newer generation,
-`restart_stream` or `close_stream` removes the old files; opening an older one is refused with `GenerationMismatch`.
+`After(cursor)` on any node with nothing missed or seen twice. A start behind the origin's ring replays from the files:
+the node's writer task reads the segment that holds it between two writes, the subscription waits meanwhile, and a
+replay goes to a child a push window at a time. `max_read_segments` (8; `StreamNode::start` refuses 0) bounds the
+segments read in that stay in memory, and each read: more starts at once take turns, in the order they asked. A read
+brings in only what the segments no start has read from yet leave room for, so the start that asked first keeps its
+segment until it reads it, or for `unread_expiry` (10 s; 0 refused) at most: a start that stops polling, or ends
+before it reads, holds no place for good, and polled later reads its segment in again. Past the limit such a segment
+goes first, then the one read from longest ago. Retention bounds it: a start older than
+the oldest segment is `HistoryUnavailable`. Relays keep only their rings and refuse such a start, so a child that may
+come back far behind needs the origin among its candidates (`upstream_for`). A follower on the restarted node itself,
+which relayed the key from another node until the open, replays from the files too what it missed before the open.
+Opening a newer generation, `restart_stream` or `close_stream` removes the old files; opening an older one is refused with `GenerationMismatch`.
 
 `StreamNode::start` reads every segment of the listed namespaces once to check it, one at a time, keeping only their
 positions, and `open_stream` reads back the newest segments until they fill the ring. Both await the files. An open is
@@ -588,7 +611,130 @@ async fn main() {
 }
 ```
 
+## History the application keeps
+
+An application that already keeps a log of what it publishes, a table or files of its own, can serve replay from it:
+`StreamNodeConfig::history(namespace, source)` puts its `RecoverySource` behind the ring of each stream of that
+namespace this node originates. A start behind the ring then replays from the source up to the ring's last record and
+goes on live, and a subscriber that kept a cursor for a day resumes `After(cursor)`. The source is never asked for a key
+the node relays, and takes the place of the [disk](#history-on-disk)'s own history for its namespace.
+
+The contract: the source holds every record the stream published, at the same position, with the same bytes. An
+application that writes its log first and publishes after meets it. Calls are synchronous and run under the node's lock,
+so a source must not block: one that reads answers `read_after` with `RecoveryError::Pending`, starts the read, and
+calls `node.history_ready(&key)` once it is in; the subscriptions it answered `Pending` wait until then, and nothing
+else on the node does. A read is at most what the subscriber's branch, or a child's push window, has room for.
+
+```rust
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+
+use axon::ActorSystem;
+use axon_cluster::{Cluster, ClusterConfig, MemoryDiscovery};
+use axon_net::SharedSecret;
+use axon_stream::{
+    Cursor, DeliveryPolicy, ReadBounds, RecoveryError, RecoverySource, ReplayRange, RingLimits, SequencedBatch,
+    StartPosition, StreamEvent, StreamKey, StreamNode, StreamNodeConfig, SubscribeOptions,
+};
+use bytes::Bytes;
+
+/// The application's own log: every record of generation 1, by position.
+#[derive(Default)]
+struct Log(Mutex<BTreeMap<u64, Bytes>>);
+
+impl RecoverySource for Log {
+    fn available_range(&self, _: &StreamKey) -> Result<ReplayRange, RecoveryError> {
+        let log = self.0.lock().unwrap();
+        let last = log.keys().next_back().copied().unwrap_or(0);
+        Ok(ReplayRange { generation: 1, first: log.keys().next().copied().unwrap_or(last + 1), last })
+    }
+
+    fn read_after(
+        &self,
+        _: &StreamKey,
+        after: Cursor,
+        through: u64,
+        bounds: ReadBounds,
+    ) -> Result<Vec<SequencedBatch>, RecoveryError> {
+        let log = self.0.lock().unwrap();
+        let records: Vec<Bytes> =
+            log.range(after.sequence + 1..=through).take(bounds.max_records).map(|(_, r)| r.clone()).collect();
+        if records.is_empty() {
+            return Err(RecoveryError::HistoryUnavailable);
+        }
+        Ok(vec![SequencedBatch::new(1, after.sequence + 1, records)?])
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    let mut transport = axon_net::Config::new("a", SharedSecret::new("at-least-16-bytes-long").unwrap());
+    transport.allow_plaintext = true;
+    let system = ActorSystem::builder().build().unwrap();
+    let cfg = ClusterConfig::new("127.0.0.1:0".parse().unwrap(), transport, MemoryDiscovery::new());
+    let cluster = Cluster::start(&system, cfg).await.unwrap();
+
+    let log = Arc::new(Log::default());
+    let mut cfg = StreamNodeConfig::new(vec![]).history("events", log.clone());
+    // A ring of 8 records, so the replay below comes from the log.
+    cfg.core.rings = vec![RingLimits { namespace: "events".into(), max_records: 8, max_bytes: 1 << 20 }];
+    let node = StreamNode::start(&cluster, cfg).await.unwrap();
+    let key = StreamKey::new("events", "e-1");
+    node.open_stream(&key, 1, DeliveryPolicy::ReplayRequired).await.unwrap();
+    for i in 1..=100u64 {
+        let record = Bytes::from(format!("event {i}"));
+        log.0.lock().unwrap().insert(i, record.clone()); // the log first
+        node.publish(&key, vec![record]).unwrap();
+    }
+
+    // A cursor stored long ago, 90 records behind the ring's last.
+    let start = StartPosition::After(Cursor { generation: 1, sequence: 10 });
+    let mut events = node.subscribe(&key, SubscribeOptions { start, ..Default::default() }).unwrap();
+    let mut next = 11;
+    while next <= 100 {
+        match events.next().await.expect("subscription open") {
+            StreamEvent::Batch(batch) => {
+                for record in batch.records() {
+                    assert_eq!(&record[..], format!("event {next}").as_bytes(), "nothing missed, nothing twice");
+                    next += 1;
+                }
+            }
+            terminal if terminal.is_terminal() => panic!("stream ended: {terminal:?}"),
+            _ => {} // Ready, CaughtUp
+        }
+    }
+    drop(node);
+    system.shutdown().await.unwrap();
+}
+```
+
 ## Standby
+
+### Moving an origin
+
+An origin that fails over to a standby can keep the generation, and with it every cursor, when the application keeps
+the stream's records itself ([above](#history-the-application-keeps)). Two rules make the new origin give every
+position the same record:
+
+1. publish a record only once the node that may take over holds it (write the log, then publish);
+2. the new origin opens after the last record it holds, `node.open_stream_after(key, last, policy)`, and never
+   publishes a position again.
+
+The old origin calls `close_stream` once it knows it may no longer publish, for example when its lease lapses. Relays
+see the close and ask the new origin from their own positions, so `Live` and `FollowAfter` subscribers go on in the
+same generation without a reset. Followers on the standby itself go on the same way: the open is after the last
+record its log holds, which can be past what reached it as a relay, and they replay the records between from the
+history source, then go on live (a follower denied `Access::Replay` is reset `HistoryUnavailable` instead). A `Live`
+one is told `CaughtUp` once where it goes on live: at the end of the replay, or, when a close or a restart stops the
+replay, at the last record it was given. A crashed
+or paused old origin cannot close: its children move once the cluster calls it gone. Let the standby relay the key
+from the origin (its `upstream` names the origin's labels), so taking over is a relay opening a key it pulls.
+`open_stream_after` is refused `InvalidOptions` without a history source for the namespace, for a namespace kept on
+disk, for a `Compacted` policy, and behind the position the node already relays, and `GenerationMismatch` in a
+generation older than the node relays or its followers hold. `tests/world_relay.rs` and
+`tests/world_wan.rs` move an origin under a crash, a pause and a late close.
+
+### Consumers
 
 A standby keeps what a consumer builds from a stream and takes over when the consumer is gone: snapshot the state
 with the cursor of its last record, and on taking over load the snapshot and subscribe `After(cursor)`. Snapshot at

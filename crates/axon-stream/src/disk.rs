@@ -5,19 +5,21 @@
 //!
 //! Nothing here does I/O but [`DiskStore::open`], which awaits a check of every segment once, and [`DiskRead::read`],
 //! which awaits a stream's newest segments without the store: the node's writer task hands each write's ops to
-//! [`Files::apply`] and the result back to the core.
+//! [`Files::apply`] and the result back to the core, and reads the segments a start behind the ring asks the
+//! [`Shelf`] for.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use axon::files::crc32;
 use bytes::{BufMut, Bytes, BytesMut};
 
 use crate::hub::{DeliveryPolicy, PublishError, StreamError};
 use crate::recovery::{
-    CompactLimits, Cursor, MemoryState, Payload, RecoveryError, SequencedBatch, StreamKey, compacted,
+    CompactLimits, Cursor, MemoryState, Payload, ReadBounds, RecoveryError, RecoverySource, ReplayRange,
+    SequencedBatch, StreamKey, compacted, lock, page,
 };
 
 #[cfg(feature = "cluster")]
@@ -34,11 +36,26 @@ pub struct DiskConfig {
     pub segment_bytes: u64,
     /// Bytes published and not synced yet past which a publish is refused with `Disk(Behind)`.
     pub max_unwritten_bytes: usize,
+    /// The segments read in for starts behind a ring that stay in memory, and the most one read of the writer task
+    /// brings in: more starts at once take turns. `StreamNode::start` refuses 0.
+    pub max_read_segments: usize,
+    /// How long a segment read in keeps its place while no start reads from it. Past that it may go as one read from
+    /// does, so a start that stalls or ends before it reads holds no place for good; polled later, it reads the
+    /// segment in again. `StreamNode::start` refuses 0.
+    pub unread_expiry: Duration,
 }
 
 impl DiskConfig {
     pub fn new(files: Arc<dyn Files>, namespaces: Vec<Retention>) -> Self {
-        Self { files, namespaces, segment_bytes: 8 << 20, max_unwritten_bytes: 64 << 20 }
+        let unread_expiry = Duration::from_secs(10);
+        Self {
+            files,
+            namespaces,
+            segment_bytes: 8 << 20,
+            max_unwritten_bytes: 64 << 20,
+            max_read_segments: 8,
+            unread_expiry,
+        }
     }
 }
 
@@ -200,6 +217,11 @@ struct Segment {
     bytes: u64,
 }
 
+/// The names and first positions of the segments that have files, as the shelf indexes them.
+fn named<'a>(key: &StreamKey, generation: u64, segments: impl IntoIterator<Item = &'a Segment>) -> Vec<(String, u64)> {
+    segments.into_iter().filter_map(|s| Some((s.name(key, generation)?, s.first))).collect()
+}
+
 impl Segment {
     /// Its file's name, once it has one.
     fn name(&self, key: &StreamKey, generation: u64) -> Option<String> {
@@ -353,8 +375,214 @@ impl DiskRead {
     }
 }
 
+/// A segment the shelf asks the writer task to read.
+#[derive(Clone)]
+pub(crate) struct Asked {
+    name: String,
+    key: StreamKey,
+    generation: u64,
+    first: u64,
+    /// The last position the read found, at least the last durable one when it was asked for. A start at or past it
+    /// reads the file again.
+    upto: u64,
+    /// When a start last read a page from it, in the shelf's count of pages; 0 before one has.
+    served: u64,
+    /// Read in and not read from: when it was read in, `None` once it sat so for `unread_expiry` and may go.
+    unread_since: Option<Instant>,
+}
+
+/// A segment read in: its batches, `None` when it could not be read.
+pub(crate) type SegmentRead = (Asked, Option<Arc<[SequencedBatch]>>);
+
+/// The segments of the streams kept here, as a history source behind their rings: a start behind a ring asks for the
+/// segment that holds it, the node's writer task reads it, and the answer is `Pending` until it is in.
+#[derive(Default)]
+pub(crate) struct Shelf(Mutex<Shelved>);
+
+/// A stream's generation, its last durable position, and its segments' names and first positions, oldest first.
+struct Indexed {
+    generation: u64,
+    last: u64,
+    segments: Vec<(String, u64)>,
+}
+
+#[derive(Default)]
+struct Shelved {
+    index: BTreeMap<StreamKey, Indexed>,
+    /// In the order they were asked for, so each start waiting gets its turn.
+    asked: VecDeque<Asked>,
+    reading: BTreeSet<String>,
+    read: VecDeque<SegmentRead>,
+    pages: u64,
+}
+
+impl Shelf {
+    /// The stream's generation and segments now, or `None` once it is closed. A segment gone, removed by retention or
+    /// a close, is no longer served; the last durable position stays while the generation does.
+    fn index(&self, key: &StreamKey, now: Option<(u64, Vec<(String, u64)>)>) {
+        let mut s = lock(&self.0);
+        let Some((generation, segments)) = now else {
+            s.index.remove(key);
+            s.read.retain(|(asked, _)| asked.key != *key);
+            s.asked.retain(|asked| asked.key != *key);
+            return;
+        };
+        s.read.retain(|(asked, _)| asked.key != *key || segments.iter().any(|(name, _)| *name == asked.name));
+        let last = s.index.get(key).filter(|e| e.generation == generation).map_or(0, |e| e.last);
+        s.index.insert(key.clone(), Indexed { generation, last, segments });
+    }
+
+    fn durable<'a>(&self, lasts: impl IntoIterator<Item = (&'a StreamKey, u64)>) {
+        let mut s = lock(&self.0);
+        for (key, last) in lasts {
+            if let Some(entry) = s.index.get_mut(key) {
+                entry.last = last;
+            }
+        }
+    }
+
+    /// Whether a read is due: segments asked for, and room for them.
+    fn asked(&self, max: usize) -> bool {
+        let s = lock(&self.0);
+        !s.asked.is_empty() && s.room(max) > 0
+    }
+
+    /// At most as many as there is room for, once the segments unread for `expiry` give theirs up; the rest wait for
+    /// the next read.
+    fn take_asked(&self, max: usize, expiry: Duration, now: Instant) -> Vec<Asked> {
+        let mut s = lock(&self.0);
+        for (asked, _) in &mut s.read {
+            if asked.unread_since.and_then(|at| at.checked_add(expiry)).is_some_and(|at| at <= now) {
+                asked.unread_since = None;
+            }
+        }
+        let n = s.room(max).min(s.asked.len());
+        let asked: Vec<Asked> = s.asked.drain(..n).collect();
+        s.reading.extend(asked.iter().map(|a| a.name.clone()));
+        asked
+    }
+
+    /// When the first segment read in and not read from has sat so for `expiry`, and may give up its place.
+    fn unread_ages(&self, expiry: Duration) -> Option<Instant> {
+        let s = lock(&self.0);
+        s.read.iter().filter_map(|(a, _)| a.unread_since?.checked_add(expiry)).min()
+    }
+
+    /// Keeps what a read brought in at `now`, at most `max` segments, and returns the streams it was for. Past `max`,
+    /// a segment that sat unread too long goes, else the one a start read from longest ago.
+    fn read_in(&self, read: Vec<SegmentRead>, max: usize, now: Instant) -> BTreeSet<StreamKey> {
+        let mut s = lock(&self.0);
+        let mut keys = BTreeSet::new();
+        for (mut asked, batches) in read {
+            s.reading.remove(&asked.name);
+            keys.insert(asked.key.clone());
+            if s.index.get(&asked.key).is_some_and(|e| e.segments.iter().any(|(name, _)| *name == asked.name)) {
+                asked.unread_since = Some(now);
+                s.read.push_back((asked, batches));
+            }
+        }
+        while s.read.len() > max {
+            // A read takes only the room the unread segments leave, so one may go; else the newest goes.
+            let may_go = s.read.iter().enumerate().filter(|(_, (a, _))| a.unread_since.is_none());
+            let at = may_go.min_by_key(|(_, (a, _))| a.served).map_or(s.read.len() - 1, |(at, _)| at);
+            s.read.remove(at);
+        }
+        keys
+    }
+}
+
+impl Shelved {
+    /// The segments a read may bring in: `max` less those read in that no start has read from yet nor sat so too
+    /// long, and those being read. A read never brings in one it would evict unread, so the starts that asked first
+    /// keep theirs.
+    fn room(&self, max: usize) -> usize {
+        let unread = self.read.iter().filter(|(a, _)| a.unread_since.is_some()).count();
+        max.saturating_sub(unread + self.reading.len())
+    }
+}
+
+impl RecoverySource for Shelf {
+    fn available_range(&self, key: &StreamKey) -> Result<ReplayRange, RecoveryError> {
+        let s = lock(&self.0);
+        let Indexed { generation, last, segments } = s.index.get(key).ok_or(RecoveryError::UnknownStream)?;
+        let first = segments.first().map_or(last + 1, |(_, first)| *first);
+        Ok(ReplayRange { generation: *generation, first, last: *last })
+    }
+
+    fn read_after(
+        &self,
+        key: &StreamKey,
+        after: Cursor,
+        through: u64,
+        bounds: ReadBounds,
+    ) -> Result<Vec<SequencedBatch>, RecoveryError> {
+        let mut guard = lock(&self.0);
+        let s = &mut *guard;
+        let Indexed { generation, last, segments } = s.index.get(key).ok_or(RecoveryError::UnknownStream)?;
+        if after.generation != *generation {
+            return Err(RecoveryError::GenerationMismatch);
+        }
+        if after.sequence >= through {
+            return Ok(Vec::new());
+        }
+        let Some((name, first)) = segments.iter().rev().find(|(_, first)| *first <= after.sequence + 1) else {
+            return Err(RecoveryError::HistoryUnavailable);
+        };
+        // A segment read before the start was durable is read again.
+        s.read.retain(|(a, _)| a.name != *name || a.upto > after.sequence);
+        let Some(at) = s.read.iter().position(|(a, _)| a.name == *name) else {
+            if !s.reading.contains(name) && !s.asked.iter().any(|a| a.name == *name) {
+                let (name, key, generation, first, upto) = (name.clone(), key.clone(), *generation, *first, *last);
+                s.asked.push_back(Asked { name, key, generation, first, upto, served: 0, unread_since: None });
+            }
+            return Err(RecoveryError::Pending);
+        };
+        // A read that failed resets the start it served; the next start reads the file again.
+        let Some(batches) = s.read[at].1.clone() else {
+            s.read.remove(at);
+            return Err(RecoveryError::HistoryUnavailable);
+        };
+        let start = batches.partition_point(|b| b.last() <= after.sequence);
+        let mut held = batches[start..]
+            .iter()
+            .flat_map(|b| (b.first()..).zip(b.records()))
+            .skip_while(|(sequence, _)| *sequence <= after.sequence)
+            .map(|(_, record)| record)
+            .peekable();
+        if held.peek().is_none() {
+            // The file lost it.
+            return Err(RecoveryError::HistoryUnavailable);
+        }
+        let page = page(after, through, bounds, held);
+        s.pages += 1;
+        (s.read[at].0.served, s.read[at].0.unread_since) = (s.pages, None);
+        page
+    }
+}
+
+/// Reads the segments the shelf asked for, one at a time, without the store.
+pub(crate) async fn read_asked(files: Arc<dyn Files>, asked: Vec<Asked>) -> Vec<SegmentRead> {
+    let mut read = Vec::with_capacity(asked.len());
+    for mut asked in asked {
+        let data = files.read(&asked.name).await.ok().map(Bytes::from);
+        let batches = data.map(|data| {
+            let scan = scan(&data, asked.generation, asked.first, asked.first - 1);
+            asked.upto = asked.upto.max(scan.last);
+            // Copied, as `DiskRead::read` does, so a replayed record does not keep its whole segment.
+            let copy = |b: &SequencedBatch| {
+                let records: Vec<_> = b.records().iter().map(|r| Bytes::copy_from_slice(r)).collect();
+                SequencedBatch::new(asked.generation, b.first(), records).expect("read above")
+            };
+            scan.batches.iter().map(copy).collect()
+        });
+        read.push((asked, batches));
+    }
+    read
+}
+
 pub(crate) struct DiskStore {
     cfg: DiskConfig,
+    shelf: Arc<Shelf>,
     found: BTreeMap<StreamKey, Found>,
     streams: BTreeMap<StreamKey, Durable>,
     next_id: u64,
@@ -384,6 +612,7 @@ impl DiskStore {
             retained_ms: 0,
             created_min: 0,
             stats: DiskStats::default(),
+            shelf: Arc::default(),
             cfg,
         };
         // Per key and generation: each segment's first position, creation, name and length.
@@ -431,6 +660,9 @@ impl DiskStore {
                     found.segments.push(Segment { first, created_ms: Some(created), bytes: good as u64 });
                 }
             }
+            // Shelved before any open takes it: followers behind the open replay from it as the open is heard.
+            store.shelf.index(&key, Some((generation, named(&key, generation, &found.segments))));
+            store.shelf.durable([(&key, found.last)]);
             store.found.insert(key, found);
         }
         Ok(store)
@@ -522,7 +754,42 @@ impl DiskStore {
             }
             None => {}
         }
+        let last = durable.next - 1;
         self.streams.insert(key.clone(), durable);
+        self.shelve(key);
+        self.shelf.durable([(key, last)]);
+    }
+
+    /// Tells the shelf the stream's segments that have files.
+    fn shelve(&self, key: &StreamKey) {
+        let now = self.streams.get(key).map(|d| (d.generation, named(key, d.generation, &d.segments)));
+        self.shelf.index(key, now);
+    }
+
+    /// The history of a stream kept here, behind its ring.
+    pub(crate) fn history(&self, key: &StreamKey) -> Option<Arc<dyn RecoverySource>> {
+        self.holds(key).then(|| self.shelf.clone() as Arc<dyn RecoverySource>)
+    }
+
+    /// The segments starts behind a ring asked for, to read with [`read_asked`] and hand to [`read_in`](Self::read_in).
+    pub(crate) fn take_reads(&self, now: Instant) -> Option<(Arc<dyn Files>, Vec<Asked>)> {
+        let asked = self.shelf.take_asked(self.cfg.max_read_segments, self.cfg.unread_expiry, now);
+        (!asked.is_empty()).then(|| (self.cfg.files.clone(), asked))
+    }
+
+    /// Keeps what a read brought in; returns the streams whose starts wait on it.
+    pub(crate) fn read_in(&self, read: Vec<SegmentRead>, now: Instant) -> BTreeSet<StreamKey> {
+        self.shelf.read_in(read, self.cfg.max_read_segments, now)
+    }
+
+    /// When a segment read in may give up its place unread, for a read due then.
+    pub(crate) fn unread_ages(&self) -> Option<Instant> {
+        self.shelf.unread_ages(self.cfg.unread_expiry)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_segments(&self) -> usize {
+        lock(&self.shelf.0).read.len()
     }
 
     /// A new generation: what the disk holds of the old one goes.
@@ -537,6 +804,7 @@ impl DiskStore {
         let Some(durable) = self.streams.remove(key) else { return };
         let names = durable.segments.iter().filter_map(|s| s.name(key, durable.generation));
         self.unwritten.extend(names.map(|name| Op::File(FileOp::Remove(name))));
+        self.shelve(key);
     }
 
     /// Assigns the records their positions and queues them for the next write, once every check has passed and then
@@ -604,6 +872,7 @@ impl DiskStore {
     pub(crate) fn take(&mut self, now_ms: u64) -> Option<Vec<FileOp>> {
         let mut flush = self.flush.take().unwrap_or_default();
         let mut appending: Option<(String, BytesMut)> = None;
+        let mut shelve = BTreeSet::new();
         let append = |(name, bytes): (String, BytesMut)| FileOp::Append(name, bytes.freeze());
         for op in std::mem::take(&mut self.unwritten) {
             let op = match op {
@@ -615,6 +884,9 @@ impl DiskStore {
                         self.stats.unwritten_bytes -= frame.len();
                         continue;
                     };
+                    if segment.created_ms.is_none() {
+                        shelve.insert(key.clone());
+                    }
                     let name = segment_name(
                         &key,
                         generation,
@@ -640,7 +912,10 @@ impl DiskStore {
         // A wall clock stepped back would otherwise hold retention off for as long as the step.
         if now_ms >= self.retained_ms.saturating_add(RETAIN_EVERY.as_millis() as u64) || now_ms < self.retained_ms {
             self.retained_ms = now_ms;
-            self.retain(now_ms, &mut flush.ops);
+            self.retain(now_ms, &mut flush.ops, &mut shelve);
+        }
+        for key in shelve {
+            self.shelve(&key);
         }
         if flush.ops.is_empty() && flush.batches.is_empty() {
             return None;
@@ -652,7 +927,7 @@ impl DiskStore {
 
     /// Whether a write waits to be taken.
     pub(crate) fn queued(&self) -> bool {
-        !self.unwritten.is_empty()
+        !self.unwritten.is_empty() || self.shelf.asked(self.cfg.max_read_segments)
     }
 
     /// Whether retention may yet remove a segment: some stream has more than the one being written.
@@ -660,7 +935,7 @@ impl DiskStore {
         self.streams.values().any(|d| d.segments.len() > 1)
     }
 
-    fn retain(&mut self, now_ms: u64, ops: &mut Vec<FileOp>) {
+    fn retain(&mut self, now_ms: u64, ops: &mut Vec<FileOp>, shelve: &mut BTreeSet<StreamKey>) {
         for (key, durable) in &mut self.streams {
             let (max_bytes, max_age) = (durable.retention.max_bytes, durable.retention.max_age.as_millis() as u64);
             let mut bytes: u64 = durable.segments.iter().map(|s| s.bytes).sum();
@@ -676,6 +951,7 @@ impl DiskStore {
                     break;
                 }
                 bytes -= durable.segments.pop_front().expect("more than one").bytes;
+                shelve.insert(key.clone());
                 if let Some(name) = name {
                     remove(ops, name);
                 }
@@ -699,7 +975,14 @@ impl DiskStore {
         self.stats.failing = None;
         self.stats.unwritten_bytes -= flush.bytes;
         let open = |key: &StreamKey, id: u64| self.streams.get(key).is_some_and(|d| d.id == id);
-        flush.batches.into_iter().filter(|(key, id, _)| open(key, *id)).map(|(key, _, batch)| (key, batch)).collect()
+        let durable: Vec<_> = flush
+            .batches
+            .into_iter()
+            .filter(|(key, id, _)| open(key, *id))
+            .map(|(key, _, batch)| (key, batch))
+            .collect();
+        self.shelf.durable(durable.iter().map(|(key, batch)| (key, batch.last())));
+        durable
     }
 
     pub(crate) fn failing(&self) -> Option<DiskError> {

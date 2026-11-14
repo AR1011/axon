@@ -1,5 +1,5 @@
 # This node's names, sourced by fault.sh, setup.sh and run.sh's commands on a node: on a box of its own they are the
-# plain ones; inside network namespace bN (setup.sh --netns, five nodes on one box) each carries bN.
+# plain ones; inside network namespace axrig-bN (setup.sh --netns, five nodes on one box) each carries axrig-bN.
 n=$(ip netns identify 2>/dev/null || true)
 # A disk's dm device, mount and image: journal, the default, or streams.
 device() { dm=rig-$1${n:+-$n} mnt=/mnt/rig-$1${n:+-$n} img=/var/lib/rig-$1${n:+-$n}.img; }
