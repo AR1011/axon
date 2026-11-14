@@ -5,11 +5,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::time::Duration;
 
+use axon::files::Files;
 use axon::{
     ActorHandle, ActorSystem, ExtensionFuture, LeaveReason, LifecycleHandle, Reject, RejectReason, SupervisedHandle,
     SystemExtension, WeakActorSystem,
 };
-use axon_net::{AcceptLimits, Backoff, Identity, Lane};
+use axon_net::{AcceptLimits, Backoff, Identity, Lane, LinkTimings};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use parking_lot::{Mutex, RwLock};
 use tokio::sync::{Notify, Semaphore};
@@ -34,14 +35,23 @@ pub struct ClusterConfig {
     /// The address peers dial. Defaults to the bound address; a port of 0 takes the bound port.
     pub advertise: Option<SocketAddr>,
     pub transport: axon_net::Config,
+    /// Timings for the links to peers that share this node's value of a label, apart from the transport's, which the
+    /// rest keep.
+    pub near: Option<Near>,
     pub tls: Option<Tls>,
     pub discovery: Arc<dyn Discovery>,
+    /// Where the node keeps its last live view, as the file `view`, written at most once per `poll_interval`. A node
+    /// that restarts while discovery cannot list it, as when its region is cut from most seeds, starts from that view,
+    /// stale, rather than with none; peers whose views are stale too take its new boot from their handshakes with it.
+    /// A file that is missing or does not read starts the node with an empty view.
+    pub view_store: Option<Arc<dyn Files>>,
     /// Advertised in discovery metadata and matched by `Placement`. Bounded so that every provider, Consul included,
     /// takes them: at most 60 entries, the cluster's own `axon.*` ones included, keys of 1 to 60 bytes with no control
     /// character, and values of at most 512 bytes.
     pub labels: BTreeMap<String, String>,
     pub authorizer: Option<Arc<dyn Authorizer>>,
-    /// Makes keyed actors strictly owned: a lease is taken before each one starts.
+    /// Makes keyed actors strictly owned: a lease is taken before each one starts, for every kind not registered
+    /// [`unleased`](crate::KindBuilder::unleased).
     pub ownership: Option<Arc<dyn OwnershipAuthority>>,
     pub accept: AcceptLimits,
     /// Redials of a peer. Its `max` (2 s) bounds how long calls wait once a cut to a listed peer heals.
@@ -87,11 +97,23 @@ pub struct ClusterConfig {
     pub event_capacity: usize,
 }
 
+/// A peer whose record has this node's value of `label` (for example `region`) is near: each of its lanes runs these
+/// timings in place of the transport's. Every other peer, and every peer of a node without the label, runs the
+/// transport's. A dial knows the peer from its record; an accepted session from the view, once the handshake named
+/// the peer, and a peer not listed yet runs the transport's until its next session.
+#[derive(Clone, Debug)]
+pub struct Near {
+    pub label: String,
+    pub timings: LinkTimings,
+}
+
 impl ClusterConfig {
     /// Tightens the transport keepalive to 1 s / 4 s idle: it is the cluster's failure detector. A dial's connect gets
     /// 1.5 s, or the handshake timeout where that is shorter, so a SYN lost once, which the kernel sends again at 1 s,
     /// still connects. `Cluster::start` tightens the idle timeout further to the ownership authority's
-    /// [`hold`](OwnershipAuthority::hold) when that is shorter, and the keepalive and the connect to a quarter of it.
+    /// [`hold`](OwnershipAuthority::hold) when that is shorter, and the keepalive and the connect to a quarter of it:
+    /// on every link. With [`near`](Self::near) set it does so on the near links only, refusing a near idle above the
+    /// hold rather than lowering it, and leaves the other links on the transport's.
     pub fn new(bind: SocketAddr, mut transport: axon_net::Config, discovery: impl Discovery) -> Self {
         transport.keepalive_interval = Duration::from_secs(1);
         transport.idle_timeout = Duration::from_secs(4);
@@ -101,8 +123,10 @@ impl ClusterConfig {
             bind,
             advertise: None,
             transport,
+            near: None,
             tls: None,
             discovery: Arc::new(discovery),
+            view_store: None,
             labels: BTreeMap::new(),
             authorizer: None,
             ownership: None,
@@ -347,6 +371,8 @@ pub(crate) struct Inner {
     pub gates: Box<[tokio::sync::Mutex<()>]>,
     /// Bumped under `unique` whenever every keyed actor is told to stop, so a start in flight notices.
     pub sweeps: AtomicU64,
+    /// Bumped with `sweeps`, and also when only the keyed actors that hold no lease are told to stop.
+    pub unleased_sweeps: AtomicU64,
     pub rebalance_settle: Duration,
     resync_interval: Duration,
     /// A leave's hand-offs, each under way from its actor's end, and the drain of `eager`, which `finish_leaving`
@@ -381,6 +407,9 @@ pub(crate) struct Inner {
     compress_control: bool,
     heartbeat_error: Mutex<Option<String>>,
     pub heartbeat_grace: Duration,
+    /// Discovery drops this node before `heartbeat_interval + 3/2 heartbeat_grace`, by which an isolated node stops
+    /// the keys it does not hold a lease for: they would run twice in between.
+    pub isolates_late: bool,
     heartbeat_ok: Mutex<Instant>,
     snapshot_ok: Mutex<Instant>,
     /// Held from asking discovery for a snapshot to applying it, so no answer replaces one asked for after it.
@@ -441,6 +470,7 @@ impl Cluster {
     /// the system so that `system.shutdown()` leaves the cluster gracefully.
     pub async fn start(system: &ActorSystem, cfg: ClusterConfig) -> Result<Self, ClusterError> {
         let advertised = cfg.advertise.unwrap_or(cfg.bind);
+        let view_store = cfg.view_store.clone();
         if advertised.ip().is_unspecified() {
             return Err(ClusterError::Config("binding a wildcard address requires `advertise`"));
         }
@@ -459,8 +489,10 @@ impl Cluster {
             return Err(ClusterError::Config("lease_renew_interval must be above zero"));
         }
         // A node that isolates after its peers dropped it runs its keys twice in between; a lease fences them instead.
+        // With an authority, `register` checks it for each unleased kind.
         let stops_within = cfg.heartbeat_interval.saturating_add(cfg.heartbeat_grace.saturating_mul(3) / 2);
-        if cfg.ownership.is_none() && cfg.discovery.drops_after().is_some_and(|drops| stops_within >= drops) {
+        let isolates_late = cfg.discovery.drops_after().is_some_and(|drops| stops_within >= drops);
+        if cfg.ownership.is_none() && isolates_late {
             return Err(ClusterError::Config(
                 "heartbeat_interval + 3/2 heartbeat_grace must be under the discovery's drops_after without an \
                  ownership authority",
@@ -468,15 +500,34 @@ impl Cluster {
         }
         let mut transport = cfg.transport;
         // A holder silent for a whole lease holds nothing. A session that quiet is not trusted, or a caller holding one
-        // would send the holder's keys there until the idle timeout, long after the lease let them go.
-        if let Some(hold) = hold.filter(|hold| *hold < transport.idle_timeout) {
-            transport.idle_timeout = hold;
-            transport.keepalive_interval = transport.keepalive_interval.min(hold / 4);
-            transport.connect_timeout = transport.connect_timeout.min(hold / 4);
-        }
+        // would send the holder's keys there until the idle timeout, long after the lease let them go. With `near` only
+        // near links are held to it: over a far one that costs liveness only, since the holder's fence stops its actors
+        // at `lease_grace`, and a far caller walks on after its idle and a connect.
+        let near = match cfg.near {
+            Some(mut near) => {
+                if let Some(hold) = hold {
+                    if near.timings.idle > hold {
+                        return Err(ClusterError::Config("near idle must be at most the ownership authority's hold"));
+                    }
+                    near.timings.keepalive = near.timings.keepalive.min(hold / 4);
+                    near.timings.connect = near.timings.connect.min(hold / 4);
+                }
+                near.timings.validate(&transport)?;
+                cfg.labels.get(&near.label).cloned().map(|value| (near, value))
+            }
+            None => {
+                if let Some(hold) = hold.filter(|hold| *hold < transport.idle_timeout) {
+                    transport.idle_timeout = hold;
+                    transport.keepalive_interval = transport.keepalive_interval.min(hold / 4);
+                    transport.connect_timeout = transport.connect_timeout.min(hold / 4);
+                }
+                None
+            }
+        };
         let membership = Membership::new(cfg.event_capacity);
         let engine_cfg = EngineConfig {
             transport,
+            near,
             backoff: cfg.backoff,
             request_timeout: cfg.request_timeout,
             poll_interval: cfg.poll_interval,
@@ -524,6 +575,7 @@ impl Cluster {
             lease_grace,
             gates: (0..256).map(|_| tokio::sync::Mutex::new(())).collect(),
             sweeps: AtomicU64::new(0),
+            unleased_sweeps: AtomicU64::new(0),
             rebalance_settle: cfg.rebalance_settle,
             resync_interval: cfg.resync_interval,
             handoff: Mutex::default(),
@@ -549,6 +601,7 @@ impl Cluster {
             compress_control: cfg.compress_control,
             heartbeat_error: Mutex::default(),
             heartbeat_grace: cfg.heartbeat_grace,
+            isolates_late,
             heartbeat_ok: Mutex::new(Instant::now()),
             snapshot_ok: Mutex::new(Instant::now()),
             refreshing: tokio::sync::Mutex::default(),
@@ -565,6 +618,14 @@ impl Cluster {
         });
         inner.discovery.attach(&inner.events);
         let started = async {
+            if let Some(files) = &view_store {
+                let cached = timeout(inner.operation_timeout, crate::view_file::load(&**files, inner.local_node()));
+                if let Ok(Some(nodes)) = cached.await
+                    && nodes.len() <= inner.max_nodes
+                {
+                    inner.engine.membership.cached(nodes);
+                }
+            }
             inner.register_system_endpoints()?;
             if let Some(authority) = &inner.ownership {
                 authority.attach(&Cluster(inner.clone())).await?;
@@ -576,6 +637,9 @@ impl Cluster {
                 tokio::spawn(inner.clone().poll_loop(poll, heartbeat)),
                 tokio::spawn(inner.clone().rebalance_loop()),
             ];
+            if let Some(files) = view_store.clone() {
+                tasks.push(tokio::spawn(crate::view_file::keep(files, inner.engine.membership.clone(), poll)));
+            }
             if inner.ownership.is_some() {
                 tasks.push(tokio::spawn(inner.clone().renew_loop(renew_every)));
                 tasks.push(tokio::spawn(inner.clone().eager_loop()));
@@ -1123,6 +1187,7 @@ impl Inner {
     pub async fn announce(&self) -> Result<(), ClusterError> {
         let record = self.record.lock().clone();
         record.validate()?;
+        self.engine.membership.announced(&record);
         match timeout(self.operation_timeout, self.discovery.register(&record)).await {
             Ok(Ok(())) | Ok(Err(DiscoveryError::ReadOnly)) => Ok(()),
             Ok(Err(error)) => Err(error.into()),
@@ -1187,9 +1252,11 @@ impl Inner {
     }
 
     /// `snapshot_ok` tells how long discovery has been failing, and a provider that is watched may not have
-    /// been asked for a while: the first failure counts from now, not from the last answer.
+    /// been asked for a while: the first failure counts from now, not from the last answer. A cached view is stale
+    /// before any failure; its first one counts from now too.
     fn unavailable(&self, error: String) {
-        if self.engine.membership.view().stale.is_none() {
+        let view = self.engine.membership.view();
+        if view.stale.is_none() || (view.cached && view.stale.as_deref() == Some(crate::membership::CACHED)) {
             *self.snapshot_ok.lock() = Instant::now();
         }
         self.engine.membership.unavailable(error);

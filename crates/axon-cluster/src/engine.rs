@@ -459,6 +459,8 @@ enum Waiter {
 pub(crate) struct Link {
     pub sender: Sender,
     pub outgoing: bool,
+    /// Runs `ClusterConfig::near`'s timings.
+    near: bool,
     pending: Mutex<HashMap<u64, Waiter>>,
     /// The peer's requests answered in parts, by its call id: where its credit goes.
     producing: Mutex<BTreeMap<u64, Arc<Flow>>>,
@@ -475,10 +477,11 @@ pub(crate) struct Link {
 }
 
 impl Link {
-    fn new(sender: Sender, outgoing: bool) -> Arc<Self> {
+    fn new(sender: Sender, outgoing: bool, near: bool) -> Arc<Self> {
         Arc::new(Self {
             sender,
             outgoing,
+            near,
             pending: Mutex::default(),
             producing: Mutex::default(),
             bodies: Mutex::default(),
@@ -730,6 +733,8 @@ pub struct PeerStats {
     /// The wire version the session runs.
     pub version: u16,
     pub lane: Lane,
+    /// The link runs `ClusterConfig::near`'s timings.
+    pub near: bool,
     /// How long an outgoing `Live` or `Bulk` lane has had no session while `Control` is up, once its dial failed: a
     /// row with no session of its own. `None` for a session.
     pub down_ms: Option<u64>,
@@ -766,6 +771,8 @@ pub struct EngineStats {
 
 pub(crate) struct EngineConfig {
     pub transport: axon_net::Config,
+    /// `ClusterConfig::near`, and this node's value of its label.
+    pub near: Option<(crate::Near, String)>,
     pub backoff: Backoff,
     pub request_timeout: Duration,
     pub poll_interval: Duration,
@@ -1217,8 +1224,16 @@ impl Engine {
                 _ = closed.wait_for(|c| *c) => None,
             };
             let Some(session) = session else { return listener.close().await };
-            let link = Link::new(session.sender.clone(), false);
             let (identity, lane) = (&session.peer().identity, session.peer().lane);
+            if self.learn_boot(&identity.node_id, identity.incarnation) {
+                self.reset_peer(&identity.node_id);
+            }
+            let near = (self.cfg.near.as_ref())
+                .filter(|_| self.membership.view().get(&identity.node_id).is_some_and(|m| self.is_near(&m.record)));
+            if let Some((near, _)) = near {
+                session.set_timings(near.timings).expect("validated at start");
+            }
+            let link = Link::new(session.sender.clone(), false, near.is_some());
             let key = (identity.node_id.as_str().into(), lane);
             // A peer dials a lane again while the session it let go idle still carries replies to its calls: that one
             // stays, until its peer closes it or a third comes. Sessions of another boot are gone.
@@ -1275,7 +1290,7 @@ impl Engine {
         while !*closed.borrow() {
             let Some(record) = self.membership.view().get(&node).map(|m| m.record.clone()) else { break };
             if dial.as_ref().is_none_or(|(r, _)| r.boot() != record.boot()) {
-                let cfg = self.cfg.transport.clone();
+                let cfg = self.dialled(self.is_near(&record));
                 dial = Some((
                     record.clone(),
                     Redial::new(record.address, Lane::Control, None, cfg, self.cfg.backoff.clone()),
@@ -1288,9 +1303,10 @@ impl Engine {
             });
             dial.as_mut().expect("dial set").1.tls = tls;
             let quiet = silent.take();
+            let connect = dial.as_ref().expect("dial set").1.cfg.connect_timeout;
             let give_up = async {
                 if let Some(error) = quiet {
-                    tokio::time::sleep(self.cfg.transport.connect_timeout).await;
+                    tokio::time::sleep(connect).await;
                     self.membership.set_reachable(&node, record.incarnation, false);
                     slot.state.send_replace(LinkState::Down(error, Some(record.boot())));
                 }
@@ -1313,7 +1329,8 @@ impl Engine {
             let pause = match attempt {
                 Ok(session) if named(&session.peer().identity) => {
                     self.counters.connects.fetch_add(1, Relaxed);
-                    let link = Link::new(session.sender.clone(), true);
+                    let near = dial.as_ref().is_some_and(|(dialled, _)| self.is_near(dialled));
+                    let link = Link::new(session.sender.clone(), true, near);
                     // The boot the handshake answered for, at the address dialled.
                     slot.state.send_replace(LinkState::Up(link.clone(), (dialled.0, record.incarnation)));
                     self.membership.set_reachable(&node, record.incarnation, true);
@@ -1332,6 +1349,13 @@ impl Engine {
                     if matches!(attempt, Err(DialError::Failed(_))) {
                         self.counters.dial_failures.fetch_add(1, Relaxed);
                     }
+                    continue;
+                }
+                // A newer boot of it, taken while the view is stale: dialled again as that boot.
+                Ok(session)
+                    if *session.peer().identity.node_id == *node
+                        && self.learn_boot(&node, session.peer().identity.incarnation) =>
+                {
                     continue;
                 }
                 Ok(_) => {
@@ -1368,7 +1392,7 @@ impl Engine {
         while !*closed.borrow() {
             let control_state = on.borrow_and_update().clone();
             let up = match control_state {
-                LinkState::Up(link, boot) => Some((boot, link.sender.peer().identity.incarnation)),
+                LinkState::Up(link, boot) => Some((boot, link.sender.peer().identity.incarnation, link.near)),
                 LinkState::Down(_, None) => break,
                 down @ LinkState::Down(..) => {
                     slot.state.send_replace(down);
@@ -1378,7 +1402,7 @@ impl Engine {
                 }
                 LinkState::Connecting => None,
             };
-            let Some((boot, incarnation)) = up else {
+            let Some((boot, incarnation, near)) = up else {
                 tokio::select! {
                     _ = on.changed() => continue,
                     _ = closed.wait_for(|c| *c) => break,
@@ -1388,7 +1412,7 @@ impl Engine {
                 slot.state.send_replace(LinkState::Connecting);
             }
             if dial.as_ref().is_none_or(|(b, _)| *b != boot) {
-                let (cfg, backoff) = (self.cfg.transport.clone(), self.cfg.backoff.clone());
+                let (cfg, backoff) = (self.dialled(near), self.cfg.backoff.clone());
                 dial = Some((boot, Redial::new(boot.0, lane, None, cfg, backoff)));
             }
             let redial = &mut dial.as_mut().expect("dial set").1;
@@ -1406,7 +1430,7 @@ impl Engine {
                         && session.peer().identity.incarnation == incarnation =>
                 {
                     self.counters.connects.fetch_add(1, Relaxed);
-                    let link = Link::new(session.sender.clone(), true);
+                    let link = Link::new(session.sender.clone(), true, near);
                     if slot.down_since.lock().take().is_some() {
                         self.cfg.events.record("lane_up", &*node, format!("{lane:?}"));
                     }
@@ -1466,6 +1490,19 @@ impl Engine {
         slot.state.send_replace(LinkState::Down(Error::Closed, None));
     }
 
+    /// Whether `record` has this node's value of `ClusterConfig::near`'s label.
+    fn is_near(&self, record: &NodeRecord) -> bool {
+        self.cfg.near.as_ref().is_some_and(|(near, value)| record.label(&near.label) == Some(value.as_str()))
+    }
+
+    /// What a dial runs with: the transport, on the near timings for a near peer.
+    fn dialled(&self, near: bool) -> axon_net::Config {
+        match &self.cfg.near {
+            Some((n, _)) if near => n.timings.applied(&self.cfg.transport),
+            _ => self.cfg.transport.clone(),
+        }
+    }
+
     fn forget(&self, node: &Arc<str>, lane: Lane, slot: &Arc<PeerSlot>) {
         let mut peers = self.peers.lock();
         let Some(lanes) = peers.get_mut(node) else { return };
@@ -1520,6 +1557,16 @@ impl Engine {
         link.sender.close();
         slot.state.send_replace(LinkState::Down(Error::Closed, None));
         None
+    }
+
+    /// A newer boot of `node` a handshake proved, taken into a stale view (`Membership::learn_boot`), never of this
+    /// node: the routes cached from the old boot go, as a snapshot's replace clears them. Whether it was taken.
+    fn learn_boot(&self, node: &str, incarnation: u128) -> bool {
+        let taken = self.local.identity.node_id != node && self.membership.learn_boot(node, incarnation);
+        if taken {
+            self.stale_routes.fetch_add(1, Relaxed);
+        }
+        taken
     }
 
     /// Ends the session to a node whose record changed under it; its task redials from the view. A dial or a backoff
@@ -2066,6 +2113,7 @@ impl Engine {
                 session: link.sender.stats(),
                 version: link.sender.peer().version,
                 lane: link.sender.peer().lane,
+                near: link.near,
                 down_ms: None,
             }
         });
@@ -2073,8 +2121,10 @@ impl Engine {
             let others = lanes.iter().zip(Lane::ALL).skip(1);
             let down = others.filter_map(|(slot, lane)| Some((lane, (*slot.as_ref()?.down_since.lock())?)));
             down.filter_map(move |(lane, since)| {
-                let (incarnation, version) = match &*lanes[Lane::Control as usize].as_ref()?.state.borrow() {
-                    LinkState::Up(link, _) => (link.sender.peer().identity.incarnation, link.sender.peer().version),
+                let (incarnation, version, near) = match &*lanes[Lane::Control as usize].as_ref()?.state.borrow() {
+                    LinkState::Up(link, _) => {
+                        (link.sender.peer().identity.incarnation, link.sender.peer().version, link.near)
+                    }
                     _ => return None,
                 };
                 Some(PeerStats {
@@ -2087,6 +2137,7 @@ impl Engine {
                     session: SessionStats::default(),
                     version,
                     lane,
+                    near,
                     down_ms: Some(u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX)),
                 })
             })

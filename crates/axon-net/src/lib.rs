@@ -21,7 +21,8 @@ pub use tokio_rustls::rustls;
 /// A session's traffic class, named in its hello: [`Config::lanes`] holds what each runs with.
 pub use axon::Lane;
 pub use config::{
-    Authenticator, CertificateIdentity, Config, Identity, LaneConfig, Lanes, Limits, PeerContext, SharedSecret,
+    Authenticator, CertificateIdentity, Config, Identity, LaneConfig, Lanes, Limits, LinkTimings, PeerContext,
+    SharedSecret,
 };
 pub use error::{Error, FrameError, Negotiation, SubmitError, SubmitReason, Timeout};
 pub use frame::{Codecs, Compression, Frame, PREFIX_MAX, Prefix};

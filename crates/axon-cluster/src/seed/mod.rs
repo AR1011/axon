@@ -23,6 +23,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{Instant, MissedTickBehavior, sleep, sleep_until, timeout};
 
 use self::core::{MAX_FRAME, MAX_MEMBERS, Node, NodeOut, Out, SYNCED, Server, SessionId, parse_seed};
+pub(crate) use self::core::{get_record, put_record};
 use crate::{BoxFuture, Discovery, DiscoveryError, NodeRecord, ProviderInfo, ProviderLink, Snapshot, Tls};
 
 const KEEPALIVE: Duration = Duration::from_secs(1);

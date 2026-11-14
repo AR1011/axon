@@ -391,6 +391,40 @@ async fn keyed_actors_move_and_stop_with_their_paxos_leases() {
     assert_eq!(host.cluster.stats().spawned, 0);
 }
 
+/// A kind registered `unleased` is placed by the view alone, as on a node without an authority: a node that reaches no
+/// majority of the acceptors still starts its keys, and refuses those of a leased kind `Isolated`.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unleased_kind_starts_with_the_acceptors_down_and_a_leased_kind_is_refused_isolated() {
+    let discovery = MemoryDiscovery::new();
+    let mut acceptors = Vec::new();
+    for id in ["p-0", "p-1", "p-2"] {
+        acceptors.push(paxos_host(id, &discovery).await);
+    }
+    let host = paxos_host("a", &discovery).await;
+    counter_kind(&host).await;
+    let build = |_: &SpawnContext, _: Bytes| Ok(Counter { total: 0, tag: String::new() });
+    host.cluster.kind::<CounterApi>("cache").unleased().register(build).await.unwrap();
+    let record = host.cluster.record();
+    assert_eq!((record.kind_leased("counter"), record.kind_leased("cache")), (Some(true), Some(false)));
+    let anywhere = Placement::default();
+    let spawn = |kind, key| host.cluster.get_or_spawn::<CounterApi>(kind, key, seed(0), &anywhere);
+    // Granted once the acceptors have warmed up.
+    eventually("a leased key starts", || async { spawn("counter", "k").await.is_ok() }).await;
+
+    for acceptor in acceptors {
+        acceptor.system.shutdown().await.unwrap();
+    }
+    eventually("a leased key is refused Isolated", || async {
+        matches!(spawn("counter", "other").await, Err(ClusterError::Spawn(SpawnRefusal::Isolated, _)))
+    })
+    .await;
+    let cached = spawn("cache", "k").await.unwrap();
+    assert_eq!((cached.node(), cached.epoch()), ("a", None));
+    cached.send(Op::Add(2)).await.unwrap();
+    assert_eq!(number(spawn("cache", "k").await.unwrap().request(Op::Get).await.unwrap()), 2);
+    host.system.shutdown().await.unwrap();
+}
+
 /// The lease timings follow the lease: with a 1 s lease and nothing else set, the renewals keep one actor
 /// through several leases. `keyed_actors_move_and_stop_with_their_paxos_leases` shows the grace ending inside it.
 #[tokio::test(flavor = "multi_thread")]
@@ -450,4 +484,38 @@ async fn each_start_of_a_key_has_its_own_number_though_starts_share_an_epoch() {
     assert!(e1.is_some() && e1 == e2, "the policy builds again under the lease it holds: {starts:?}");
     assert!(s1 < s2 && s2 < s3 && s3 < s4, "{starts:?}");
     a.system.shutdown().await.unwrap();
+}
+
+/// Near links are held to the authority's hold, so a caller near a holder stops trusting a quiet session before the
+/// lease lets the holder's keys go; an idle beyond it is refused at start, not clamped.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_near_idle_beyond_the_hold_is_refused() {
+    let start = |near_idle: Duration| async move {
+        let mut cfg = ClusterConfig::new("127.0.0.1:0".parse().unwrap(), transport("a"), MemoryDiscovery::new());
+        common::short(&mut cfg);
+        let mut paxos = PaxosConfig::new(["a"]);
+        // spec/wan.md § 14's near lease: a hold of 3.76 s.
+        paxos.lease = Duration::from_secs(4);
+        paxos.store = Some(Arc::new(axon::files::MemoryFiles::new()));
+        cfg.ownership = Some(Arc::new(PaxosLeases::new(paxos).unwrap()));
+        cfg.labels.insert("region".into(), "one".into());
+        // The near timings of spec/wan.md § 14, with the idle under test.
+        cfg.near = Some(Near {
+            label: "region".into(),
+            timings: axon_net::LinkTimings {
+                // spec/wan.md § 14's near keepalive and connect; the idle is the one under test.
+                keepalive: Duration::from_millis(500),
+                idle: near_idle,
+                connect: Duration::from_millis(500),
+            },
+        });
+        let system = ActorSystem::builder().build().unwrap();
+        let started = Cluster::start(&system, cfg).await.map(drop);
+        (system, started)
+    };
+    let (_, refused) = start(Duration::from_secs(4)).await;
+    assert!(matches!(refused, Err(ClusterError::Config(_))), "{refused:?}");
+    let (system, started) = start(Duration::from_secs(2)).await;
+    started.unwrap();
+    system.shutdown().await.unwrap();
 }

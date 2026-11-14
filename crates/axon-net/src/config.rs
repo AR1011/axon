@@ -275,10 +275,52 @@ impl Config {
             check(lane.max_bytes_per_sec != Some(0), "max_bytes_per_sec must be non-zero")?;
             check(lane.notsent_lowat != Some(0), "notsent_lowat must be non-zero")?;
         }
-        let timeouts = [self.handshake_timeout, self.connect_timeout, self.write_timeout, self.keepalive_interval];
-        check(timeouts.iter().all(|t| !t.is_zero()), "timeouts must be non-zero")?;
-        check(self.connect_timeout <= self.handshake_timeout, "connect_timeout must be within handshake_timeout")?;
-        check(self.keepalive_interval < self.idle_timeout, "keepalive_interval must be below idle_timeout")
+        check(!self.handshake_timeout.is_zero() && !self.write_timeout.is_zero(), "timeouts must be non-zero")?;
+        LinkTimings::of(self).validate(self)
+    }
+}
+
+/// A session's keepalive, idle timeout and dial connect timeout, which may differ from its [`Config`]'s: a dial takes
+/// them in the config it is given ([`applied`](Self::applied)), an accepted session from
+/// [`Session::set_timings`](crate::Session::set_timings).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LinkTimings {
+    pub keepalive: Duration,
+    /// Nothing received for this long closes the session. Pongs count.
+    pub idle: Duration,
+    /// How long a dial waits for its TCP connect, within the `Config`'s `handshake_timeout`.
+    pub connect: Duration,
+}
+
+impl LinkTimings {
+    /// The `Config`'s own.
+    pub fn of(cfg: &Config) -> Self {
+        Self { keepalive: cfg.keepalive_interval, idle: cfg.idle_timeout, connect: cfg.connect_timeout }
+    }
+
+    /// Refuses timings no session of `cfg` could run with.
+    pub fn validate(&self, cfg: &Config) -> Result<(), Error> {
+        let check = |ok: bool, why| if ok { Ok(()) } else { Err(Error::Config(why)) };
+        check(!self.connect.is_zero(), "timeouts must be non-zero")?;
+        check(self.connect <= cfg.handshake_timeout, "connect_timeout must be within handshake_timeout")?;
+        self.validate_ticks()
+    }
+
+    /// Refuses a keepalive a session could not tick on: zero, or not below the idle timeout.
+    pub(crate) fn validate_ticks(&self) -> Result<(), Error> {
+        let check = |ok: bool, why| if ok { Ok(()) } else { Err(Error::Config(why)) };
+        check(!self.keepalive.is_zero(), "timeouts must be non-zero")?;
+        check(self.keepalive < self.idle, "keepalive_interval must be below idle_timeout")
+    }
+
+    /// `cfg` with these in place of its own.
+    pub fn applied(self, cfg: &Config) -> Config {
+        Config {
+            keepalive_interval: self.keepalive,
+            idle_timeout: self.idle,
+            connect_timeout: self.connect,
+            ..cfg.clone()
+        }
     }
 }
 

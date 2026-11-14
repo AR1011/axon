@@ -2,8 +2,9 @@
 //!
 //! A keyed actor lives on the rendezvous winner among the nodes that advertise its kind and
 //! satisfy its placement. The receiving node checks that it is the winner in its own view, but for the nodes the
-//! caller names as passed under an ownership authority: those that could not take the lease, or that the caller
-//! cannot reach. The lease, not the check, keeps a key on one node.
+//! caller names as passed for a leased kind: those that could not take the lease, or that the caller cannot reach.
+//! The lease, not the check, keeps a key of a leased kind on one node; a kind registered `unleased`, or any kind on a
+//! node without an ownership authority, has the check alone.
 
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
@@ -97,9 +98,15 @@ pub(crate) struct Kind {
     factory: Factory,
     /// The args and placement a key of an eager kind restarts with.
     eager: Option<(Bytes, Placement)>,
+    /// Its keys run under the ownership authority's leases: there is one, and the kind is not `unleased`.
+    leased: bool,
     /// Carried to the kind registered again in its place.
     counts: Arc<KindCounts>,
 }
+
+/// Bits of the `axon.owns` answer, `Inner::takes_keys`: keys of leased kinds, and of the others.
+const TAKES_LEASED: u8 = 1;
+const TAKES_UNLEASED: u8 = 2;
 
 /// How a key came to start here, indexing [`HostedKind::started`]: a call asked this node (`get_or_spawn`, and an
 /// eager restart or a move that this node asked itself or another node asked), or a node that moved the key or left
@@ -384,12 +391,12 @@ impl Inner {
             tokio.spawn(async move {
                 // A no looks again once: the first look asks again an acceptor link that failed long ago, and a
                 // healthy one has answered by then.
-                let mut takes = inner.takes_keys();
-                if !takes {
+                let mut answer = inner.takes_keys();
+                if answer != TAKES_LEASED | TAKES_UNLEASED {
                     sleep(HELD_RETRY).await;
-                    takes = inner.takes_keys();
+                    answer = inner.takes_keys();
                 }
-                let _ = reply.send(Bytes::copy_from_slice(&[takes as u8]));
+                let _ = reply.send(Bytes::copy_from_slice(&[answer]));
             });
             Ok(None)
         });
@@ -415,12 +422,26 @@ impl Inner {
         &self.gates[hasher.finish() as usize % self.gates.len()]
     }
 
-    /// Stops every keyed actor here, and makes any start still in flight give up. Returns their keys.
-    fn sweep(&self) -> Vec<String> {
+    /// Stops every keyed actor here, or with `unleased_only` those that hold no lease, and makes any start still in
+    /// flight give up. Returns their keys.
+    fn sweep(&self, unleased_only: bool) -> Vec<String> {
         let unique = self.unique.lock();
-        self.sweeps.fetch_add(1, Relaxed);
-        unique.values().for_each(|u| u.lifecycle.stop());
-        unique.keys().map(|(kind, key)| lease_of(kind, key)).collect()
+        self.unleased_sweeps.fetch_add(1, Relaxed);
+        if !unleased_only {
+            self.sweeps.fetch_add(1, Relaxed);
+        }
+        (unique.iter())
+            .filter(|(_, u)| !unleased_only || u.epoch.is_none())
+            .map(|((kind, key), u)| {
+                u.lifecycle.stop();
+                lease_of(kind, key)
+            })
+            .collect()
+    }
+
+    /// The sweeps so far that stop a key of a kind `leased` or not: a leased key stops only for those of every key.
+    fn sweeps_of(&self, leased: bool) -> u64 {
+        (if leased { &self.sweeps } else { &self.unleased_sweeps }).load(Relaxed)
     }
 
     /// Starts again, without a caller, the keys of eager kinds among `names` that ended here, or were taken on here and
@@ -488,11 +509,13 @@ impl Inner {
         view.owner(kind, key, placement) == Some(self.local_node())
     }
 
-    /// Whether this node would take a key moved to it: open, a member, and able to take the lease.
-    fn takes_keys(&self) -> bool {
-        self.engine.open.load(Relaxed)
-            && !self.isolated.load(Relaxed)
-            && self.ownership.as_ref().is_none_or(|a| a.can_grant())
+    /// Which keys this node would take moved to it, as `axon.owns` answers: those of unleased kinds while it is open
+    /// and a member, and those of leased kinds while it can also take the lease.
+    fn takes_keys(&self) -> u8 {
+        if !self.engine.open.load(Relaxed) || self.isolated.load(Relaxed) {
+            return 0;
+        }
+        TAKES_UNLEASED | if self.ownership.as_ref().is_none_or(|a| a.can_grant()) { TAKES_LEASED } else { 0 }
     }
 
     /// `request` on `node`, which must serve the caller's `schema`.
@@ -512,8 +535,9 @@ impl Inner {
     /// names the holder sends the caller there. Any other refusal, such as acceptors still warming up, ends the walk
     /// with the first node's answer: the key would only start away from its owner. A holder that cannot be reached is
     /// waited for, asking again every `HELD_RETRY`, until `operation_timeout`; with `Follow::No` a `Held` refusal is
-    /// returned at once. Without an authority only the owner is asked. `schema`: the caller's, which every node asked
-    /// must serve.
+    /// returned at once. For an owner that advertises the kind unleased only the owner is asked: its mode decides, not
+    /// this node's, so every caller walks one way to one owner. `schema`: the caller's, which every node asked must
+    /// serve.
     async fn place_keyed(
         self: &Arc<Self>,
         mut request: SpawnRequest,
@@ -529,7 +553,7 @@ impl Inner {
             };
             request.passed.clear();
             let mut node = next(&request).ok_or(ClusterError::NoCandidate)?;
-            if self.ownership.is_none() {
+            if !view.leases(&node, &request.kind) {
                 return self.place_at(&view, node, &request, schema).await;
             }
             let key = request.key.as_deref().expect("a keyed request");
@@ -601,7 +625,7 @@ impl Inner {
             Some(slot) => Some(self.gate(slot).lock().await),
             None => None,
         };
-        let sweeps = self.sweeps.load(Relaxed);
+        let sweeps = self.sweeps_of(kind.leased);
         // One budget for waiting out an ending actor and a lease held elsewhere.
         let deadline = Instant::now() + self.operation_timeout;
         if let Some(slot) = &slot {
@@ -635,14 +659,14 @@ impl Inner {
             if self.isolated.load(Relaxed) {
                 return isolated();
             }
-            if self.ownership.as_ref().is_some_and(|a| !a.can_grant()) {
+            if kind.leased && self.ownership.as_ref().is_some_and(|a| !a.can_grant()) {
                 return Err((SpawnRefusal::Isolated, "this node reaches no majority of the authority".into()));
             }
             // The caller may simply be ahead of this node's view, or have seen the owner this node picks crash, which
             // a node that never called it cannot see: look again, and try that owner, before refusing.
-            // With an authority, the first of the order the caller did not pass. Without one, the owner: nothing would
-            // keep a key started past it on one node.
-            let passed = if self.ownership.is_some() { &request.passed[..] } else { &[] };
+            // For a leased kind, the first of the order the caller did not pass. Otherwise the owner: nothing would keep
+            // a key started past it on one node.
+            let passed = if kind.leased { &request.passed[..] } else { &[] };
             let placed = || {
                 let view = self.engine.membership.view();
                 view.owner_past(&request.kind, &slot.1, &request.placement, passed).map(Arc::<str>::from)
@@ -666,7 +690,7 @@ impl Inner {
             let _ = checked.send(());
         }
 
-        let lease = slot.as_ref().map(|(kind, key)| lease_of(kind, key));
+        let lease = slot.as_ref().filter(|_| kind.leased).map(|(kind, key)| lease_of(kind, key));
         let built = async {
             let epoch = match (&self.ownership, &slot, &lease) {
                 (Some(authority), Some(slot), Some(lease)) => {
@@ -743,13 +767,13 @@ impl Inner {
         };
 
         // Every keyed actor, or this one's lease, may have been given up while it started, or the node isolated, which
-        // under an authority sweeps nothing: it would have been missed.
+        // sweeps no leased key: it would have been missed.
         let endpoints: Arc<[Endpoint]> = spawned.endpoints.into();
         let swept = slot.as_ref().is_some_and(|slot| {
             let mut unique = self.unique.lock();
             let lapsed = fence.as_ref().is_some_and(|f| !f.is_open());
             let swept = lapsed
-                || self.sweeps.load(Relaxed) != sweeps
+                || self.sweeps_of(kind.leased) != sweeps
                 || self.isolated.load(Relaxed)
                 || !self.engine.open.load(Relaxed);
             if !swept {
@@ -783,8 +807,8 @@ impl Inner {
             // Only a lease: a key without one starts wherever it is asked for, and each start would crowd the ring.
             self.events.record("acquired", lease, format!("epoch {epoch}"));
         }
-        let (inner, endpoint, lifecycle, counts) =
-            (self.clone(), endpoints[0].0, spawned.lifecycle, kind.counts.clone());
+        let (inner, endpoint, lifecycle, counts, leased) =
+            (self.clone(), endpoints[0].0, spawned.lifecycle, kind.counts.clone(), kind.leased);
         tokio::spawn(async move {
             let exit = lifecycle.join().await;
             let lapsed = !swept && fence.is_some_and(|f| !f.is_open());
@@ -803,7 +827,7 @@ impl Inner {
                     "failed"
                 } else if lapsed {
                     "lease_lost"
-                } else if inner.sweeps.load(Relaxed) != sweeps {
+                } else if inner.sweeps_of(leased) != sweeps {
                     "isolated"
                 } else if moved {
                     "moved"
@@ -1405,13 +1429,19 @@ impl Inner {
             // itself.
             let mut asks = JoinSet::new();
             for (owner, slots) in elsewhere {
-                let (this, owner) = (self.clone(), Arc::from(owner));
+                let (this, owner, view) = (self.clone(), Arc::<str>::from(owner), view.clone());
                 asks.spawn(async move {
-                    // Whether it would take a key moved to it (`takes_keys`): no answer is no.
-                    let asked = this.engine.ask(owner, OWNS, Bytes::new()).await;
-                    if !matches!(asked, Ok((_, Some(answer))) if answer[..] == [1]) {
-                        return false;
-                    }
+                    // Whether it would take a key moved to it (`takes_keys`), of a leased kind and of another: no
+                    // answer is no.
+                    let answer = match this.engine.ask(owner.clone(), OWNS, Bytes::new()).await {
+                        Ok((_, Some(answer))) if answer.len() == 1 => answer[0],
+                        _ => 0,
+                    };
+                    // The bit for the mode the owner advertises the key's kind in.
+                    let takes =
+                        |kind: &str| answer & if view.leases(&owner, kind) { TAKES_LEASED } else { TAKES_UNLEASED };
+                    let (slots, kept): (Vec<_>, Vec<_>) = slots.into_iter().partition(|(kind, _)| takes(kind) != 0);
+                    let taken = kept.is_empty();
                     let moved: Vec<_> = {
                         let mut unique = this.unique.lock();
                         let hand = |slot| {
@@ -1436,7 +1466,7 @@ impl Inner {
                         });
                     }
                     while moves.join_next().await.is_some() {}
-                    true
+                    taken
                 });
             }
             while let Some(asked) = asks.join_next().await {
@@ -1448,7 +1478,7 @@ impl Inner {
     /// Discovery has not heard from this node for the grace period, so the rest of the cluster may be about to run its
     /// keyed actors elsewhere. A peer that still lists it, with none that dropped it, vouches for it: an outage that hits
     /// every node alike stops nothing. Without a vouch the node is isolated. Its keyed actors stop at once when a peer
-    /// dropped it or there is no ownership authority; when nobody answered, each leased one stops by its fence instead.
+    /// dropped it, and those of unleased kinds also when nobody answered; each leased one then stops by its fence.
     pub(crate) async fn check_isolation(self: &Arc<Self>, limit: Duration) {
         let view = self.engine.membership.view();
         let peers: Vec<Arc<str>> = (view.members.iter())
@@ -1477,10 +1507,8 @@ impl Inner {
         }
         self.heard_since.lock().take();
         self.set_isolated(true);
-        if dropped || self.ownership.is_none() {
-            let swept = self.sweep();
-            self.restart_eager(swept);
-        }
+        let swept = self.sweep(!dropped);
+        self.restart_eager(swept);
     }
 
     /// Each change is an event, and each start of one is counted, once the node has joined: it has been heard, or its
@@ -1609,6 +1637,7 @@ pub struct KindBuilder<'c, P: ActorProtocol> {
     idle: Option<Duration>,
     policy: Option<RestartPolicy>,
     eager: Option<(Bytes, Placement)>,
+    leased: bool,
     also: Vec<Schema<P::Mailbox>>,
 }
 
@@ -1657,6 +1686,17 @@ impl<P: ActorProtocol> KindBuilder<'_, P> {
         self
     }
 
+    /// Places the kind's keys by the membership view alone, without the ownership authority's leases, as on a node
+    /// without one: a start costs no round to the authority, and a node cut from it still starts the kind's keys, but
+    /// a partition may run a key on each side until the view agrees again. Advertised as `kind/2+1/u`, so the nodes
+    /// that host the kind leased are its only candidates while there are any. An eager kind is leased: `register`
+    /// refuses both. So is a kind whose node would run its keys twice for longer than isolation takes:
+    /// `heartbeat_interval + 3/2 heartbeat_grace` must be under the discovery's `drops_after`.
+    pub fn unleased(mut self) -> Self {
+        self.leased = false;
+        self
+    }
+
     /// Lets this node host the kind and advertises it, making the node a placement candidate. `build` turns the
     /// caller's encoded arguments into the actor. Without a policy, an actor that fails stops and is counted in
     /// `keyed_failed`; the next `get_or_spawn` builds it again. Registering a kind again replaces its factory for the
@@ -1666,7 +1706,7 @@ impl<P: ActorProtocol> KindBuilder<'_, P> {
         A: Actor<Message = P::Mailbox> + Send,
         F: Fn(&SpawnContext, Bytes) -> Result<A, String> + Send + Sync + 'static,
     {
-        let Self { cluster, kind, execution, mailbox, idle, policy, eager, also } = self;
+        let Self { cluster, kind, execution, mailbox, idle, policy, eager, leased: wants_lease, also } = self;
         let idle = idle.or(mailbox.as_ref().and_then(|m| m.idle));
         let kind = kind.as_str();
         // Commas separate kinds in the record; a slash would let two kinds' keys share a lease named `kind/key`.
@@ -1691,10 +1731,21 @@ impl<P: ActorProtocol> KindBuilder<'_, P> {
             return Err(ClusterError::Config("the kind's execution names no pool of this runtime"));
         }
         let eager_kind = eager.is_some();
+        if eager_kind && !wants_lease {
+            return Err(ClusterError::Config("an eager kind is leased"));
+        }
         // A probe: `held_by` is `None` when the authority cannot list a node's keys, and the future is never polled.
         if eager_kind && inner.ownership.as_ref().and_then(|a| a.held_by(Holder::Lapsed, &[])).is_none() {
             return Err(ClusterError::Config("an eager kind needs an ownership authority that lists a node's keys"));
         }
+        // Refused at start without an authority.
+        if !wants_lease && inner.isolates_late {
+            return Err(ClusterError::Config(
+                "heartbeat_interval + 3/2 heartbeat_grace must be under the discovery's drops_after for an \
+                 unleased kind",
+            ));
+        }
+        let leased = wants_lease && inner.ownership.is_some();
         let build = Arc::new(build);
         let factory: Factory = Box::new(move |system, inner, context, fence, args| {
             let built = catch_unwind(AssertUnwindSafe(|| build(&context, args.clone())));
@@ -1742,9 +1793,12 @@ impl<P: ActorProtocol> KindBuilder<'_, P> {
         });
         {
             let mut kinds = inner.kinds.write();
-            let schemas = |s: &[u16]| s.iter().map(u16::to_string).collect::<Vec<_>>().join("+");
-            let others = kinds.iter().filter(|(k, _)| *k != kind).map(|(k, v)| format!("{k}/{}", schemas(&v.schemas)));
-            let mut names: Vec<String> = others.chain([format!("{kind}/{}", schemas(&advertised))]).collect();
+            let advert = |kind: &str, schemas: &[u16], leased: bool| {
+                let schemas = schemas.iter().map(u16::to_string).collect::<Vec<_>>().join("+");
+                format!("{kind}/{schemas}{}", if leased { "" } else { "/u" })
+            };
+            let others = kinds.iter().filter(|(k, _)| *k != kind).map(|(k, v)| advert(k, &v.schemas, v.leased));
+            let mut names: Vec<String> = others.chain([advert(kind, &advertised, leased)]).collect();
             names.sort_unstable();
             let advertised_all = names.join(",");
             if advertised_all.len() > MAX_VALUE {
@@ -1752,7 +1806,7 @@ impl<P: ActorProtocol> KindBuilder<'_, P> {
             }
             inner.record.lock().metadata.insert(KINDS.into(), advertised_all);
             let counts = kinds.get(kind).map_or_else(Default::default, |k| k.counts.clone());
-            let entry = Kind { protocol: P::ID, schemas: advertised, factory, eager, counts };
+            let entry = Kind { protocol: P::ID, schemas: advertised, factory, eager, leased, counts };
             kinds.insert(kind.to_owned(), Arc::new(entry));
         }
         if eager_kind {
@@ -1826,6 +1880,7 @@ impl Cluster {
             idle: None,
             policy: None,
             eager: None,
+            leased: true,
             also: Vec::new(),
         }
     }
@@ -1856,11 +1911,11 @@ impl Cluster {
     /// Dropping the call does not stop a start already under way. A request to the owner on every
     /// call, even when the actor is running: keep the reference, or call through [`Cluster::keyed`].
     ///
-    /// Under an ownership authority, an owner that cannot take the lease (it reaches no majority of acceptors, or is
-    /// leaving) or cannot be reached is passed, and the next node of the order is asked, three nodes in all; a node
-    /// told that another holds the key names it, and the call asks that node if this one reaches it. The reference
-    /// is to the node that answered. A holder that cannot be reached is asked about again every [`HELD_RETRY`]. All
-    /// of it within `operation_timeout`.
+    /// For an owner that advertises the kind leased, whether or not this node has an ownership authority, an owner that
+    /// cannot take the lease (it reaches no majority of acceptors, or is leaving) or cannot be reached is passed, and
+    /// the next node of the order is asked, three nodes in all; a node told that another holds the key names it, and
+    /// the call asks that node if this one reaches it. The reference is to the node that answered. A holder that cannot
+    /// be reached is asked about again every [`HELD_RETRY`]. All of it within `operation_timeout`.
     pub async fn get_or_spawn<P: WireProtocol>(
         &self,
         kind: &str,

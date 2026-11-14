@@ -221,6 +221,49 @@ async fn keys_go_only_to_nodes_that_speak_every_callers_schema_of_their_kind_and
     }
 }
 
+/// A kind's nodes must agree on its mode, or two would each take a key, one by the view and one by the lease. While
+/// some node advertises the kind leased, the nodes that advertise it unleased are no candidates for it, and every node
+/// reads the same view, so all pick the same owners.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_kind_advertised_in_two_modes_is_placed_on_its_leased_nodes_only() {
+    let (discovery, leases) = (MemoryDiscovery::new(), MemoryLeases::new());
+    let leased = |cfg: &mut ClusterConfig| cfg.ownership = Some(std::sync::Arc::new(leases.authority()));
+    let (old, new) = (node("old", &discovery, leased).await, node("new", &discovery, leased).await);
+    let build = |_: &SpawnContext, _: Bytes| Ok(Total(0));
+    old.cluster.kind::<V1>("total").register(build).await.unwrap();
+    new.cluster.kind::<V1>("total").unleased().register(build).await.unwrap();
+    eventually("both advertise the kind", || async {
+        let view = old.cluster.view();
+        view.members.iter().filter(|m| m.record.has_kind("total")).count() == 2
+    })
+    .await;
+    let view = new.cluster.view();
+    let mode = |id: &str| view.get(id).and_then(|m| m.record.kind_leased("total"));
+    assert_eq!((mode("old"), mode("new")), (Some(true), Some(false)));
+    assert_eq!(new.cluster.record().kind_schemas("total"), Some(vec![1]), "the mode is no schema");
+
+    let any = Placement::default();
+    for i in 0..8 {
+        let key = format!("k{i}");
+        for caller in [&old, &new] {
+            assert_eq!(caller.cluster.owner("total", &key, &any).as_deref(), Some("old"));
+            let placed = caller.cluster.get_or_spawn::<V1>("total", &key, Bytes::new(), &any).await.unwrap();
+            assert_eq!((placed.node(), placed.epoch().is_some()), ("old", true));
+        }
+    }
+    assert_eq!(new.cluster.stats().spawned, 0);
+
+    // Registered leased again, it is a candidate beside the other.
+    new.cluster.kind::<V1>("total").register(build).await.unwrap();
+    eventually("new owns some keys", || async {
+        (0..8).any(|i| old.cluster.owner("total", &format!("k{i}"), &any).as_deref() == Some("new"))
+    })
+    .await;
+    for n in [old, new] {
+        n.system.shutdown().await.unwrap();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn nodes_whose_wire_versions_do_not_meet_are_refused_naming_both_ranges_and_counted() {
     let discovery = MemoryDiscovery::new();

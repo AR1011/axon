@@ -854,6 +854,46 @@ fn nodes_started_with_their_seeds_record_no_isolation() {
     .unwrap();
 }
 
+/// The seeds and a, b in one region, c and d in a second one cut from it, and d restarted inside the cut: it starts
+/// from the view it wrote, and c takes its new boot from their handshake (spec/seed-discovery.md § 10).
+#[test]
+fn a_node_restarted_while_cut_from_its_seeds_serves_from_its_cached_view() {
+    check_seeds(seeds(0..16), |seed| {
+        let stored = |host: &Host, cfg: &mut ClusterConfig| cfg.view_store = Some(Arc::new(host.disk().dir("view")));
+        let members = ["a", "b", "c", "d"];
+        let mut w = world(seed, &Find::Seeds(&SEEDS, SeedTimings::default()), &members, &["d"], stored);
+        publish_counter(&mut w, "c", 5);
+        w.run_until("kinds are advertised", Duration::from_secs(30), |w| with_kind(w, "c") == 1);
+        // Past a poll, so each node's file holds the view.
+        w.run_for(Duration::from_secs(1));
+        w.partition(&["s0", "s1", "s2", "a", "b"], &["c", "d"]);
+        w.run_until("c's view is stale", Duration::from_secs(30), |w| cluster(w, "c").view().stale.is_some());
+        crash(&mut w, "d");
+        w.restart("d");
+        w.run_until("d is back", Duration::from_secs(30), |w| w.nodes().any(|(n, _)| n == "d"));
+
+        let named = w.block_on("d", |n| async move {
+            let counter = n.cluster.unwrap().resolve_on::<CounterApi>("c", "counter").await?;
+            counter.request(Op::Get).await.map_err(ClusterError::Call)
+        });
+        assert_eq!(named.unwrap().ok(), Some(5), "seed {seed}: d calls c's name");
+        let keyed = w.block_on("c", |n| async move {
+            let anywhere = Placement::default();
+            let placed = n.cluster.unwrap().get_or_spawn::<CounterApi>("counter", "k", start(3), &anywhere).await?;
+            let total = placed.request(Op::Get).await.map_err(ClusterError::Call)?;
+            Ok::<_, ClusterError>((placed.node().to_owned(), total))
+        });
+        let keyed = keyed.unwrap().map_err(|e| format!("{e:?} {:?}", cluster(&w, "c").view().get("d")));
+        assert_eq!(keyed, Ok(("d".to_owned(), 3)), "seed {seed}: c calls d's kind");
+        w.run_for(Duration::from_secs(2));
+        let stats = cluster(&w, "d").stats();
+        assert!(!stats.isolated && stats.spawned == 1, "seed {seed}: {stats:?}");
+        let view = cluster(&w, "d").view();
+        assert!(view.cached && view.stale.is_some(), "seed {seed}: {view:?}");
+    })
+    .unwrap();
+}
+
 /// The epoch `on` runs `key` under, if it runs it.
 fn runs(w: &World<Node>, on: &str, key: &str) -> Option<u64> {
     let (hosted, _) = cluster(w, on).hosted_keys("counter", key, None, 1);

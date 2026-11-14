@@ -926,6 +926,18 @@ async fn main() {
   and have that store refuse older epochs, and a write whose epoch it cannot check as well. A restart under the
   kind's policy keeps the epoch: where the store must tell its starts apart, add `SpawnContext::start`. Ids kept
   to recognise a request twice must be kept as long as any sender may still send it again.
+- The authority leases every kind, unless a kind is registered `.unleased()`. Its keys are then placed by the view
+  alone, as on a node without an authority. A start costs no round trip to the authority. A node cut from the
+  acceptors, which refuses leased keys `Isolated`, keeps starting the kind's keys. A partition may run a key on each
+  side until the views agree again, so use it for actors a brief duplicate does not harm, such as a cache or the
+  sessions above: `cluster.kind::<SessionApi>("session").unleased().register(build)`.
+  The node advertises the mode with the kind (`NodeRecord::kind_leased`). While any node advertises a kind leased,
+  only the nodes that do are its candidates, so every node agrees on a key's owner and on how to reach it: a caller
+  walks past an owner refused `Isolated` only for a leased kind, whatever its own authority. An eager kind cannot
+  be unleased. Neither can a kind whose node stops its keys more slowly than discovery drops the node:
+  `heartbeat_interval + 3/2 heartbeat_grace` must be under the discovery's `drops_after`, as it must be without an
+  authority. `register` refuses both with `ClusterError::Config`. An isolated node stops an unleased kind's keys at
+  once, as it stops every key without an authority.
 - A keyed actor that fails (a handler error, a panic, a start that fails) stops and is counted in
   `ClusterStats::keyed_failed`; the next `get_or_spawn` builds it again from the same args. Register the kind with
   `.policy(RestartPolicy)` on `cluster.kind::<P>(kind)` and it is rebuilt in place under that policy, with fresh
@@ -1614,6 +1626,12 @@ async fn main() {
   the running actors stay, nothing joins or leaves, and nodes thaw when a second seed is back. One seed alone
   is fine for development; if it restarts, the cluster freezes for 5 to 7 s. After a cut from most of the seeds, a
   node thaws once the others in its view are back, or 5 s after it reaches the seeds again.
+- **Give each node a `view_store` where a region can be cut from most seeds.** A node that restarts inside such a
+  cut gets no view from them: it would list no peer, and its frozen peers would still list its old boot and refuse
+  the new one. With `cfg.view_store = Some(Arc::new(OsFiles::new(dir)))` it writes its last live view there, as the
+  file `view`, and starts from it, stale and with `view.cached` set, listing itself as it now is. A peer whose view is
+  stale takes the node's new boot from its handshake, so they call each other again and the node is not isolated.
+  The first live view replaces the cached one. A missing or corrupt file starts the node with an empty view.
 - `discovery.set_seeds(list)` replaces the seed list of a running node. To replace a seed machine, keep its name
   and no list changes.
 - `discovery.stats()` and `server.stats()` show each link's state and last error, refusals, and the list size.
@@ -2166,6 +2184,49 @@ Calls and stream pushes share the `Live` lane unless a namespace goes on `Bulk` 
 `transport.lanes.bulk.max_bytes_per_sec` below the link's rate, or a busy `Bulk` keeps a round trip of bytes queued in
 the network ahead of `Live`. A parent keeps up to `core.max_push_window` of pushes unanswered per child
 ([streams § Tree](streams.md#tree)), which the host settings above let one connection carry.
+
+### Near links
+
+With an ownership authority, `Cluster::start` lowers every session's idle timeout to the authority's `hold` when that
+is shorter, and its keepalive and connect to a quarter of it, so that a caller does not send a holder's keys over a
+quiet session after the lease let them go. With the acceptors and the holders of the leased keys 1 to 2 ms apart in
+one region and peers in others, one lease cannot suit both: at a 4 s lease every link idles out at 3.76 s and one lost
+SYN marks a far peer unreachable, and at the 10 s lease above a dead holder's keys wait about 14 s, also for callers
+0.24 ms away. `ClusterConfig::near` gives the links between peers that share a label's value timings of their own:
+
+```rust,no_run
+use std::time::Duration;
+
+use axon_cluster::{ClusterConfig, Near, PaxosConfig};
+use axon_net::LinkTimings;
+
+/// The acceptors in this node's region, 1 to 2 ms apart; the other regions keep across_regions's transport timings.
+fn acceptors_near(cluster: &mut ClusterConfig, paxos: &mut PaxosConfig, region: &str) {
+    cluster.labels.insert("region".into(), region.into());
+    cluster.near = Some(Near {
+        label: "region".into(),
+        timings: LinkTimings { keepalive: Duration::from_millis(500), idle: Duration::from_secs(2), connect: Duration::from_millis(500) },
+    });
+    // A hold of 3.76 s, a lease_grace of 3.29 s and a renew every 1.32 s.
+    paxos.lease = Duration::from_secs(4);
+}
+```
+
+A peer whose record has this node's value of `label` is near, on each of its lanes; every other peer runs the
+transport's timings, as does every peer of a node without the label. A dial knows the peer from its record; an
+accepted session looks the peer up in the view once the handshake names it, and a peer not listed yet runs the
+transport's timings until its next session. `PeerStats::near` says which links run them.
+
+With `near` set the hold clamps the near links only, and `Cluster::start` refuses a `near.idle` above the hold
+(`ClusterError::Config`). Far links keep their idle above it: there that costs liveness, not safety, as the holder's
+fence stops its actors at `lease_grace` and a far caller walks on after its idle and a connect. The lease is one value,
+part of the acceptors' protocol, so a short one pays only where a majority of the acceptors and the holders of the
+leased kinds are near each other. Its bound is a round's patience, `lease / 6`, which must hold an ask and one
+retransmit on the slowest link any holder renews over: at 4 s, 0.67 s, enough up to 219 ms (0.22 + 0.42 s).
+
+At these values a dead holder is unreachable to near callers 2 to 2.5 s after it died. The acceptors free its keys at
+most a lease after its last renew reached them, and the next owner's acquire is one round at near round trips: its
+keys run again about 4.5 s after it died. Callers in far regions see it after their own idle and connect, 11.5 s.
 
 ## Simulating a cluster
 

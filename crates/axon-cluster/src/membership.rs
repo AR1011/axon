@@ -12,8 +12,11 @@ use parking_lot::Mutex;
 use tokio::sync::broadcast::{self, error::RecvError};
 
 use crate::WeakCluster;
-use crate::discovery::{NodeRecord, Snapshot};
+use crate::discovery::{LEAVE_REASON, LIFECYCLE, NodeRecord, Snapshot};
 use crate::placement::{Candidates, Placement};
+
+/// The reason a cached view is stale, until a discovery error takes its place.
+pub(crate) const CACHED: &str = "cached";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
@@ -38,13 +41,20 @@ pub struct View {
     pub members: Vec<Member>,
     /// Set while discovery is failing; the members are the last good snapshot.
     pub stale: Option<String>,
+    /// Loaded from `ClusterConfig::view_store` at start, until the first live snapshot.
+    pub cached: bool,
     /// Worked out by the owner lookups made in this view.
     pub(crate) candidates: Candidates,
 }
 
 impl View {
     pub fn get(&self, id: &str) -> Option<&Member> {
-        self.members.binary_search_by(|m| m.record.id.as_str().cmp(id)).ok().map(|i| &self.members[i])
+        self.index(id).ok().map(|i| &self.members[i])
+    }
+
+    /// Where `id` is in `members`, or would go.
+    fn index(&self, id: &str) -> Result<usize, usize> {
+        self.members.binary_search_by(|m| m.record.id.as_str().cmp(id))
     }
 
     /// The available members that carry every `required` label of `placement`, in id order.
@@ -362,6 +372,64 @@ impl Membership {
         next.stale = Some(error.clone());
         self.publish(&mut current, next, |_| MembershipEvent::Unavailable(error));
     }
+
+    /// A view from `ClusterConfig::view_store`, stale until the first live snapshot replaces it. At revision 0: the
+    /// provider's own may have moved anywhere since, and a watch from 0 answers with its first view.
+    pub(crate) fn cached(&self, nodes: Vec<NodeRecord>) {
+        let mut current = self.view.lock();
+        let changes: Arc<[_]> = nodes.iter().cloned().map(MemberChange::Joined).collect();
+        let members = nodes.into_iter().map(|record| Member { record, reachable: true }).collect();
+        let next = View { members, stale: Some(CACHED.into()), cached: true, ..View::default() };
+        self.publish(&mut current, next, |view| MembershipEvent::Changes { view, changes });
+    }
+
+    /// This node's record as it announces it, while the view is the cached one: a member there as discovery would list
+    /// it, so it places keys on itself. Not in another stale view: one that is stale as the node starts, its seeds still
+    /// warming up, would list it, and its isolation then would count as one.
+    pub(crate) fn announced(&self, record: &NodeRecord) {
+        let mut current = self.view.lock();
+        let at = current.index(&record.id);
+        if !current.cached || at.is_ok_and(|i| current.members[i].record == *record) {
+            return;
+        }
+        let mut next = View::clone(&current);
+        let member = Member { record: record.clone(), reachable: true };
+        let change = match at {
+            Ok(i) => {
+                let previous = std::mem::replace(&mut next.members[i], member).record;
+                MemberChange::Updated { previous, current: record.clone() }
+            }
+            Err(i) => {
+                next.members.insert(i, member);
+                MemberChange::Joined(record.clone())
+            }
+        };
+        let changes = vec![change].into();
+        self.publish(&mut current, next, |view| MembershipEvent::Changes { view, changes });
+    }
+
+    /// While the view is stale, a newer boot of a member it lists, which a handshake proved (the same id with a
+    /// greater incarnation), takes that member's place at its address and metadata, but for the old boot's drain: a
+    /// node that restarted while discovery is away is reached again. Whether it did. A record of incarnation 0, from a
+    /// static list, takes any boot already.
+    pub(crate) fn learn_boot(&self, id: &str, incarnation: u128) -> bool {
+        let mut current = self.view.lock();
+        let Some(i) = current.stale.as_ref().and_then(|_| current.index(id).ok()) else { return false };
+        let previous = &current.members[i].record;
+        if previous.incarnation == 0 || previous.incarnation >= incarnation {
+            return false;
+        }
+        let mut record = NodeRecord { incarnation, ..previous.clone() };
+        record.metadata.remove(LIFECYCLE);
+        record.metadata.remove(LEAVE_REASON);
+        let previous = previous.clone();
+        let mut next = View::clone(&current);
+        next.members[i] = Member { record: record.clone(), reachable: true };
+        self.churn.replaced.fetch_add(1, Relaxed);
+        let changes = vec![MemberChange::Replaced { previous, current: record }].into();
+        self.publish(&mut current, next, |view| MembershipEvent::Changes { view, changes });
+        true
+    }
 }
 
 #[cfg(test)]
@@ -382,5 +450,43 @@ mod tests {
         assert!(matches!(events.next().await, Some(MembershipEvent::Unavailable(e)) if e == "four"));
         membership.close();
         assert!(events.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_stale_view_takes_a_newer_boot_a_handshake_proves_and_a_live_view_does_not() {
+        let b = |incarnation| NodeRecord {
+            id: "b".into(),
+            incarnation,
+            address: ([10, 0, 0, 2], 7000).into(),
+            metadata: [("role".to_owned(), "x".to_owned())].into(),
+            version: 3,
+        };
+        let membership = Membership::new(8);
+        // The old boot was draining as it left; its new boot is not.
+        let mut leaving = b(5);
+        leaving.metadata.extend([(LIFECYCLE.to_owned(), "draining".to_owned()), (LEAVE_REASON.to_owned(), "x".into())]);
+        membership.apply(Snapshot { revision: 1, nodes: vec![leaving] });
+        assert!(!membership.learn_boot("b", 7), "live");
+        membership.set_reachable("b", 5, false);
+        membership.unavailable("cut".into());
+        assert!(!membership.learn_boot("b", 4), "older");
+        assert!(!membership.learn_boot("c", 9), "not listed");
+        let mut events = membership.subscribe();
+        assert!(membership.learn_boot("b", 7));
+        let view = membership.view();
+        // The new boot at the old record's address and metadata but its drain, reachable, the view still stale.
+        assert_eq!(
+            (view.members[0].clone(), view.stale.as_deref()),
+            (Member { record: b(7), reachable: true }, Some("cut"))
+        );
+        assert!(!membership.learn_boot("b", 7), "the same boot again");
+        assert!(matches!(events.next().await, Some(MembershipEvent::Snapshot(_))));
+        let changes = events.next().await;
+        assert!(
+            matches!(&changes, Some(MembershipEvent::Changes { changes, .. })
+                if matches!(&changes[..], [MemberChange::Replaced { previous, current }]
+                    if previous.incarnation == 5 && current.incarnation == 7)),
+            "{changes:?}"
+        );
     }
 }

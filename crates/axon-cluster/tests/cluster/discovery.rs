@@ -1,4 +1,5 @@
 use super::*;
+use axon::files::{FileOp, Files, MemoryFiles};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering::Relaxed};
 
 #[tokio::test(flavor = "multi_thread")]
@@ -59,6 +60,9 @@ const CROWDED: u8 = 6;
 /// Every call panics, a heartbeat as it is asked for and a snapshot as it is polled.
 const PANICKING: u8 = 7;
 
+/// Seeds a node is cut from: a registration is taken and goes nowhere, and every other call fails.
+const FROZEN: u8 = 8;
+
 /// A node's own path to discovery, which can be cut without touching anyone else's.
 #[derive(Clone)]
 struct Cuttable(MemoryDiscovery, Arc<AtomicU8>);
@@ -94,7 +98,7 @@ impl Discovery for Cuttable {
 
     fn register(&self, record: &NodeRecord) -> BoxFuture<'_, Result<(), DiscoveryError>> {
         let (inner, record) = (self.0.clone(), record.clone());
-        if self.1.load(Relaxed) == TAKEN {
+        if matches!(self.1.load(Relaxed), TAKEN | FROZEN) {
             return Box::pin(async { Ok(()) });
         }
         self.pass(Box::pin(async move { inner.register(&record).await }))
@@ -732,4 +736,74 @@ async fn refreshes_that_come_together_share_snapshots_and_the_heartbeat_goes_on(
     let gap = beats.windows(2).map(|w| w[1] - w[0]).max().expect("a beat");
     assert!(gap < Duration::from_secs(1), "the heartbeat stopped for {gap:?}");
     a.system.shutdown().await.unwrap();
+}
+
+/// A view file `a` wrote while it and b were up, and the discovery that lists b.
+async fn written_view() -> (MemoryFiles, MemoryDiscovery, Node) {
+    let (discovery, files) = (MemoryDiscovery::new(), MemoryFiles::new());
+    let store = files.clone();
+    let a = node_with("a", discovery.clone(), |cfg| cfg.view_store = Some(Arc::new(store))).await;
+    let b = node("b", &discovery).await;
+    // The file's revision, after "AXVW" and its version.
+    let revision = |file: &[u8]| u64::from_be_bytes(file[6..14].try_into().unwrap());
+    eventually("a writes the view that lists both", || async {
+        let view = a.cluster.view();
+        view.members.len() == 2 && files.read("view").await.is_ok_and(|file| revision(&file) == view.revision)
+    })
+    .await;
+    a.system.shutdown().await.unwrap();
+    (files, discovery, b)
+}
+
+/// `a` restarted from `files`, its discovery frozen until `thaw` is set to 0.
+async fn restarted(files: &MemoryFiles, discovery: &MemoryDiscovery) -> (Node, Arc<AtomicU8>) {
+    let (thaw, store) = (Arc::new(AtomicU8::new(FROZEN)), files.clone());
+    let cuttable = Cuttable(discovery.clone(), thaw.clone());
+    let a = node_with("a", cuttable, |cfg| cfg.view_store = Some(Arc::new(store))).await;
+    (a, thaw)
+}
+
+fn ids(node: &Node) -> Vec<String> {
+    node.cluster.view().members.iter().map(|m| m.record.id.clone()).collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_missing_or_corrupt_view_file_starts_the_node_with_an_empty_view() {
+    let (files, discovery, _b) = written_view().await;
+    let good = files.read("view").await.unwrap();
+    // The file lists b and a's old boot, which gives way to the new one.
+    let (a, _) = restarted(&files, &discovery).await;
+    assert_eq!(ids(&a), ["a", "b"]);
+    assert_eq!(a.cluster.view().get("a").unwrap().record, a.cluster.record());
+    let view = a.cluster.view();
+    assert!(view.cached && view.stale.is_some(), "{view:?}");
+
+    let (a, _) = restarted(&MemoryFiles::new(), &discovery).await;
+    assert_eq!(ids(&a), Vec::<String>::new(), "missing");
+    let mut crc = good.clone();
+    *crc.last_mut().unwrap() ^= 1;
+    let mut version = good[..good.len() - 4].to_vec();
+    version[5] ^= 1;
+    version.extend_from_slice(&axon::files::crc32(&version).to_be_bytes());
+    for (bad, why) in [(crc, "a bad CRC"), (version, "another version"), (good[..20].to_vec(), "torn")] {
+        files.apply(vec![FileOp::Replace("view".into(), bad.into())]).await.unwrap();
+        let (a, _) = restarted(&files, &discovery).await;
+        assert_eq!(ids(&a), Vec::<String>::new(), "{why}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_first_live_snapshot_replaces_the_cached_view() {
+    let (files, discovery, b) = written_view().await;
+    let (a, thaw) = restarted(&files, &discovery).await;
+    assert_eq!(ids(&a), ["a", "b"]);
+    // While a is cut off, b leaves and c joins.
+    b.system.shutdown().await.unwrap();
+    let _c = node("c", &discovery).await;
+    thaw.store(0, Relaxed);
+    eventually("the live view replaces the cached one", || async {
+        let view = a.cluster.view();
+        view.stale.is_none() && !view.cached && ids(&a) == ["a", "c"]
+    })
+    .await;
 }
