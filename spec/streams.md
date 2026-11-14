@@ -146,6 +146,11 @@ has no followers of its own behind the open (the fourth case above is tested in 
   generation: the leaf read "1 after 200"). On odd seeds the standby opens before the records reach it as a relay,
   with a `FollowAfter(0)` follower that came after them; those seeds failed before the fourth case was fixed.
 - `crates/axon-stream/src/core/tests.rs::a_follower_on_the_standby_behind_the_open_replays_the_rest_from_the_history`
+  and `::a_follower_on_the_standby_behind_the_open_that_may_not_replay_is_reset`
+- `crates/axon-stream/src/node/tests.rs::a_follower_behind_an_open_from_disk_replays_the_rest_from_the_disk`: the same
+  for an open from the disk of a key the node relayed after its restart, with a ring of 4. The disk's source knew the
+  key only once the open had taken it, after the hub heard of the open, so the follower was reset
+  `HistoryUnavailable`; the disk now shelves every key it holds at its boot.
 - `crates/axon-stream/tests/world_wan.rs::an_origin_moved_to_another_region_keeps_every_cursor`: the same across three
   regions at the WAN timings. Every follower recovers within 15 s of the fault (the cluster calls a silent origin gone
   about 11.5 s after it), and within `upstream_timeout` plus one round trip of an old origin's close.

@@ -633,6 +633,82 @@ fn an_open_that_fails_after_letting_a_pulled_key_go_pulls_it_again() {
     assert!(relay.is_subscribed(follower));
 }
 
+/// A node whose disk kept a key from an earlier boot relays the key meanwhile: its open from the disk goes on after
+/// the last record the disk holds, past what reached it as a relay. A follower behind that position replays the rest
+/// from the disk's segments behind the ring, each record once and in order, and goes on live.
+#[test]
+fn a_follower_behind_an_open_from_disk_replays_the_rest_from_the_disk() {
+    use crate::core::tests::{ask, deliver};
+    use crate::recovery::RingLimits;
+    let (key, replay) = (StreamKey::new("md", "btc"), DeliveryPolicy::ReplayRequired);
+    let (o, r) = (PeerId::new("o", 1), PeerId::new("r", 1));
+    let record = |n: u64| Bytes::copy_from_slice(&n.to_be_bytes());
+    let files: Arc<dyn Files> = Arc::new(MemoryFiles::new());
+    let retention = Retention { namespace: "md".into(), max_bytes: u64::MAX, max_age: Duration::from_secs(3600) };
+    let disk = || {
+        let mut cfg = DiskConfig::new(files.clone(), vec![retention.clone()]);
+        // A few records a segment: the gap spans several.
+        cfg.segment_bytes = 64;
+        match now(DiskStore::open(cfg)) {
+            Poll::Ready(disk) => disk.unwrap(),
+            Poll::Pending => panic!("files in memory waited"),
+        }
+    };
+    let write = |relay: &mut RelayCore| {
+        let (written, ops) = relay.take_disk_writes(0).unwrap();
+        assert!(matches!(now(written.apply(ops)), Poll::Ready(Ok(()))));
+        relay.disk_written(Ok(()));
+    };
+    // A ring of 4: most of the gap is on the disk only.
+    let rings = vec![RingLimits { namespace: "md".into(), max_records: 4, max_bytes: 1 << 20 }];
+    let cfg = CoreConfig { rings, ..CoreConfig::default() };
+    // An earlier boot of r kept records 1 to 20 of generation 1 on its disk.
+    let mut relay = RelayCore::new(&r, crate::AllowAll, cfg.clone()).unwrap();
+    relay.disk = Some(disk());
+    relay.open_stream(&key, 1, replay).unwrap();
+    for n in 1..=20 {
+        relay.publish(&key, vec![record(n)]).unwrap();
+    }
+    write(&mut relay);
+
+    let mut relay = RelayCore::new(&r, crate::AllowAll, cfg.clone()).unwrap();
+    relay.disk = Some(disk());
+    let mut origin = RelayCore::new(&o, crate::AllowAll, CoreConfig { relay: false, ..cfg }).unwrap();
+    origin.open_stream(&key, 1, replay).unwrap();
+    let follower = relay.subscribe(&key, SubscribeOptions::default()).unwrap();
+    let at = Instant::now().into_std();
+    ask(&mut origin, &o, &mut relay, &r, at);
+    origin.publish(&key, (1..=10).map(record).collect()).unwrap();
+    deliver(&mut origin, &o, &mut relay, &r, at);
+    let mut seen = Vec::new();
+    let mut poll = |relay: &mut RelayCore| {
+        while let Some(event) = relay.poll(follower) {
+            match event {
+                StreamEvent::Batch(batch) => seen.extend((batch.first()..).zip(batch.records().iter().cloned())),
+                StreamEvent::Ready { .. } | StreamEvent::CaughtUp { .. } => {}
+                other => panic!("{other:?} after {} records", seen.len()),
+            }
+        }
+    };
+    poll(&mut relay);
+    let read = relay.disk_read(&key, 1, replay).unwrap().expect("the disk holds the key");
+    let Poll::Ready(read) = now(read.read()) else { panic!("files in memory waited") };
+    relay.open_read(&key, 1, replay, Some(read)).unwrap();
+    relay.publish(&key, vec![record(21)]).unwrap();
+    write(&mut relay);
+    let mut reads = 0;
+    poll(&mut relay);
+    while let Some((files, asked)) = relay.take_disk_reads() {
+        let Poll::Ready(read) = now(disk::read_asked(files, asked)) else { panic!("files in memory waited") };
+        relay.disk_read_in(read);
+        poll(&mut relay);
+        reads += 1;
+    }
+    assert!(reads > 0, "the replay never read the disk");
+    assert_eq!(seen, (1..=21).map(|n| (n, record(n))).collect::<Vec<_>>());
+    assert!(relay.is_subscribed(follower));
+}
+
 /// History that must not be asked.
 struct Never;
 

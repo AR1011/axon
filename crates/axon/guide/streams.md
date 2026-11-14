@@ -503,7 +503,8 @@ the generation and last record the files hold, until the stream is opened. A sub
 the node's writer task reads the segment that holds it between two writes, the subscription waits meanwhile, and a
 replay goes to a child a push window at a time. Retention bounds it: a start older than the oldest segment is
 `HistoryUnavailable`. Relays keep only their rings and refuse such a start, so a child that may come back far behind
-needs the origin among its candidates (`upstream_for`). Opening a newer generation,
+needs the origin among its candidates (`upstream_for`). A follower on the restarted node itself, which relayed the key
+from another node until the open, replays from the files too what it missed before the open. Opening a newer generation,
 `restart_stream` or `close_stream` removes the old files; opening an older one is refused with `GenerationMismatch`.
 
 `StreamNode::start` reads every segment of the listed namespaces once to check it, one at a time, keeping only their

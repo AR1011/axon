@@ -605,6 +605,10 @@ impl DiskStore {
                     found.segments.push(Segment { first, created_ms: Some(created), bytes: good as u64 });
                 }
             }
+            // Shelved before any open takes it: followers behind the open replay from it as the open is heard.
+            let named = found.segments.iter().filter_map(|s| Some((s.name(&key, generation)?, s.first)));
+            store.shelf.index(&key, Some((generation, named.collect())));
+            store.shelf.durable([(&key, found.last)]);
             store.found.insert(key, found);
         }
         Ok(store)
