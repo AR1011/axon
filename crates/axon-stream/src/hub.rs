@@ -171,8 +171,12 @@ pub enum SlowConsumerPolicy {
 pub enum StartPosition {
     #[default]
     Live,
-    /// Resume strictly after an applied position.
+    /// Resume strictly after an applied position. Ends `End(StreamClosed)` at a close of the key.
     After(Cursor),
+    /// Strictly after the cursor, then the key is followed as a `Live` subscription follows it: at a close it waits with
+    /// its position and goes on at the next open of its generation, here or on another node. A new generation ends it
+    /// `ResetRequired(GenerationChanged)`. Upstream it is asked as `After`.
+    FollowAfter(Cursor),
     /// From record 1 of the current generation.
     First,
     /// The state of a [`Compacted`](DeliveryPolicy::Compacted) stream, then every record after it, on any node. A
@@ -180,6 +184,16 @@ pub enum StartPosition {
     /// `End(Revoked)` where `Access::Snapshot` is denied on the way, and `End(SlowConsumer)` on a relay whose
     /// subscriber, branches or pushes cannot hold the state.
     SnapshotThenLive,
+}
+
+impl StartPosition {
+    /// The start a parent is asked for: what a `FollowAfter` follows is local, so it asks `After`.
+    pub(crate) fn upstream(self) -> Self {
+        match self {
+            Self::FollowAfter(after) => Self::After(after),
+            start => start,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -464,6 +478,11 @@ struct Sub {
     terminal: Option<StreamEvent>,
     /// Survives restarts and closes of the key: a `Ready` marks each one instead of a terminal event.
     follow: bool,
+    /// A [`FollowAfter`](StartPosition::FollowAfter) follower: held to the generation of its position.
+    one_generation: bool,
+    /// Told `Ready { start: None }` and no position since: the next batch it is given is announced first, though the
+    /// stream took a position behind its own.
+    unplaced: bool,
     /// The last position it was given, at a batch or a positioned `Ready`, or the cut its replay runs to: the
     /// subscription's own, whatever position its stream takes.
     at: Option<Cursor>,
@@ -508,9 +527,13 @@ impl Sub {
     }
 
     /// Whether the stream's new position `to` is news to this subscription: not when it is behind the subscription's
-    /// own in its generation, and a reset when it is past it, where it would skip records.
+    /// own in its generation, and a reset when it is past it, where it would skip records, or in another generation
+    /// than one held to its own.
     fn moves_to(&self, to: Cursor) -> Result<bool, StreamEvent> {
         match self.at {
+            Some(at) if self.one_generation && at.generation != to.generation => {
+                Err(StreamEvent::ResetRequired(ResetReason::GenerationChanged))
+            }
             Some(at) if at.generation == to.generation && to.sequence > at.sequence => {
                 Err(StreamEvent::ResetRequired(ResetReason::HistoryUnavailable))
             }
@@ -523,6 +546,7 @@ impl Sub {
     fn announce(&mut self, to: Cursor) -> Result<(), StreamEvent> {
         if self.moves_to(to)? {
             self.at = Some(to);
+            self.unplaced = false;
             self.push(StreamEvent::Ready { start: Some(to) });
         }
         Ok(())
@@ -542,6 +566,7 @@ impl Sub {
             self.queue.pop_back();
         }
         self.at = start.or(self.at);
+        self.unplaced = start.is_none();
         self.push(StreamEvent::Ready { start });
         Ok(())
     }
@@ -557,12 +582,24 @@ impl Sub {
         }
     }
 
+    /// At a close the source of its replay goes: a follower still replaying waits instead for its stream to come back
+    /// to the last position it was given, and the live batches held behind the replay are given back.
+    fn stop_replay(&mut self, total: &mut QueueUsage) {
+        let Phase::Recovering { next_after, cut, .. } = self.phase else { return };
+        for _ in 0..self.tail {
+            let event = self.queue.pop_back().expect("the tail is queued");
+            self.release(&event, total);
+        }
+        let given = Cursor { generation: cut.generation, sequence: next_after };
+        (self.tail, self.at, self.phase) = (0, Some(given), Phase::Waiting(Some(given)));
+    }
+
     /// Goes live once the stream is at or past a waiting start.
     fn reach(&mut self, at: u64) {
         if let Phase::Waiting(Some(after)) = self.phase
             && at >= after.sequence
         {
-            self.at = Some(after);
+            (self.at, self.unplaced) = (Some(after), false);
             self.queue.push_back(StreamEvent::Ready { start: Some(after) });
             self.queue.push_back(StreamEvent::CaughtUp { through: after });
             self.phase = Phase::Live;
@@ -641,11 +678,15 @@ impl Sub {
                 &trimmed
             }
             Some(at) if at.generation != from.generation => {
+                self.unplaced = false;
                 self.push(StreamEvent::Ready { start: Some(from) });
                 batch
             }
             _ => batch,
         };
+        if std::mem::take(&mut self.unplaced) {
+            self.push(StreamEvent::Ready { start: Some(Cursor { sequence: batch.first() - 1, ..from }) });
+        }
         self.at = Some(batch.cursor());
         let (branch, global) = self.fits(batch.bytes(), batch.len(), total, hub);
         if branch && global {
@@ -863,7 +904,10 @@ impl<A: Authorizer> StreamHub<A> {
                     self.stats.count(&terminal);
                     self.streams.get_mut(key).expect("looked up above").subscribers.push(id);
                 }
-                Some(sub) if sub.follow => self.parked.entry(key.clone()).or_default().push(id),
+                Some(sub) if sub.follow => {
+                    sub.stop_replay(&mut self.total);
+                    self.parked.entry(key.clone()).or_default().push(id);
+                }
                 _ => self.terminate(id, terminal.clone()),
             }
         }
@@ -1301,10 +1345,13 @@ impl<A: Authorizer> StreamHub<A> {
         follow: bool,
     ) -> Result<u64, StreamError> {
         self.allowed(peer, key, Access::Subscribe)?;
-        if options.start != StartPosition::Live {
+        // Admitted as `After`, then followed from the position it reaches.
+        let (asked, one_generation) =
+            (options.start.upstream(), matches!(options.start, StartPosition::FollowAfter(_)));
+        if asked != StartPosition::Live {
             self.allowed(peer, key, Access::Replay)?;
         }
-        if options.start == StartPosition::SnapshotThenLive {
+        if asked == StartPosition::SnapshotThenLive {
             self.allowed(peer, key, Access::Snapshot)?;
         }
         let l = options.limits;
@@ -1328,8 +1375,8 @@ impl<A: Authorizer> StreamHub<A> {
         }
         let cut = stream.cursor;
         // A relay holds no state: the subscriber waits for the one its parent sends.
-        let pending = (options.start == StartPosition::SnapshotThenLive && stream.relay).then(|| source.clone());
-        let waiting = match (options.start, cut) {
+        let pending = (asked == StartPosition::SnapshotThenLive && stream.relay).then(|| source.clone());
+        let waiting = match (asked, cut) {
             (StartPosition::After(_) | StartPosition::First, None) => true,
             (StartPosition::After(after), Some(cut)) => {
                 stream.relay && after.generation == cut.generation && after.sequence > cut.sequence
@@ -1347,16 +1394,18 @@ impl<A: Authorizer> StreamHub<A> {
             inflight: QueueUsage::default(),
             phase: Phase::Live,
             terminal: None,
-            follow,
+            follow: follow || one_generation,
+            one_generation,
+            unplaced: false,
             at: None,
             awaits_state: false,
             held: None,
         };
         let mut snapshot = None;
-        let from = match options.start {
+        let from = match asked {
             StartPosition::Live => None,
             _ if waiting || pending.is_some() => None,
-            StartPosition::After(cursor) => {
+            StartPosition::After(cursor) | StartPosition::FollowAfter(cursor) => {
                 let cut = cut.ok_or(RecoveryError::HistoryUnavailable)?;
                 if cursor.generation != cut.generation {
                     return Err(RecoveryError::GenerationMismatch.into());
@@ -1391,10 +1440,13 @@ impl<A: Authorizer> StreamHub<A> {
         if let Some(source) = pending {
             sub.phase = Phase::Snapshot(source);
         } else if waiting {
-            sub.phase = Phase::Waiting(match options.start {
+            let after = match asked {
                 StartPosition::After(after) => Some(after),
                 _ => None,
-            });
+            };
+            sub.phase = Phase::Waiting(after);
+            // Its own position until the stream reaches it, so a new generation before then ends it.
+            sub.at = after.filter(|_| one_generation);
         } else {
             sub.begin(start, snapshot, recovering, &mut self.total);
         }
@@ -1672,6 +1724,22 @@ impl<A: Authorizer> StreamHub<A> {
     /// Whether `poll` would return an event.
     pub fn pollable(&self, id: u64) -> bool {
         self.subs.get(&id).is_some_and(Sub::pollable)
+    }
+
+    /// Where each subscription to the key needs its stream to go on from, by id: the start one waits for, and the
+    /// position of a follower that has one.
+    pub(crate) fn waiting(&self, key: &StreamKey) -> Vec<(u64, StartPosition)> {
+        let ids = self.streams.get(key).map_or(&[][..], |s| &s.subscribers);
+        let start = |id| {
+            let sub = self.subs.get(id)?;
+            match sub.phase {
+                Phase::Waiting(None) => Some((*id, StartPosition::First)),
+                Phase::Waiting(Some(after)) => Some((*id, StartPosition::After(after))),
+                Phase::Live if sub.follow => Some((*id, StartPosition::After(sub.at?))),
+                _ => None,
+            }
+        };
+        ids.iter().filter_map(start).collect()
     }
 
     pub fn is_recovering(&self, id: u64) -> bool {

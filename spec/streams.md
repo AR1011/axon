@@ -1,6 +1,6 @@
 # Design — stream continuity
 
-Status: §3 and §1 built; §2 designed, not built. Three gaps in what a stream promises a subscriber that holds a cursor: replay stops at
+Status: §3, §1 and §2 built. Three gaps in what a stream promises a subscriber that holds a cursor: replay stops at
 the in-memory ring (§1), a moved origin starts a new generation and ends every cursor (§2), and a `Live` follower has
 no position of its own, so a relay that forgets its position moves the follower past records or back over them (§3).
 The order to build them is §3, §1, §2: §3 guards the others, and §2 rests on both. All ship in wire v8
@@ -81,19 +81,32 @@ open "generation g after position p", but it is `pub(crate)` and only disk resum
 - `StreamNode::open_stream_after(key, after: Cursor, policy)`, a future like `open_stream`. The key goes on in
   `after.generation` from `after.sequence + 1`, over `resume_stream`, with an empty ring and the namespace's history
   source behind it (§1). Without a source it is refused `InvalidOptions`: positions at or before `after` would be
-  served by nobody.
+  served by nobody. So is a namespace kept on disk (its files number the key from the disk's own last record), a
+  `Compacted` policy (its state is not in the history source), and an `after` behind the position the node already
+  relays in that generation (it would number those records again, against rule 2).
 - The rule the guide gives becomes: a new origin keeps the generation only when it gives every position the same
   record. The application holds it with two rules, which [tla/OriginMove.tla](tla/OriginMove.tla) checks:
   1. publish a record only once the node that may take over holds it (publish after commit);
   2. the new origin opens after the last record it holds, and never writes a position again.
 - The old origin calls `close_stream` once it knows it lost the right to publish (its lease lapsed). Relays see a
   close, and repull from their own position (§3), so the same generation goes on from the new origin with no reset.
-  A paused old origin cannot close: its children are orphaned after `upstream_timeout` and ask their other candidates,
-  as today (`core.rs:2195-2210`). Until it closes it publishes nothing new, by rule 1.
+  A paused old origin cannot close: its children move once the cluster calls it gone and drops it from their
+  candidates (`parent_lost`), as for a crash; `upstream_timeout` only orphans them in the meantime. At the WAN timings
+  that is about 11.5 s after the pause. Until it closes it publishes nothing new, by rule 1.
 - `StartPosition::FollowAfter(Cursor)`: strictly after the cursor, then the key is followed as a `Live` follower is.
   At a close it parks with its cursor and goes on at the next open of its generation; a new generation ends it
   `ResetRequired(GenerationChanged)`. A plain `After` keeps today's end at a close. `FollowAfter` is local to the
   subscriber's node: what goes upstream is the relay's `After(position)`, as now.
+- Built in the hub as a follower that holds one generation (`Sub::one_generation`, checked in `moves_to`), admitted
+  as an `After`. Three cases the sim found:
+  - a follower still replaying its start when the key closes loses its replay's source with the stream: it waits
+    instead for the last position it was given, and the live batches held behind the replay are given back
+    (`Sub::stop_replay`);
+  - at a relay's repull every parked follower's position is a want (`StreamHub::waiting`), not only the best-effort
+    `After` the relay closed at: a parent that cannot give it is then left for one that can, instead of the relay
+    falling back to the live edge past the follower;
+  - a follower told `Ready { start: None }` on a relay stream with no position is told its position before the first
+    batch it gets (`Sub::unplaced`).
 - Topology the guide recommends: the standby relays the key from the origin (its tiers name the origin's label), so
   taking over is the tested "a relay opens a key it pulls" path (`world_relay.rs:278`), and no `UnknownStream` backoff
   (`core.rs:1859-1868`) delays its children.
@@ -104,7 +117,8 @@ up to `MaxMoves` times (a lease lapsing, the old writer still running or not); a
 a ring gives up its oldest record. Invariants: no position twice (`NoRepeat`), none skipped (`NoGap`), each the record
 the log holds there (`SameRecord`), no subscriber ended (`NoEnd`); under fairness every subscriber reaches the last
 committed record (`CatchesUp`). `OriginMove.cfg` (3 records, 2 moves, 2 faults) passes: 685 441 distinct states,
-depth 33, 14 s on 8 workers. `OriginMove-Wide.cfg` (3 moves, 3 faults) passes: 3 397 959, depth 37, 1 min 8 s; it is
+depth 33, 14 s on 8 workers (40 s at `-workers 4` in `check.sh tla` on 2026-11-14, the seven mutations failing as
+listed). `OriginMove-Wide.cfg` (3 moves, 3 faults) passes: 3 397 959, depth 37, 1 min 8 s; it is
 not in `check.sh tla`. Each `mutations/OriginMove-*.cfg` fails within 3 s: `RepullForgets` (a relay that asks `First`
 after a close takes the live edge past its followers), `NoSource` (an origin that serves only its ring) and `CloseEnds`
 (a plain `After` at a close) break `NoEnd`; `TrustRelay` (a follower that takes its relay's position as its own, today's
@@ -120,14 +134,17 @@ relay's ring holds what it took, a read from the source is one step, and the sta
 
 - `crates/axon-stream/tests/world_relay.rs::the_origin_moves_to_its_standby_and_every_cursor_goes_on`: the origin
   crashes or pauses (seeded), the standby opens after the last record it holds, the old origin closes later or never
-  comes back. The oracle of `tests/world.rs:159` (`check`), held to one generation. Fails today: there is no
-  `open_stream_after`, and the moved generation has no history behind it.
+  comes back. The oracle of `tests/world.rs:159` (`check`), held to one generation. It failed before: there was no
+  `open_stream_after`, and the moved generation had no history behind it (run against stubs that open the next
+  generation: the leaf read "1 after 200").
 - `crates/axon-stream/tests/world_wan.rs::an_origin_moved_to_another_region_keeps_every_cursor`: the same across three
-  regions at the WAN timings; every follower recovers within the move plus `upstream_timeout` plus one push.
+  regions at the WAN timings. Every follower recovers within 15 s of the fault (the cluster calls a silent origin gone
+  about 11.5 s after it), and within `upstream_timeout` plus one round trip of an old origin's close.
 - `crates/axon-stream/tests/hub.rs::a_follow_after_subscription_parks_at_a_close_and_goes_on_at_a_reopen_of_its_generation`
 - `crates/axon-stream/tests/hub.rs::a_follow_after_subscription_ends_generation_changed_at_a_new_generation`
 - `crates/axon-stream/src/node/tests.rs::open_stream_after_without_a_history_source_is_refused`
-- The rig: a `move` role in `examples/rig/src/streams.rs`, judged by `check.py`'s `stream-gap` and `stream-dup`.
+- The rig: a `move` role in `examples/rig/src/streams.rs`, judged by `check.py`'s `stream-gap` and `stream-dup`. Not
+  built: no rig hosts are left to run it.
 - TLC: `OriginMove.cfg` and every `mutations/OriginMove-*.cfg` in `scripts/check.sh tla`.
 
 ## 3. Follower positions
@@ -180,9 +197,10 @@ position first in each seed is not pinned by reading; the fix below does not dep
   follows, its parent closes the key, and the relay asks again `After` the position it closed at, not `First`. It
   failed before the fix.
 - `crates/axon-stream/tests/sim.rs`: "the origin reopens the same generation" and "a relay sees a close" join the fault
-  mix, judged by the oracle of `tests/world.rs:159`. They land with §2: without a disk an origin that opens the same
+  mix, judged by the oracle of `tests/world.rs:159`. They landed with §2: without a disk an origin that opens the same
   generation again numbers it from record 1, and with one `close_stream` removes the files, so the only reopen of a
-  generation that goes on is an `open_stream_after` elsewhere.
+  generation that goes on is an `open_stream_after`. The sim closes the origin's keys and reopens them after the last
+  record, and late leaves start `FollowAfter` record 0 (`First` in the runs where it never closes them).
 - `crates/axon-stream/tests/world_disk.rs::a_follower_two_relays_away_sees_each_record_once_when_the_origin_resumes_after_origin_lost`:
   the origin down 3.5 to 8 s, two relays. No seed of 0..512 fails before the fix either: the relays keep their
   positions through `OriginLost`, and nothing closes their streams. It stays as the guard of that path. A ring smaller
@@ -190,8 +208,7 @@ position first in each seed is not pinned by reading; the fix below does not dep
   records behind and was rightly reset (`ResetRequired(HistoryUnavailable)`, seed 171). A close and a reopen of the
   same generation at the origin is not the case either: `close_stream` removes the files, so the reopen numbers from
   record 1 again, the reuse the guide forbids. A relay sees a close of a generation that goes on only when the origin
-  moves, so that case is §2's World test. Until then the evidence is the hub test above, red before the fix, and the
-  three rig replays.
+  moves, so that case is §2's World tests and the sim above.
 - The three rows move from Open findings to Findings fixed in [fault-rig.md](fault-rig.md), citing these tests.
 
 ## 4. Elsewhere

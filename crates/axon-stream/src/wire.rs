@@ -112,7 +112,8 @@ pub fn encode_interest(interest: &Interest) -> Bytes {
         match want.start {
             // `SnapshotThenLive` is never asked of a parent: `snapshot` is.
             StartPosition::Live | StartPosition::SnapshotThenLive => out.put_u8(snapshot),
-            StartPosition::After(after) => {
+            // Wants are asked `upstream`: a `FollowAfter` never reaches the wire, and would be its `After`.
+            StartPosition::After(after) | StartPosition::FollowAfter(after) => {
                 out.put_u8(snapshot | 1);
                 put_cursor(&mut out, after);
             }

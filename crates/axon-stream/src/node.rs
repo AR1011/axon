@@ -664,9 +664,42 @@ impl StreamNode {
         generation: u64,
         policy: DeliveryPolicy,
     ) -> impl Future<Output = Result<(), StreamError>> + Send + 'static {
+        self.open(key, generation, policy, None)
+    }
+
+    /// Makes this node the key's origin in `after.generation`, going on from `after.sequence + 1`: the stream of a
+    /// producer that moved here, which subscribers holding a cursor of that generation follow on with no reset. Its
+    /// ring starts empty, and the namespace's [`history`](StreamNodeConfig::history) serves every position up to
+    /// `after`, so it must hold them, the same records the old origin published. `InvalidOptions` without one, in a
+    /// namespace the [`disk`](StreamNodeConfig::disk) keeps, for a `Compacted` stream, and behind the position this
+    /// node already relays in that generation, which would number records again. Otherwise as
+    /// [`open_stream`](Self::open_stream).
+    ///
+    /// The generation goes on only when every position keeps its record: publish a record only once the node that
+    /// may take over holds it, and open after the last record this node holds, never writing a position again. The
+    /// old origin [`close_stream`](Self::close_stream)s the key once it knows it may no longer publish.
+    pub fn open_stream_after(
+        &self,
+        key: &StreamKey,
+        after: Cursor,
+        policy: DeliveryPolicy,
+    ) -> impl Future<Output = Result<(), StreamError>> + Send + 'static {
+        self.open(key, after.generation, policy, Some(after))
+    }
+
+    fn open(
+        &self,
+        key: &StreamKey,
+        generation: u64,
+        policy: DeliveryPolicy,
+        after: Option<Cursor>,
+    ) -> impl Future<Output = Result<(), StreamError>> + Send + 'static {
         let (node, key) = (self.0.clone(), key.clone());
         async move {
-            let reader = node.core.lock().disk_read(&key, generation, policy)?;
+            let reader = match after {
+                Some(_) => None,
+                None => node.core.lock().disk_read(&key, generation, policy)?,
+            };
             let read = match reader {
                 Some(reader) => Some(reader.read().await),
                 None => None,
@@ -681,7 +714,10 @@ impl StreamNode {
                     }
                     _ => None,
                 };
-                core.open_read(&key, generation, policy, read)?;
+                match after {
+                    Some(after) => core.open_stream_after(&key, after, policy)?,
+                    None => core.open_read(&key, generation, policy, read)?,
+                }
                 if let Some(permit) = permit {
                     node.permits.lock().insert(key.clone(), permit);
                 }

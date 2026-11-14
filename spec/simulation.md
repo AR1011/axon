@@ -504,6 +504,19 @@ relay that stops at the first subscriber it resets. From `spec/tla`: `java -cp t
 -config SnapshotThenLive.cfg SnapshotThenLive`. Not checked, as the module's header lists: batches of more than one
 record, a second parent or a chain of relays, queue capacity, limits and access, and the state across generations.
 
+**Moving an origin.** [tla/OriginMove.tla](tla/OriginMove.tla) checks `open_stream_after` and `FollowAfter`
+([streams.md § 2](streams.md#2-moving-an-origin)): two nodes that can be origin, a committed log written by one writer
+at a time, one relay, and a `Live` follower and a `FollowAfter(0)` subscriber on the relay's node. The writer moves up
+to `MaxMoves` times, the old one still running or not; a node crashes or pauses and comes back; a ring gives up its
+oldest record. Invariants: no position twice (`NoRepeat`), none skipped (`NoGap`), each the record the log holds there
+(`SameRecord`), no subscriber ended (`NoEnd`); under fairness every subscriber reaches the last committed record
+(`CatchesUp`). `OriginMove.cfg` passes with 685 441 distinct states, depth 33, in 40 s at `-workers 4` in
+`check.sh tla` (2026-11-14). Each of its seven `mutations/OriginMove-*.cfg` fails within 3 s: `CloseEnds`, `NoSource`
+and `RepullForgets` break `NoEnd`, `TrustRelay` breaks `NoGap`, `PublishBeforeCommit` and `StaleOpen` break
+`SameRecord`, and `NeverClose` breaks `CatchesUp`. `OriginMove-Wide.cfg` is not in `check.sh tla`. The code's own
+evidence is `world_relay.rs::the_origin_moves_to_its_standby_and_every_cursor_goes_on`,
+`world_wan.rs::an_origin_moved_to_another_region_keeps_every_cursor` and the sim's close and reopen fault.
+
 **Deep runs (2026-10-01).** Each base config with its bounds raised, 3 h on 2 workers each, six at once on a 24-thread
 EPYC 4484PX, on the models before c077ca6 and the hand-over and relay fixes after it. None found a violation.
 Finished: `RelayGiveUp` (`MaxSeq=4`, `MaxCuts=3`, `MaxCrashes=2`) 36.6 M distinct states, depth 55, 1 h 18 min;

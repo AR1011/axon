@@ -16,6 +16,7 @@ use axon_testkit::{check_seeds, seeds};
 use bytes::Bytes;
 
 mod common;
+use common::numbered::Numbered;
 use common::{NoStreams, SECRET, key, labels};
 
 #[derive(Clone)]
@@ -25,8 +26,9 @@ struct Node {
     system: ActorSystem,
 }
 
-/// With the timings of `relay.rs`. The role is the name's: `origin`, `relay-*`, or a leaf. Each boot of the origin
-/// opens the key as a new generation. `set` runs on the stream config last.
+/// With the timings of `relay.rs`. The role is the name's: `origin`, `standby`, `relay-*`, or a leaf. Each boot of the
+/// origin opens the key as a new generation; the standby relays it from the origin, and the relays and leaves ask it
+/// after the origin. `set` runs on the stream config last.
 async fn boot(
     host: Host,
     discovery: MemoryDiscovery,
@@ -35,6 +37,7 @@ async fn boot(
 ) -> Node {
     let role = match host.name() {
         "origin" => "origin",
+        "standby" => "standby",
         name if name.starts_with("relay") => "relay",
         _ => "leaf",
     };
@@ -49,8 +52,13 @@ async fn boot(
     let cluster = Cluster::start(&system, cfg).await.unwrap();
     let upstream = match role {
         "origin" => vec![],
-        "relay" => vec![labels(&[("role", "origin")])],
-        _ => vec![labels(&[("role", "relay"), ("region", "eu")]), labels(&[("role", "origin")])],
+        "standby" => vec![labels(&[("role", "origin")])],
+        "relay" => vec![labels(&[("role", "origin")]), labels(&[("role", "standby")])],
+        _ => vec![
+            labels(&[("role", "relay"), ("region", "eu")]),
+            labels(&[("role", "origin")]),
+            labels(&[("role", "standby")]),
+        ],
     };
     let mut cfg = StreamNodeConfig::new(upstream);
     common::short_stream(&mut cfg);
@@ -101,7 +109,10 @@ type Read = Rc<RefCell<Result<u64, String>>>;
 
 /// Records start with their sequence numbers, so a reader that starts after a cursor expects the next one.
 fn collect(w: &mut World<Node>, leaf: &str, key: StreamKey, start: StartPosition) -> Read {
-    let after = if let StartPosition::After(cursor) = start { cursor.sequence } else { 0 };
+    let after = match start {
+        StartPosition::After(cursor) | StartPosition::FollowAfter(cursor) => cursor.sequence,
+        _ => 0,
+    };
     let read = Read::new(RefCell::new(Ok(after)));
     let r = read.clone();
     drop(w.spawn_on(leaf, move |n| async move {
@@ -212,7 +223,11 @@ fn leaves_see_every_record_once_while_relays_crash_and_return() {
 }
 
 fn publish(w: &mut World<Node>, range: std::ops::RangeInclusive<u64>) {
-    let published = w.block_on("origin", move |n| async move {
+    publish_on(w, "origin", range);
+}
+
+fn publish_on(w: &mut World<Node>, on: &str, range: std::ops::RangeInclusive<u64>) {
+    let published = w.block_on(on, move |n| async move {
         for i in range {
             n.stream.publish(&key(), vec![Bytes::copy_from_slice(&i.to_be_bytes())]).unwrap();
         }
@@ -1063,13 +1078,13 @@ struct Log {
 }
 
 impl RecoverySource for Log {
-    fn available_range(&self, _: &StreamKey) -> Result<ReplayRange, RecoveryError> {
-        Ok(ReplayRange { generation: 1, first: 1, last: u64::MAX - 1 })
+    fn available_range(&self, key: &StreamKey) -> Result<ReplayRange, RecoveryError> {
+        Numbered(0).available_range(key)
     }
 
     fn read_after(
         &self,
-        _: &StreamKey,
+        key: &StreamKey,
         after: Cursor,
         through: u64,
         bounds: ReadBounds,
@@ -1091,13 +1106,7 @@ impl RecoverySource for Log {
                 }
             }
         }
-        let last = through.min(after.sequence + bounds.max_records.min(bounds.max_bytes / 8) as u64);
-        let records: Vec<Bytes> =
-            (after.sequence + 1..=last).map(|s| Bytes::copy_from_slice(&s.to_be_bytes())).collect();
-        if records.is_empty() {
-            return Err(RecoveryError::LimitExceeded);
-        }
-        Ok(vec![SequencedBatch::new(1, after.sequence + 1, records)?])
+        Numbered(0).read_after(key, after, through, bounds)
     }
 }
 
@@ -1139,4 +1148,62 @@ fn behind_every_ring(seed: u64) {
 #[test]
 fn a_subscriber_behind_every_ring_replays_from_the_origins_history_then_goes_live() {
     check_seeds(seeds(0..64), behind_every_ring).unwrap();
+}
+
+/// The key's producer moves to the standby, which relays the key from the origin. The origin crashes and never comes
+/// back, pauses and closes the key once it is back, stays paused, or runs on and closes the key (seeded); the standby
+/// opens the key after the last record, which it holds, as every record is committed there before it is published.
+/// Both publish from the application's log, which serves what neither ring holds. Every follower, `Live` or
+/// `FollowAfter`, on the leaf and on the standby, reads every record once, in order, in generation 1.
+fn origin_moves(seed: u64) {
+    let set = |cfg: &mut StreamNodeConfig| {
+        cfg.history.insert(key().namespace().into(), Arc::new(Numbered(0)));
+    };
+    let names = ["origin", "standby", "relay-a", "relay-b", "leaf"];
+    let (mut w, _) = world_with(WorldConfig { seed, ..WorldConfig::default() }, &names, Compression::None, set);
+    let from = |sequence| StartPosition::FollowAfter(Cursor { generation: 1, sequence });
+    let leaves = ["leaf", "leaf", "standby"];
+    let reads = [
+        collect(&mut w, "leaf", key(), StartPosition::Live),
+        collect(&mut w, "leaf", key(), from(0)),
+        collect(&mut w, "standby", key(), StartPosition::Live),
+    ];
+    w.run_until("the leaf and the standby are positioned", Duration::from_secs(30), |w| {
+        ["leaf", "standby"].iter().all(|n| stream(w, n).cursor(&key()).is_some())
+    });
+    publish(&mut w, 1..=200);
+    let last = Cursor { generation: 1, sequence: 200 };
+    w.run_until("the standby holds every record", Duration::from_secs(10), |w| {
+        stream(w, "standby").cursor(&key()) == Some(last)
+    });
+    let fault = w.pick(0..4);
+    match fault {
+        0 => crash(&mut w, "origin"),
+        1 | 2 => {
+            let pause = Duration::from_millis(if fault == 1 { w.pick(500..8000) } else { 60_000 });
+            w.log(format_args!("origin paused {pause:?}"));
+            w.pause("origin", pause);
+        }
+        _ => {}
+    }
+    let opened = w.block_on("standby", move |n| async move {
+        n.stream.open_stream_after(&key(), last, DeliveryPolicy::ReplayRequired).await
+    });
+    opened.unwrap().unwrap();
+    publish_on(&mut w, "standby", 201..=300);
+    if fault % 2 == 1 {
+        // Once it runs again, the old origin learns it may no longer publish.
+        let wait = Duration::from_millis(w.pick(0..500));
+        w.run_for(wait);
+        let closed = w.block_on("origin", |n| async move { n.stream.close_stream(&key()) });
+        closed.unwrap().unwrap();
+    }
+    publish_on(&mut w, "standby", 301..=400);
+    read_through(&mut w, seed, &leaves, &reads, 400);
+    println!("world digest origin_moves seed {seed}: {:016x}", w.digest());
+}
+
+#[test]
+fn the_origin_moves_to_its_standby_and_every_cursor_goes_on() {
+    check_seeds(seeds(0..64), origin_moves).unwrap();
 }

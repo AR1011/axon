@@ -688,6 +688,51 @@ fn a_history_source_is_not_asked_for_a_key_the_node_relays() {
     assert_eq!(records(&mut origin, id), (3..=12).collect::<Vec<_>>());
 }
 
+/// `open_stream_after` serves every position up to its cursor from the namespace's history: refused without one, in a
+/// namespace the disk keeps, which numbers a generation from record 1, for a compacted stream, whose state no
+/// history holds, and after the last position there is. With one, a cursor behind the open replays from it and goes on live.
+#[tokio::test(flavor = "multi_thread")]
+async fn open_stream_after_without_a_history_source_is_refused() {
+    use crate::recovery::{CompactLimits, MemoryLimits, MemoryStore, SequencedBatch, lock};
+    let at = |sequence| Cursor { generation: 4, sequence };
+    let record = |n: u64| Bytes::copy_from_slice(&n.to_be_bytes());
+    let (system, cluster) = start_cluster("a", &MemoryDiscovery::new()).await;
+    let log = Arc::new(std::sync::Mutex::new(MemoryStore::new(MemoryLimits::default()).unwrap()));
+    let (logged, kept, plain) =
+        (StreamKey::new("logged", "a"), StreamKey::new("kept", "a"), StreamKey::new("plain", "a"));
+    for key in [&logged, &kept] {
+        lock(&log).open(key, 4).unwrap();
+        // The application's log: 4 is committed before it is published.
+        lock(&log).append(key, &SequencedBatch::new(4, 1, (1..=4).map(record).collect::<Vec<_>>()).unwrap()).unwrap();
+    }
+    let cfg = on_disk(Arc::new(MemoryFiles::default()), &["kept"]).history("logged", log.clone()).history("kept", log);
+    let node = StreamNode::start(&cluster, cfg).await.unwrap();
+    let replay = DeliveryPolicy::ReplayRequired;
+    let compacted = DeliveryPolicy::Compacted(CompactLimits { max_keys: 4, max_bytes: 1 << 10 });
+    assert_eq!(node.open_stream_after(&plain, at(3), replay).await, Err(StreamError::InvalidOptions));
+    assert_eq!(node.open_stream_after(&kept, at(3), replay).await, Err(StreamError::InvalidOptions));
+    assert_eq!(node.open_stream_after(&logged, at(3), compacted).await, Err(StreamError::InvalidOptions));
+    assert_eq!(node.open_stream_after(&logged, at(u64::MAX), replay).await, Err(StreamError::InvalidOptions));
+    assert_eq!(node.cursor(&logged), None);
+
+    node.open_stream_after(&logged, at(3), replay).await.unwrap();
+    assert_eq!(node.publish(&logged, vec![record(4)]).map_err(|e| e.error), Ok(at(4)));
+    let options = SubscribeOptions { start: StartPosition::After(at(1)), ..Default::default() };
+    let mut sub = node.subscribe(&logged, options).unwrap();
+    let mut seen = Vec::new();
+    while seen.len() < 3 {
+        if let StreamEvent::Batch(batch) =
+            tokio::time::timeout(Duration::from_secs(5), sub.next()).await.unwrap().unwrap()
+        {
+            seen.extend((batch.first()..).zip(batch.records()).map(|(s, r)| (s, r == &record(s))));
+        }
+    }
+    assert_eq!(seen, [(2, true), (3, true), (4, true)]);
+    drop((sub, node));
+    drop(cluster);
+    system.shutdown().await.unwrap();
+}
+
 /// A push goes to the boot of the child that asked for it. Sent again after that boot went, it never reaches the next
 /// boot, whose links are numbered from 1 again: taken there, it set the new boot to the old one's position and its
 /// follower skipped records the origin still held (the rig's `stream-gap`). The origin gives the old boot up at once.

@@ -351,6 +351,65 @@ fn a_follower_never_sees_a_position_twice_or_moves_past_one_whatever_its_relay_a
     assert_eq!(got, want);
 }
 
+/// A `FollowAfter` subscription replays from its cursor, then waits through a close with its position and goes on when
+/// the key is opened again in its generation: here, relayed from the node that took the key over after 5. A plain
+/// `After` ends at the close.
+#[test]
+fn a_follow_after_subscription_parks_at_a_close_and_goes_on_at_a_reopen_of_its_generation() {
+    let at = |sequence| Cursor { generation: 7, sequence };
+    let (mut hub, store) = hub();
+    publish(&mut hub, &store, 1..=5, 2);
+    let follow = SubscribeOptions { start: StartPosition::FollowAfter(at(2)), ..Default::default() };
+    let follows = hub.subscribe(&me(), &key(), follow, Some(store.clone())).unwrap();
+    let plain = hub.subscribe(&me(), &key(), after(2), Some(store.clone())).unwrap();
+    assert_eq!(drain(&mut hub, follows, 2), (vec![3, 4, 5], None));
+    assert_eq!(drain(&mut hub, plain, 2), (vec![3, 4, 5], None));
+
+    hub.close_stream(&me(), &key(), EndReason::StreamClosed).unwrap();
+    assert_eq!(drain(&mut hub, plain, 2), (vec![], Some(StreamEvent::End(EndReason::StreamClosed))));
+    assert_eq!((drain(&mut hub, follows, 2), hub.demand_count(&key())), ((vec![], None), 1));
+    hub.open_relay_stream(&me(), &key(), DeliveryPolicy::ReplayRequired).unwrap();
+    hub.adopt_relay_stream(&me(), &key(), at(5)).unwrap();
+    hub.accept_batch(&me(), &key(), batch(7, 6, 3)).unwrap();
+    let readies = [hub.poll(follows), hub.poll(follows)];
+    assert_eq!(readies, [None, Some(at(5))].map(|start| Some(StreamEvent::Ready { start })));
+    assert_eq!(drain(&mut hub, follows, 2), (vec![6, 7, 8], None));
+}
+
+/// A `FollowAfter` subscription keeps its generation: a restart, or an open of the next one here or relayed, ends it
+/// `ResetRequired(GenerationChanged)` where a `Live` follower would go on.
+#[test]
+fn a_follow_after_subscription_ends_generation_changed_at_a_new_generation() {
+    type Then = fn(&mut StreamHub);
+    let cases: [(&str, Then); 3] = [
+        ("a restart", |hub| hub.restart_stream(&me(), &key(), 8).unwrap()),
+        ("a close, an open of the next", |hub| {
+            hub.close_stream(&me(), &key(), EndReason::StreamClosed).unwrap();
+            hub.open_stream(&me(), &key(), 8, DeliveryPolicy::ReplayRequired).unwrap();
+        }),
+        ("a close, a relay that adopts the next", |hub| {
+            hub.close_stream(&me(), &key(), EndReason::StreamClosed).unwrap();
+            hub.open_relay_stream(&me(), &key(), DeliveryPolicy::ReplayRequired).unwrap();
+            hub.adopt_relay_stream(&me(), &key(), Cursor { generation: 8, sequence: 0 }).unwrap();
+        }),
+    ];
+    let (mut want, mut got) = (Vec::new(), Vec::new());
+    for (case, then) in cases {
+        let (mut hub, store) = hub();
+        publish(&mut hub, &store, 1..=3, 3);
+        let follow = SubscribeOptions {
+            start: StartPosition::FollowAfter(Cursor { generation: 7, sequence: 1 }),
+            ..Default::default()
+        };
+        let id = hub.subscribe(&me(), &key(), follow, Some(store.clone())).unwrap();
+        assert_eq!(drain(&mut hub, id, 8), (vec![2, 3], None), "{case}");
+        then(&mut hub);
+        got.push((case, drain(&mut hub, id, 8), hub.stats().subscriptions));
+        want.push((case, (vec![], Some(StreamEvent::ResetRequired(ResetReason::GenerationChanged))), 0));
+    }
+    assert_eq!(got, want);
+}
+
 /// The follower a lost position would skip ends alone, with what it had queued: the stream and a follower that came
 /// after the give-up carry on.
 #[test]

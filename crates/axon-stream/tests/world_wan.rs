@@ -20,12 +20,13 @@ use axon_cluster::{
     SeedServerConfig, SeedTimings, SpawnContext,
 };
 use axon_net::SharedSecret;
-use axon_stream::{DeliveryPolicy, RelayTimings, StreamEvent, StreamNode, StreamNodeConfig, SubscribeOptions};
+use axon_stream::{Cursor, DeliveryPolicy, RelayTimings, StreamEvent, StreamNode, StreamNodeConfig, SubscribeOptions};
 use axon_testkit::world::{Crash, Host, Wire, World, WorldConfig};
 use axon_testkit::{check_seeds, seeds};
 use bytes::{Buf, Bytes};
 
 mod common;
+use common::numbered::Numbered;
 use common::{Echo, EchoApi, SECRET, SEED_PORT, key, keys, role};
 
 const NODES: [&str; 5] = ["eu-a", "eu-b", "sin", "us", "us-b"];
@@ -33,6 +34,8 @@ const NODES: [&str; 5] = ["eu-a", "eu-b", "sin", "us", "us-b"];
 const SEEDS: [&str; 3] = ["eu-a", "sin", "us"];
 const ORIGIN: &str = "eu-a";
 const FOLLOWERS: [&str; 2] = ["sin", "us-b"];
+/// Where the key's producer moves to in `an_origin_moved_to_another_region_keeps_every_cursor`.
+const STANDBY: &str = "us";
 
 /// spec/wan.md § 9's time for a dead holder's keys to run elsewhere, 14 s, and a margin.
 const RECOVER: Duration = Duration::from_secs(15);
@@ -135,7 +138,9 @@ struct Node {
     seed: Option<Arc<SeedServer>>,
 }
 
-async fn boot(host: Host, timings: Timings) -> Node {
+/// With `standby`, `STANDBY` relays the key from the origin and the other members ask it after the origin, and every
+/// node keeps the application's log of generation 1 as the key's history.
+async fn boot(host: Host, timings: Timings, standby: bool) -> Node {
     let wan = timings == Timings::Wan;
     let transport = host.transport(SharedSecret::new(SECRET).unwrap());
     let system = ActorSystem::builder().runtime(host.runtime()).build().unwrap();
@@ -155,10 +160,25 @@ async fn boot(host: Host, timings: Timings) -> Node {
     let discovery = SeedDiscovery::start(seeds).await.unwrap();
     let mut cfg = ClusterConfig::new(host.addr(), transport, discovery.clone());
     let origin = host.name() == ORIGIN;
-    cfg.labels = role(if origin { "origin" } else { "member" });
+    let is_standby = standby && host.name() == STANDBY;
+    cfg.labels = role(if origin {
+        "origin"
+    } else if is_standby {
+        "standby"
+    } else {
+        "member"
+    });
     let mut paxos = PaxosConfig::new(SEEDS);
     paxos.store = Some(Arc::new(host.disk().dir("leases")));
-    let mut streams = StreamNodeConfig::new(if origin { vec![] } else { vec![role("origin")] });
+    let mut streams = StreamNodeConfig::new(match (origin, standby && !is_standby) {
+        (true, _) => vec![],
+        (false, true) => vec![role("origin"), role("standby")],
+        (false, false) => vec![role("origin")],
+    });
+    if standby {
+        // Record s carries s - 1, as `keep_publishing` numbers them.
+        streams = streams.history(key().namespace(), Arc::new(Numbered(1)));
+    }
     if wan {
         across_regions(&mut cfg, &mut paxos, &mut streams);
         // The guide's, for a namespace whose origin is in another region.
@@ -194,6 +214,8 @@ struct Seen {
     /// The payload of the origin's next record: records are numbered from 0, so record n has sequence n + 1.
     next: Cell<u64>,
     stop: Cell<bool>,
+    /// The node that publishes, `ORIGIN` while `None`.
+    writer: Cell<Option<&'static str>>,
     followers: RefCell<BTreeMap<&'static str, Follower>>,
     /// The node each key was first seen running on, per epoch.
     epochs: RefCell<BTreeMap<String, BTreeMap<u64, String>>>,
@@ -229,9 +251,14 @@ impl Seen {
 
 /// A record every 20 ms from the origin, until `stop`.
 fn keep_publishing(w: &mut World<Node>, seen: &Rc<Seen>) {
+    keep_publishing_on(w, seen, ORIGIN);
+}
+
+/// A record every 20 ms from `on`, until `stop` or another node is the `writer`.
+fn keep_publishing_on(w: &mut World<Node>, seen: &Rc<Seen>, on: &'static str) {
     let seen = seen.clone();
-    drop(w.spawn_on(ORIGIN, move |n| async move {
-        while !seen.stop.get() {
+    drop(w.spawn_on(on, move |n| async move {
+        while !seen.stop.get() && seen.writer.get().unwrap_or(ORIGIN) == on {
             let next = seen.next.get();
             if n.stream.publish(&key(), vec![Bytes::copy_from_slice(&next.to_be_bytes())]).is_ok() {
                 seen.next.set(next + 1);
@@ -339,11 +366,15 @@ fn recovered(
 
 /// Five nodes on `timings`, every node having called every key, and both followers following.
 fn start(seed: u64, timings: Timings) -> (World<Node>, Rc<Seen>) {
+    start_with(seed, timings, false)
+}
+
+fn start_with(seed: u64, timings: Timings, standby: bool) -> (World<Node>, Rc<Seen>) {
     // At the default 64 KiB a connection moves 337 KB/s at 190 ms: the World, not axon, would set the stream's speed
     // and every call's wait behind it (spec/push-window.md § 10).
     let mut w = World::new(WorldConfig { seed, window: 64 << 20, ..WorldConfig::default() });
     for name in NODES {
-        w.add(name, move |host| boot(host, timings));
+        w.add(name, move |host| boot(host, timings, standby));
     }
     for (a, b) in links() {
         w.wire(a, b, wire(a, b));
@@ -586,4 +617,62 @@ fn seed_link_lost_syn(seed: u64) {
 #[test]
 fn a_seed_link_redials_across_a_lost_syn_within_the_connect_timeout_and_keeps_the_node_listed() {
     check_seeds(seeds(0..16), seed_link_lost_syn).unwrap();
+}
+
+/// The key's producer moves from eu-a to us, in another region, which relays the key: eu-a crashes, pauses and
+/// closes the key once it runs again, stays paused, or runs on and closes the key (seeded). us opens the key after the
+/// last record, which it holds, as every record is committed there before it is published. The followers on sin,
+/// us-b and us go on in generation 1 with no reset: from a silent eu-a once the cluster calls it gone, within the
+/// guide's time for a dead holder, and from a close within the namespace's `upstream_timeout` plus one push.
+fn origin_moved(seed: u64) {
+    let (mut w, seen) = start_with(seed, Timings::Wan, true);
+    follow(&mut w, &seen, STANDBY);
+    let since = w.now();
+    recovered(&mut w, &[], &[STANDBY], &seen, since);
+    let quiet = Duration::from_millis(w.pick(0..2000));
+    run(&mut w, &seen, quiet);
+    // The lease moves: eu-a publishes nothing more.
+    seen.writer.set(Some(STANDBY));
+    let last = Cursor { generation: 1, sequence: seen.next.get() };
+    let held = |w: &World<Node>| w.nodes().find(|(n, _)| *n == STANDBY).and_then(|(_, n)| n.stream.cursor(&key()));
+    w.run_until("the standby holds every record", Duration::from_secs(10), |w| held(w) == Some(last));
+    let (fault, moved) = (w.pick(0..4), w.now());
+    match fault {
+        0 => {
+            let how = if w.pick(0..2) == 0 { Crash::Process } else { Crash::Machine };
+            w.log(format_args!("{ORIGIN} {how:?}"));
+            w.crash(ORIGIN, how);
+        }
+        1 | 2 => {
+            let pause = Duration::from_millis(if fault == 1 { w.pick(500..10_000) } else { 120_000 });
+            w.log(format_args!("{ORIGIN} paused {pause:?}"));
+            w.pause(ORIGIN, pause);
+        }
+        _ => {}
+    }
+    let opened = w.block_on(STANDBY, move |n| async move {
+        n.stream.open_stream_after(&key(), last, DeliveryPolicy::ReplayRequired).await
+    });
+    opened.unwrap().unwrap();
+    keep_publishing_on(&mut w, &seen, STANDBY);
+    let mut closed = None;
+    if fault % 2 == 1 {
+        let wait = Duration::from_millis(w.pick(0..1000));
+        run(&mut w, &seen, wait);
+        let close = w.block_on(ORIGIN, |n| async move { n.stream.close_stream(&key()) });
+        close.unwrap().unwrap();
+        closed = Some(w.now());
+    }
+    let followers = [FOLLOWERS[0], FOLLOWERS[1], STANDBY];
+    let took = recovered(&mut w, &[], &followers, &seen, moved);
+    if let Some(closed) = closed {
+        let (after, bound) = (moved + took - closed, Duration::from_secs(7) + rtt(STANDBY, "sin"));
+        assert!(after <= bound, "seed {seed}: the followers recovered {after:?} after the close, past {bound:?}");
+    }
+    println!("world digest origin_moved seed {seed}: {:016x}", w.digest());
+}
+
+#[test]
+fn an_origin_moved_to_another_region_keeps_every_cursor() {
+    check_seeds(seeds(0..16), origin_moved).unwrap();
 }

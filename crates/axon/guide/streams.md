@@ -106,6 +106,8 @@ async fn main() {
   so the same generation resumed from disk goes on for their followers where they were, with no record twice and none
   skipped. Give it a generation above the last one: a cursor names a position in one generation, and a new origin that
   reuses the number gives the same positions to other records, which a cursor from the old one then takes as its own.
+  The one exception is a new origin that gives every position the same record, which
+  [`open_stream_after`](#moving-an-origin) is for.
   Keeping one origin at a time is the application's part, for example a keyed actor under a lease. When no parent
   reaches the origin any more (every parent lacks the key or has lost its own upstream, or none has fed it for
   `upstream_timeout`), a follower on another node gets `StreamEvent::OriginLost`, once per loss, and one that
@@ -117,7 +119,9 @@ async fn main() {
   `ResetRequired(HistoryUnavailable)`. A subscription that starts from a cursor, `First` or `SnapshotThenLive` holds a
   position in one generation: it goes on through an origin that resumes that generation [from disk](#history-on-disk),
   and ends with `ResetRequired(GenerationChanged)` at a new generation or `End(StreamClosed)` at a close, because its
-  position, or the state it built, is meaningless afterwards. Subscribe again to start over.
+  position, or the state it built, is meaningless afterwards. Subscribe again to start over. `FollowAfter(cursor)`
+  starts strictly after the cursor and then follows the key: at a close it waits with its position and goes on at the
+  next open of its generation, and only a new generation ends it.
 - Put a middle tier in by giving nodes more `upstream` label sets, tried in order:
   `vec![{role: relay, region: eu}, {role: origin}]`. Relays fetch one copy of a stream however many subscribers they
   have, and children move to another parent when theirs fails.
@@ -696,6 +700,26 @@ async fn main() {
 ```
 
 ## Standby
+
+### Moving an origin
+
+An origin that fails over to a standby can keep the generation, and with it every cursor, when the application keeps
+the stream's records itself ([above](#history-the-application-keeps)). Two rules make the new origin give every
+position the same record:
+
+1. publish a record only once the node that may take over holds it (write the log, then publish);
+2. the new origin opens after the last record it holds, `node.open_stream_after(key, last, policy)`, and never
+   publishes a position again.
+
+The old origin calls `close_stream` once it knows it may no longer publish, for example when its lease lapses. Relays
+see the close and ask the new origin from their own positions, so `Live` and `FollowAfter` subscribers go on in the
+same generation without a reset. A crashed or paused old origin cannot close: its children move once the cluster calls
+it gone. Let the standby relay the key from the origin (its `upstream` names the origin's labels), so taking over is a
+relay opening a key it pulls. `open_stream_after` is refused `InvalidOptions` without a history source for the
+namespace, for a namespace kept on disk, for a `Compacted` policy, and behind the position the node already relays. `tests/world_relay.rs` and
+`tests/world_wan.rs` move an origin under a crash, a pause and a late close.
+
+### Consumers
 
 A standby keeps what a consumer builds from a stream and takes over when the consumer is gone: snapshot the state
 with the cursor of its last record, and on taking over load the snapshot and subscribe `After(cursor)`. Snapshot at
