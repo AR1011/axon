@@ -280,7 +280,7 @@ async fn movers_start(cx: &crate::Ctx<'_>, sh: Arc<Shared>) -> Result<(), Box<dy
         .eager(Bytes::new(), Placement::default())
         .register(move |scx: &SpawnContext, _| {
             let epoch = scx.epoch.ok_or("leased only")?;
-            Ok(Mover { sh: sh.clone(), epoch, next: 0, failing: Default::default() })
+            Ok(Mover { sh: sh.clone(), epoch, next: [0; 2], failing: Default::default() })
         })
         .await?;
     let cluster = cx.cluster.downgrade();
@@ -302,8 +302,8 @@ async fn movers_start(cx: &crate::Ctx<'_>, sh: Arc<Shared>) -> Result<(), Box<dy
 struct Mover {
     sh: Arc<Shared>,
     epoch: u64,
-    /// The next record to publish on both streams.
-    next: u64,
+    /// The next record to publish on each stream.
+    next: [u64; 2],
     failing: [crate::Failing; 2],
 }
 
@@ -341,26 +341,28 @@ impl Actor for Mover {
         match msg {
             Moved::Opened(Err(e)) => return Err(e),
             Moved::Opened(Ok(after)) => {
-                self.next = after + 1;
+                self.next = [after + 1; 2];
                 self.sh.log.line("move_open", json!({"e": self.epoch, "after": after}));
                 cx.schedule_every(EVERY, || Moved::Due).map_err(|e| format!("{:?}", e.reason))?;
             }
             Moved::Due => {
-                // Each record when it is due: several after a turn ran late.
-                let last = (now_us() / DUE_US).min(self.next + 200);
-                if last < self.next {
-                    return Ok(());
-                }
-                for (key, failing) in move_keys().iter().zip(&mut self.failing) {
-                    let records = (self.next..=last).map(|s| move_record(key, s)).collect();
+                // Each record when it is due: several after a turn ran late. A refused batch is published again, so
+                // each position keeps the record due there.
+                let due = now_us() / DUE_US;
+                for ((key, failing), next) in move_keys().iter().zip(&mut self.failing).zip(&mut self.next) {
+                    let last = due.min(*next + 200);
+                    if last < *next {
+                        continue;
+                    }
+                    let records = (*next..=last).map(|s| move_record(key, s)).collect();
                     match self.sh.node.publish(key, records) {
                         Ok(_) => {
                             failing.ok();
+                            *next = last + 1;
                         }
                         Err(e) => failing.err(&self.sh.log, key, &e.error),
                     }
                 }
-                self.next = last + 1;
             }
         }
         Ok(())
@@ -370,7 +372,8 @@ impl Actor for Mover {
         for key in move_keys() {
             let _ = self.sh.node.close_stream(&key);
         }
-        let line = json!({"e": self.epoch, "last": self.next.saturating_sub(1), "why": format!("{why:?}")});
+        let last = self.next.map(|n| n.saturating_sub(1));
+        let line = json!({"e": self.epoch, "last": last, "why": format!("{why:?}")});
         self.sh.log.line("move_close", line);
     }
 }

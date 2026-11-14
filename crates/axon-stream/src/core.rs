@@ -913,16 +913,15 @@ impl<A: Authorizer> RelayCore<A> {
         self.history.insert(namespace.into(), source);
     }
 
-    /// What an open of the key reads from disk first, without the core: `None` when it reads nothing.
+    /// What an open of the key reads from disk first, without the core: `None` when it reads nothing. An open the
+    /// node refuses reads nothing.
     pub(crate) fn disk_read(
         &self,
         key: &StreamKey,
         generation: u64,
         policy: DeliveryPolicy,
     ) -> Result<Option<DiskRead>, StreamError> {
-        if self.originated.contains(key) {
-            return Err(StreamError::AlreadyExists);
-        }
+        self.may_open(key, generation)?;
         match self.disk.as_ref().filter(|d| d.holds(key)) {
             Some(disk) => disk.reader(key, generation, policy, lock(&self.store).ring_limits(key)),
             None => Ok(None),
@@ -939,6 +938,18 @@ impl<A: Authorizer> RelayCore<A> {
         read: Option<Result<Resume, ReadError>>,
     ) -> Result<(), StreamError> {
         self.open(key, generation, policy, read, None)
+    }
+
+    fn may_open(&self, key: &StreamKey, generation: u64) -> Result<(), StreamError> {
+        // The key conflicts before its generation does: `restart_stream` it, or close it first.
+        if self.originated.contains(key) {
+            return Err(StreamError::AlreadyExists);
+        }
+        // A generation only goes up: the node's followers would move back to an older one.
+        if self.hub.newest_generation(key).is_some_and(|newest| newest > generation) {
+            return Err(RecoveryError::GenerationMismatch.into());
+        }
+        Ok(())
     }
 
     /// An open at record 1 of `generation`, or after the disk's `read`, or `after` a position.
@@ -968,14 +979,7 @@ impl<A: Authorizer> RelayCore<A> {
                 return Err(StreamError::InvalidOptions);
             }
         }
-        // The key conflicts before its generation does: `restart_stream` it, or close it first.
-        if self.originated.contains(key) {
-            return Err(StreamError::AlreadyExists);
-        }
-        // A generation only goes up: the node's followers would move back to an older one.
-        if self.hub.newest_generation(key).is_some_and(|newest| newest > generation) {
-            return Err(RecoveryError::GenerationMismatch.into());
-        }
+        self.may_open(key, generation)?;
         let pulled = self.feeds.contains_key(key);
         let last = self.cursor(key);
         if pulled {
