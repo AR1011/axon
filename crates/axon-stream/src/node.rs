@@ -479,20 +479,23 @@ impl Inner {
 /// Writes what was published to the streams kept on disk, one write at a time: each starts as soon as the last has
 /// landed and something waits, and takes all of it, so a record waits for one write in progress at most, never for a
 /// tick. A failed write is tried again after `RETRY_WRITE`. After each write it reads the segments that starts behind
-/// a ring asked for.
+/// a ring asked for, and it wakes when one read in and not read from may give up its place.
 async fn write_disk(node: Weak<Inner>, writes: Arc<Notify>) {
     loop {
         let Some(inner) = node.upgrade() else { return };
-        let (taken, reads, aging) = {
+        let (taken, reads, aging, expires) = {
             let mut core = inner.core.lock();
-            (core.take_disk_writes(axon::trace::unix_micros() / 1000), core.take_disk_reads(), core.disk_may_retain())
+            let taken = core.take_disk_writes(axon::trace::unix_micros() / 1000);
+            (taken, core.take_disk_reads(Instant::now().into_std()), core.disk_may_retain(), core.disk_unread_ages())
         };
         drop(inner);
         if taken.is_none() && reads.is_none() {
-            if aging {
-                let _ = tokio::time::timeout(RETAIN_EVERY, writes.notified()).await;
-            } else {
-                writes.notified().await;
+            let retain = aging.then(|| Instant::now() + RETAIN_EVERY);
+            match expires.map(Instant::from_std).into_iter().chain(retain).min() {
+                Some(at) => {
+                    let _ = tokio::time::timeout_at(at, writes.notified()).await;
+                }
+                None => writes.notified().await,
             }
             continue;
         }
@@ -515,7 +518,7 @@ async fn write_disk(node: Weak<Inner>, writes: Arc<Notify>) {
             let unread: Vec<_> = asked.iter().map(|a| (a.clone(), None)).collect();
             let read = tokio::spawn(disk::read_asked(files, asked)).await.unwrap_or(unread);
             let Some(inner) = node.upgrade() else { return };
-            inner.with(|core| core.disk_read_in(read));
+            inner.with(|core| core.disk_read_in(read, Instant::now().into_std()));
         }
         if failed {
             tokio::time::sleep(RETRY_WRITE).await;
@@ -551,6 +554,9 @@ impl StreamNode {
         }
         if cfg.disk.as_ref().is_some_and(|d| d.max_read_segments == 0) {
             return Err(ClusterError::Config("DiskConfig::max_read_segments must be at least 1"));
+        }
+        if cfg.disk.as_ref().is_some_and(|d| d.unread_expiry.is_zero()) {
+            return Err(ClusterError::Config("DiskConfig::unread_expiry must be above 0"));
         }
         let cluster_wide =
             cfg.core.namespaces.values().any(|l| l.records_per_sec.or(l.bytes_per_sec).or(l.open_streams).is_some());

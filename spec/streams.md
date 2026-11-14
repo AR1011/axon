@@ -45,8 +45,11 @@ supplies", but no `StreamNodeConfig` field reaches it. Disk history serves only 
   than the oldest segment is `HistoryUnavailable`. `DiskConfig::max_read_segments` (8) bounds the segments read in
   that stay in memory and each read; more starts at once take turns, in the order they asked. A read brings in only
   what the segments no start has read from yet, and those being read, leave room for: none is read in to be evicted
-  unread, and the start that asked first keeps its segment until it reads it. Past the limit the segment read from
-  longest ago goes. Replay beyond the ring is then axon's own, and the World tests it.
+  unread, and the start that asked first keeps its segment until it reads it, or for `DiskConfig::unread_expiry`
+  (10 s) at most: a start that stops polling, or ends before it reads, holds no place for good. The writer task wakes
+  when a segment's expiry ends; polled later, the start reads its segment in again. Past the limit a segment past its
+  expiry goes first, then the one read from longest ago. Replay beyond the ring is then axon's own, and the World tests
+  it.
 - A start behind every relay's ring. A relay refuses it `HistoryUnavailable` (`core.rs:1435-1437`); the child asks its
   other candidates and waits for one that holds it while any is still appearing (`reconcile`, `core.rs:2176-2190`). The
   origin must be among the child's candidates (`upstream_for`): the guide says so, and a test holds it. A relay that
@@ -72,6 +75,10 @@ supplies", but no `StreamNodeConfig` field reaches it. Disk history serves only 
   reads in as many segments. Before, the starts were read by segment name, and the last key waited for the others'
   whole replays; then a read past the limit evicted the first read's segments unread, and the first key got its first
   record in round 38; then reads twice a round brought in 168 segments against 90, evicted unread.
+- `crates/axon-stream/src/node/tests.rs::a_start_that_stops_polling_holds_its_segment_until_it_expires` and
+  `::a_start_gone_before_it_reads_its_segment_holds_the_shelf_only_until_it_expires`: one segment read in, held by a
+  start that does not read it; the next replay goes on once the expiry ends, and the slow start, polled after, gets
+  every record in order. Before, the next replay waited until the key closed.
 - `crates/axon-stream/src/core/tests.rs::a_source_replay_larger_than_the_branch_limit_goes_through_the_push_window_without_a_slow_consumer_reset`
 - `crates/axon-stream/src/node/tests.rs::a_history_source_is_not_asked_for_a_key_the_node_relays`
 

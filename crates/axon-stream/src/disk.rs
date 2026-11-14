@@ -11,7 +11,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axon::files::crc32;
 use bytes::{BufMut, Bytes, BytesMut};
@@ -39,11 +39,23 @@ pub struct DiskConfig {
     /// The segments read in for starts behind a ring that stay in memory, and the most one read of the writer task
     /// brings in: more starts at once take turns. `StreamNode::start` refuses 0.
     pub max_read_segments: usize,
+    /// How long a segment read in keeps its place while no start reads from it. Past that it may go as one read from
+    /// does, so a start that stalls or ends before it reads holds no place for good; polled later, it reads the
+    /// segment in again. `StreamNode::start` refuses 0.
+    pub unread_expiry: Duration,
 }
 
 impl DiskConfig {
     pub fn new(files: Arc<dyn Files>, namespaces: Vec<Retention>) -> Self {
-        Self { files, namespaces, segment_bytes: 8 << 20, max_unwritten_bytes: 64 << 20, max_read_segments: 8 }
+        let unread_expiry = Duration::from_secs(10);
+        Self {
+            files,
+            namespaces,
+            segment_bytes: 8 << 20,
+            max_unwritten_bytes: 64 << 20,
+            max_read_segments: 8,
+            unread_expiry,
+        }
     }
 }
 
@@ -375,6 +387,8 @@ pub(crate) struct Asked {
     upto: u64,
     /// When a start last read a page from it, in the shelf's count of pages; 0 before one has.
     served: u64,
+    /// Read in and not read from: when it was read in, `None` once it sat so for `unread_expiry` and may go.
+    unread_since: Option<Instant>,
 }
 
 /// A segment read in: its batches, `None` when it could not be read.
@@ -433,31 +447,44 @@ impl Shelf {
         !s.asked.is_empty() && s.room(max) > 0
     }
 
-    /// At most as many as there is room for; the rest wait for the next read.
-    fn take_asked(&self, max: usize) -> Vec<Asked> {
+    /// At most as many as there is room for, once the segments unread for `expiry` give theirs up; the rest wait for
+    /// the next read.
+    fn take_asked(&self, max: usize, expiry: Duration, now: Instant) -> Vec<Asked> {
         let mut s = lock(&self.0);
+        for (asked, _) in &mut s.read {
+            if asked.unread_since.and_then(|at| at.checked_add(expiry)).is_some_and(|at| at <= now) {
+                asked.unread_since = None;
+            }
+        }
         let n = s.room(max).min(s.asked.len());
         let asked: Vec<Asked> = s.asked.drain(..n).collect();
         s.reading.extend(asked.iter().map(|a| a.name.clone()));
         asked
     }
 
-    /// Keeps what a read brought in, at most `max` segments, and returns the streams it was for. Past `max`, the
-    /// segment a start read from longest ago goes.
-    fn read_in(&self, read: Vec<SegmentRead>, max: usize) -> BTreeSet<StreamKey> {
+    /// When the first segment read in and not read from has sat so for `expiry`, and may give up its place.
+    fn unread_ages(&self, expiry: Duration) -> Option<Instant> {
+        let s = lock(&self.0);
+        s.read.iter().filter_map(|(a, _)| a.unread_since?.checked_add(expiry)).min()
+    }
+
+    /// Keeps what a read brought in at `now`, at most `max` segments, and returns the streams it was for. Past `max`,
+    /// a segment that sat unread too long goes, else the one a start read from longest ago.
+    fn read_in(&self, read: Vec<SegmentRead>, max: usize, now: Instant) -> BTreeSet<StreamKey> {
         let mut s = lock(&self.0);
         let mut keys = BTreeSet::new();
-        for (asked, batches) in read {
+        for (mut asked, batches) in read {
             s.reading.remove(&asked.name);
             keys.insert(asked.key.clone());
             if s.index.get(&asked.key).is_some_and(|e| e.segments.iter().any(|(name, _)| *name == asked.name)) {
+                asked.unread_since = Some(now);
                 s.read.push_back((asked, batches));
             }
         }
         while s.read.len() > max {
-            // A read takes only the room the unread segments leave, so one has been read from; else the newest goes.
-            let read_from = s.read.iter().enumerate().filter(|(_, (a, _))| a.served > 0);
-            let at = read_from.min_by_key(|(_, (a, _))| a.served).map_or(s.read.len() - 1, |(at, _)| at);
+            // A read takes only the room the unread segments leave, so one may go; else the newest goes.
+            let may_go = s.read.iter().enumerate().filter(|(_, (a, _))| a.unread_since.is_none());
+            let at = may_go.min_by_key(|(_, (a, _))| a.served).map_or(s.read.len() - 1, |(at, _)| at);
             s.read.remove(at);
         }
         keys
@@ -465,10 +492,11 @@ impl Shelf {
 }
 
 impl Shelved {
-    /// The segments a read may bring in: `max` less those read in that no start has read from yet, and those being
-    /// read. A read never brings in one it would evict unread, so the starts that asked first keep theirs.
+    /// The segments a read may bring in: `max` less those read in that no start has read from yet nor sat so too
+    /// long, and those being read. A read never brings in one it would evict unread, so the starts that asked first
+    /// keep theirs.
     fn room(&self, max: usize) -> usize {
-        let unread = self.read.iter().filter(|(a, _)| a.served == 0).count();
+        let unread = self.read.iter().filter(|(a, _)| a.unread_since.is_some()).count();
         max.saturating_sub(unread + self.reading.len())
     }
 }
@@ -505,7 +533,7 @@ impl RecoverySource for Shelf {
         let Some(at) = s.read.iter().position(|(a, _)| a.name == *name) else {
             if !s.reading.contains(name) && !s.asked.iter().any(|a| a.name == *name) {
                 let (name, key, generation, first, upto) = (name.clone(), key.clone(), *generation, *first, *last);
-                s.asked.push_back(Asked { name, key, generation, first, upto, served: 0 });
+                s.asked.push_back(Asked { name, key, generation, first, upto, served: 0, unread_since: None });
             }
             return Err(RecoveryError::Pending);
         };
@@ -527,7 +555,7 @@ impl RecoverySource for Shelf {
         }
         let page = page(after, through, bounds, held);
         s.pages += 1;
-        s.read[at].0.served = s.pages;
+        (s.read[at].0.served, s.read[at].0.unread_since) = (s.pages, None);
         page
     }
 }
@@ -744,14 +772,19 @@ impl DiskStore {
     }
 
     /// The segments starts behind a ring asked for, to read with [`read_asked`] and hand to [`read_in`](Self::read_in).
-    pub(crate) fn take_reads(&self) -> Option<(Arc<dyn Files>, Vec<Asked>)> {
-        let asked = self.shelf.take_asked(self.cfg.max_read_segments);
+    pub(crate) fn take_reads(&self, now: Instant) -> Option<(Arc<dyn Files>, Vec<Asked>)> {
+        let asked = self.shelf.take_asked(self.cfg.max_read_segments, self.cfg.unread_expiry, now);
         (!asked.is_empty()).then(|| (self.cfg.files.clone(), asked))
     }
 
     /// Keeps what a read brought in; returns the streams whose starts wait on it.
-    pub(crate) fn read_in(&self, read: Vec<SegmentRead>) -> BTreeSet<StreamKey> {
-        self.shelf.read_in(read, self.cfg.max_read_segments)
+    pub(crate) fn read_in(&self, read: Vec<SegmentRead>, now: Instant) -> BTreeSet<StreamKey> {
+        self.shelf.read_in(read, self.cfg.max_read_segments, now)
+    }
+
+    /// When a segment read in may give up its place unread, for a read due then.
+    pub(crate) fn unread_ages(&self) -> Option<Instant> {
+        self.shelf.unread_ages(self.cfg.unread_expiry)
     }
 
     #[cfg(test)]

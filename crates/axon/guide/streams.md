@@ -505,7 +505,9 @@ the node's writer task reads the segment that holds it between two writes, the s
 replay goes to a child a push window at a time. `max_read_segments` (8; `StreamNode::start` refuses 0) bounds the
 segments read in that stay in memory, and each read: more starts at once take turns, in the order they asked. A read
 brings in only what the segments no start has read from yet leave room for, so the start that asked first keeps its
-segment until it reads it, and the segment read from longest ago goes first. Retention bounds it: a start older than
+segment until it reads it, or for `unread_expiry` (10 s; 0 refused) at most: a start that stops polling, or ends
+before it reads, holds no place for good, and polled later reads its segment in again. Past the limit such a segment
+goes first, then the one read from longest ago. Retention bounds it: a start older than
 the oldest segment is `HistoryUnavailable`. Relays keep only their rings and refuse such a start, so a child that may
 come back far behind needs the origin among its candidates (`upstream_for`). A follower on the restarted node itself,
 which relayed the key from another node until the open, replays from the files too what it missed before the open.

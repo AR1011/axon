@@ -1186,16 +1186,21 @@ impl<A: Authorizer> RelayCore<A> {
     }
 
     /// The segments starts behind a ring wait on: read them with `disk::read_asked`, without the core, and hand them
-    /// to [`disk_read_in`](Self::disk_read_in).
-    pub(crate) fn take_disk_reads(&self) -> Option<(Arc<dyn Files>, Vec<Asked>)> {
-        self.disk.as_ref()?.take_reads()
+    /// to [`disk_read_in`](Self::disk_read_in). Take them again at [`disk_unread_ages`](Self::disk_unread_ages).
+    pub(crate) fn take_disk_reads(&self, now: Instant) -> Option<(Arc<dyn Files>, Vec<Asked>)> {
+        self.disk.as_ref()?.take_reads(now)
     }
 
-    pub(crate) fn disk_read_in(&mut self, read: Vec<SegmentRead>) {
+    pub(crate) fn disk_read_in(&mut self, read: Vec<SegmentRead>, now: Instant) {
         let Some(disk) = &self.disk else { return };
-        for key in disk.read_in(read) {
+        for key in disk.read_in(read, now) {
             self.history_ready(&key);
         }
+    }
+
+    /// When a segment read in that no start has read from may give up its place to the starts waiting for one.
+    pub(crate) fn disk_unread_ages(&self) -> Option<Instant> {
+        self.disk.as_ref()?.unread_ages()
     }
 
     /// Whether a write or a segment read waits to be taken.

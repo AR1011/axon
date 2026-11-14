@@ -482,8 +482,75 @@ async fn start_refuses_a_disk_that_keeps_no_segment_read_in() {
     let zero = "DiskConfig::max_read_segments must be at least 1";
     assert!(matches!(refused, Some(ClusterError::Config(e)) if e == zero), "{refused:?}");
     cfg.disk.as_mut().expect("a disk").max_read_segments = 1;
+    // No time at all: a segment read in could go before its start reads it, every time.
+    cfg.disk.as_mut().expect("a disk").unread_expiry = Duration::ZERO;
+    let refused = StreamNode::start(&cluster, cfg.clone()).await.err();
+    let zero = "DiskConfig::unread_expiry must be above 0";
+    assert!(matches!(refused, Some(ClusterError::Config(e)) if e == zero), "{refused:?}");
+    // The least there is.
+    cfg.disk.as_mut().expect("a disk").unread_expiry = Duration::from_nanos(1);
     let node = StreamNode::start(&cluster, cfg).await.expect("one segment read in");
     drop((node, cluster));
+    system.shutdown().await.unwrap();
+}
+
+/// A start behind the ring that ends while its segment is read, as a subscriber dropped after its first poll, holds
+/// that segment's place on the shelf only for `unread_expiry`: the writer task wakes then, and the next replay from the
+/// disk goes on with every record once and in order. Before, it waited until the key closed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_start_gone_before_it_reads_its_segment_holds_the_shelf_only_until_it_expires() {
+    use crate::recovery::RingLimits;
+    let (system, cluster) = start_cluster("a", &MemoryDiscovery::new()).await;
+    let gated = Gated::new(Arc::new(MemoryFiles::new()));
+    let mut cfg = on_disk(gated.clone(), &["md"]);
+    cfg.core.rings = vec![RingLimits { namespace: "md".into(), max_records: 4, max_bytes: 1 << 20 }];
+    let disk = cfg.disk.as_mut().expect("a disk");
+    // One segment a stream, so retention never wakes the writer task, one read in at a time, and an expiry short
+    // enough to wait out here.
+    (disk.max_read_segments, disk.unread_expiry) = (1, Duration::from_millis(100));
+    let node = StreamNode::start(&cluster, cfg).await.unwrap();
+    let record = |n: u64| Bytes::copy_from_slice(&n.to_be_bytes());
+    let (gone, next) = (StreamKey::new("md", "k0"), StreamKey::new("md", "k1"));
+    for key in [&gone, &next] {
+        node.open_stream(key, 1, DeliveryPolicy::ReplayRequired).await.unwrap();
+        for n in 1..40 {
+            node.publish(key, vec![record(n)]).unwrap();
+        }
+        let at = node.publish(key, vec![record(40)]).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), node.wait_cursor(key, at)).await.expect("synced").unwrap();
+    }
+    let start = StartPosition::After(Cursor { generation: 1, sequence: 0 });
+    let options = SubscribeOptions { start, ..Default::default() };
+    gated.armed.store(true, SeqCst);
+    let mut first = node.subscribe(&gone, options).unwrap();
+    let _ = now(first.next());
+    tokio::time::timeout(Duration::from_secs(5), gated.entered.notified()).await.expect("its segment is read");
+    drop(first);
+    gated.release.notify_one();
+    let read_in = || node.0.core.lock().disk.as_ref().expect("a disk").read_segments() == 1;
+    let held = async {
+        while !read_in() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), held).await.expect("the segment is read in");
+
+    let mut after = node.subscribe(&next, options).unwrap();
+    let replay = async {
+        let mut seen = Vec::new();
+        while seen.len() < 40 {
+            match after.next().await {
+                Some(StreamEvent::Batch(b)) => seen.extend((b.first()..).zip(b.records().iter().cloned())),
+                Some(StreamEvent::Ready { .. } | StreamEvent::CaughtUp { .. }) => {}
+                other => panic!("{other:?} after {} records", seen.len()),
+            }
+        }
+        seen
+    };
+    let replayed = tokio::time::timeout(Duration::from_secs(5), replay).await;
+    let all: Vec<_> = (1..=40).map(|n| (n, record(n))).collect();
+    assert_eq!(replayed.expect("the next replay waited on a start that ended"), all);
+    drop((after, node, cluster));
     system.shutdown().await.unwrap();
 }
 
@@ -714,9 +781,9 @@ fn a_follower_behind_an_open_from_disk_replays_the_rest_from_the_disk() {
     write(&mut relay);
     let mut reads = 0;
     poll(&mut relay);
-    while let Some((files, asked)) = relay.take_disk_reads() {
+    while let Some((files, asked)) = relay.take_disk_reads(at) {
         let Poll::Ready(read) = now(disk::read_asked(files, asked)) else { panic!("files in memory waited") };
-        relay.disk_read_in(read);
+        relay.disk_read_in(read, at);
         poll(&mut relay);
         reads += 1;
     }
@@ -763,14 +830,16 @@ fn more_replays_from_the_disk_than_it_keeps_segments_for_take_turns() {
         // The round each follower got its first record in, and its last.
         let (mut first, mut last) = (vec![0; keys.len()], vec![0; keys.len()]);
         let (mut held, mut segments) = (0, 0);
+        // One instant: no segment sits unread long enough to give up its place.
+        let at = Instant::now().into_std();
         for round in 1..=1000 {
             for _ in 0..reads {
-                if let Some((files, asked)) = origin.take_disk_reads() {
+                if let Some((files, asked)) = origin.take_disk_reads(at) {
                     segments += asked.len();
                     let Poll::Ready(read) = now(disk::read_asked(files, asked)) else {
                         panic!("files in memory waited")
                     };
-                    origin.disk_read_in(read);
+                    origin.disk_read_in(read, at);
                     held = held.max(origin.disk.as_ref().expect("a disk").read_segments());
                 }
             }
@@ -804,6 +873,83 @@ fn more_replays_from_the_disk_than_it_keeps_segments_for_take_turns() {
              last in {last:?}"
         );
     }
+}
+
+/// A start behind the ring whose segment is read in and which does not read from it, as a follower that stopped
+/// polling, holds its place on the shelf for `unread_expiry`, and the writer task is told when that ends: then the
+/// next replay from the disk goes on. Polled once its segment went, the slow start reads it in again and gets every
+/// record once and in order. Before, the next replay waited until the key closed.
+#[test]
+fn a_start_that_stops_polling_holds_its_segment_until_it_expires() {
+    use crate::recovery::RingLimits;
+    let record = |n: u64| Bytes::copy_from_slice(&n.to_be_bytes());
+    let retention = Retention { namespace: "md".into(), max_bytes: u64::MAX, max_age: Duration::from_secs(3600) };
+    let mut cfg = DiskConfig::new(Arc::new(MemoryFiles::new()), vec![retention]);
+    // A few records a segment, and one read in at a time.
+    (cfg.segment_bytes, cfg.max_read_segments) = (64, 1);
+    let expiry = cfg.unread_expiry;
+    let Poll::Ready(disk) = now(DiskStore::open(cfg)) else { panic!("files in memory waited") };
+    let rings = vec![RingLimits { namespace: "md".into(), max_records: 4, max_bytes: 1 << 20 }];
+    let cfg = CoreConfig { rings, ..CoreConfig::default() };
+    let mut origin = RelayCore::new(&PeerId::new("o", 1), crate::AllowAll, cfg).unwrap();
+    origin.disk = Some(disk.unwrap());
+    let keys = [StreamKey::new("md", "k0"), StreamKey::new("md", "k1")];
+    for key in &keys {
+        origin.open_stream(key, 1, DeliveryPolicy::ReplayRequired).unwrap();
+        for n in 1..=40 {
+            origin.publish(key, vec![record(n)]).unwrap();
+        }
+    }
+    let (written, ops) = origin.take_disk_writes(0).unwrap();
+    assert!(matches!(now(written.apply(ops)), Poll::Ready(Ok(()))));
+    origin.disk_written(Ok(()));
+    let start = StartPosition::After(Cursor { generation: 1, sequence: 0 });
+    let ids =
+        keys.each_ref().map(|key| origin.subscribe(key, SubscribeOptions { start, ..Default::default() }).unwrap());
+    let mut seen = [Vec::new(), Vec::new()];
+    let mut poll = |origin: &mut RelayCore, i: usize| {
+        while let Some(event) = origin.poll(ids[i]) {
+            match event {
+                StreamEvent::Batch(b) => seen[i].extend((b.first()..).zip(b.records().iter().cloned())),
+                StreamEvent::Ready { .. } | StreamEvent::CaughtUp { .. } => {}
+                other => panic!("{other:?} after {} records of {}", seen[i].len(), keys[i]),
+            }
+        }
+        seen[i].clone()
+    };
+    let read = |origin: &mut RelayCore, at| {
+        let Some((files, asked)) = origin.take_disk_reads(at) else { return false };
+        let Poll::Ready(read) = now(disk::read_asked(files, asked)) else { panic!("files in memory waited") };
+        origin.disk_read_in(read, at);
+        true
+    };
+    // The slow start's segment is read in, and it polls no more; the next start asks for its own.
+    let read_at = Instant::now().into_std();
+    poll(&mut origin, 0);
+    assert!(read(&mut origin, read_at));
+    poll(&mut origin, 1);
+    assert!(!read(&mut origin, read_at + expiry - Duration::from_nanos(1)), "a read before the expiry");
+    assert_eq!(origin.disk_unread_ages(), Some(read_at + expiry));
+    let at = read_at + expiry;
+    let mut next = Vec::new();
+    for _ in 0..1000 {
+        read(&mut origin, at);
+        next = poll(&mut origin, 1);
+        if next.len() >= 40 {
+            break;
+        }
+    }
+    let all: Vec<_> = (1..=40).map(|n| (n, record(n))).collect();
+    assert_eq!(next, all, "the next replay");
+    let mut slow = Vec::new();
+    for _ in 0..1000 {
+        slow = poll(&mut origin, 0);
+        read(&mut origin, at);
+        if slow.len() >= 40 {
+            break;
+        }
+    }
+    assert_eq!(slow, all, "the slow start");
 }
 
 /// History that must not be asked.
