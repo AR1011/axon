@@ -385,25 +385,6 @@ fn an_app_span_outside_a_trace_is_none_and_records_nothing() {
 }
 
 #[test]
-fn reading_the_whole_ring_holds_its_lock_for_one_page_at_most() {
-    const SPANS: usize = 65_536;
-    let tracer = Tracer::new(SPANS, 0);
-    let (one, other) = (TraceContext::root(), TraceContext::root());
-    for i in 0..SPANS + 10 {
-        let parent = if i % 1000 == 0 { one } else { other };
-        tracer.record(Span::begin(parent, i as u64 + 1, SpanKind::Handle, "work"));
-    }
-    assert_eq!(tracer.evicted(), 10);
-    // What `Request::Traces` asks for.
-    let all = tracer.since(0, usize::MAX);
-    assert_eq!((all.len(), all[0].seq, all[SPANS - 1].seq), (SPANS, 11, SPANS as u64 + 10));
-    assert!(all.windows(2).all(|w| w[1].seq == w[0].seq + 1), "no span is skipped or repeated between pages");
-    assert_eq!(tracer.trace(one.trace).len(), 65, "every thousandth, but the first, which the ring let go");
-    assert_eq!(tracer.since(SPANS as u64, 1000).len(), 10);
-    assert_eq!(tracer.most_held(), Tracer::PAGE);
-}
-
-#[test]
 fn a_ring_of_any_capacity_keeps_exactly_its_newest_spans_from_any_position() {
     let seqs = |spans: Vec<Span>| spans.iter().map(|s| s.seq).collect::<Vec<_>>();
     for capacity in [1, 5, 31, 32, 33, 100, 300] {

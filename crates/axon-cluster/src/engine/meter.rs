@@ -178,8 +178,9 @@ impl Meters {
             let [tx, rx] = totals.wire;
             rows.extend([row(true, None, [0, 0, tx]), row(false, None, [0, 0, rx])]);
             for (protocol, [sent, sent_bytes, received, received_bytes]) in totals.protocols {
-                rows.push(row(true, Some(label(protocol)), [sent, sent_bytes, 0]));
-                rows.push(row(false, Some(label(protocol)), [received, received_bytes, 0]));
+                let label = label(protocol);
+                rows.push(row(true, Some(label.clone()), [sent, sent_bytes, 0]));
+                rows.push(row(false, Some(label), [received, received_bytes, 0]));
             }
         }
         rows

@@ -12,6 +12,7 @@ use std::num::NonZeroU128;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
+#[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -391,6 +392,7 @@ pub struct Tracer {
     sample_every: u32,
     ring: Mutex<Ring>,
     /// The most spans a reader looked at in one hold of the ring's lock.
+    #[cfg(test)]
     most_held: AtomicUsize,
     /// What an [`AppSpan`]'s `busy` is read on.
     clock: Clock,
@@ -411,7 +413,14 @@ impl Tracer {
         // Room for every segment the ring holds at its fullest, taken now: a recorder never waits on the list growing.
         let sealed = VecDeque::with_capacity(if capacity == 0 { 0 } else { capacity.div_ceil(SEGMENT) + 2 });
         let ring = Mutex::new(Ring { next: 0, sealed, open: Arc::new(Vec::with_capacity(SEGMENT)) });
-        Arc::new(Self { capacity, sample_every, ring, most_held: AtomicUsize::new(0), clock })
+        Arc::new(Self {
+            capacity,
+            sample_every,
+            ring,
+            #[cfg(test)]
+            most_held: AtomicUsize::new(0),
+            clock,
+        })
     }
 
     pub(crate) fn sample(&self, ordinal: u64) -> Option<TraceContext> {
@@ -482,18 +491,12 @@ impl Tracer {
         self.read(0, usize::MAX, Some(trace))
     }
 
-    /// Test only: the most spans a reader looked at in one hold of the ring's lock.
-    #[doc(hidden)]
-    pub fn most_held(&self) -> usize {
-        self.most_held.load(Ordering::Relaxed)
-    }
-
     /// Copies the spans after `after`, of `trace` alone if given, up to `limit`, taking a page of them per hold of
     /// the lock. It stops at the newest span of its first hold, so writers faster than it cannot keep it reading.
     /// A span the ring lets go between two holds is skipped, as it would be had the reader come later.
     fn read(&self, mut after: u64, limit: usize, trace: Option<TraceId>) -> Vec<Span> {
         let keep = |span: &&Span| trace.is_none_or(|trace| span.trace == trace);
-        let (mut out, mut newest, mut most) = (Vec::new(), None, 0);
+        let (mut out, mut newest) = (Vec::new(), None);
         // Allocated outside the lock, and big enough for any page.
         let mut segments = Vec::with_capacity(Self::PAGE / SEGMENT + 1);
         while out.len() < limit {
@@ -516,12 +519,12 @@ impl Tracer {
                 out.extend(segment[range].iter().filter(keep).cloned());
             }
             after = first + held as u64 - 1;
-            most = most.max(held);
+            #[cfg(test)]
+            self.most_held.fetch_max(held, Ordering::Relaxed);
             if held < page {
                 break;
             }
         }
-        self.most_held.fetch_max(most, Ordering::Relaxed);
         out
     }
 }
@@ -608,4 +611,24 @@ fn the_ring_takes_its_full_size_at_the_start_and_never_grows_under_its_lock() {
         tracer.record(Span::begin(TraceContext::fresh(), id, SpanKind::Handle, "work"));
         assert_eq!(tracer.ring.lock().sealed.capacity(), room, "grew at span {id}");
     }
+}
+
+#[cfg(test)]
+#[test]
+fn reading_the_whole_ring_holds_its_lock_for_one_page_at_most() {
+    const SPANS: usize = 65_536;
+    let tracer = Tracer::new(SPANS, 0);
+    let (one, other) = (TraceContext::root(), TraceContext::root());
+    for i in 0..SPANS + 10 {
+        let parent = if i % 1000 == 0 { one } else { other };
+        tracer.record(Span::begin(parent, i as u64 + 1, SpanKind::Handle, "work"));
+    }
+    assert_eq!(tracer.evicted(), 10);
+    // What `Request::Traces` asks for.
+    let all = tracer.since(0, usize::MAX);
+    assert_eq!((all.len(), all[0].seq, all[SPANS - 1].seq), (SPANS, 11, SPANS as u64 + 10));
+    assert!(all.windows(2).all(|w| w[1].seq == w[0].seq + 1), "no span is skipped or repeated between pages");
+    assert_eq!(tracer.trace(one.trace).len(), 65, "every thousandth, but the first, which the ring let go");
+    assert_eq!(tracer.since(SPANS as u64, 1000).len(), 10);
+    assert_eq!(tracer.most_held.load(Ordering::Relaxed), Tracer::PAGE);
 }

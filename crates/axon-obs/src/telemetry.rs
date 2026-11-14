@@ -1002,17 +1002,13 @@ impl Out {
         sessions.take(connections).for_each(|p| self.connection(p));
         // Every link, past the busiest: what crossed between two regions, never reset.
         for link in &c.links {
-            let (src, dst) = (link.src_region.as_str(), link.dst_region.as_str());
-            let mut labels = vec![
-                ("src_region", src),
-                ("dst_region", dst),
-                ("lane", link.lane.name()),
-                ("direction", link.direction),
-            ];
+            let src = ("src_region", link.src_region.as_str());
+            let dst = ("dst_region", link.dst_region.as_str());
+            let (lane, direction) = (("lane", link.lane.name()), ("direction", link.direction));
             match &link.protocol {
-                None => self.counter("link.wire_bytes", "bytes", &labels, link.wire_bytes),
+                None => self.counter("link.wire_bytes", "bytes", &[src, dst, lane, direction], link.wire_bytes),
                 Some(protocol) => {
-                    labels.push(("protocol", protocol));
+                    let labels = [src, dst, lane, direction, ("protocol", protocol.as_str())];
                     self.counter("link.frames", "frames", &labels, link.frames);
                     self.counter("link.frame_bytes", "bytes", &labels, link.frame_bytes);
                 }

@@ -526,8 +526,6 @@ fn every_call_and_a_live_follower_recover_from_each_fault_across_regions() {
     check_seeds(seeds(0..32), faults).unwrap();
 }
 
-/// sin cut from the rest for 5 s, every SYN on its links and every answer to one lost once, and after the heal its
-/// connections to eu-b and us-b reset: how many times a node counted a peer unreachable.
 fn traced_publish(seed: u64) {
     let (mut w, seen) = start(seed, Timings::Wan);
     seen.stop.set(true);
@@ -574,6 +572,8 @@ fn a_traced_publish_keeps_its_128_bit_trace_on_every_hop_across_regions() {
     check_seeds(seeds(0..4), traced_publish).unwrap();
 }
 
+/// sin cut from the rest for 5 s, every SYN on its links and every answer to one lost once, and after the heal its
+/// connections to eu-b and us-b reset: how many times a node counted a peer unreachable.
 fn lost_syns(seed: u64, timings: Timings) -> u64 {
     let (mut w, seen) = start(seed, timings);
     let unreachable = |w: &World<Node>| counters(w).values().map(|c| c.unreachable).sum::<u64>();

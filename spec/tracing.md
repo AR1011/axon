@@ -108,8 +108,8 @@ span the ring has, while every traced handler on the node waits to record.
 
 **Tests.**
 
-- `crates/axon/tests/trace.rs::reading_the_whole_ring_holds_its_lock_for_one_page_at_most`: a `#[doc(hidden)]` count of
-  the most spans copied in one hold is 256 after `Request::Traces` on a 65 536-span ring (65 536 today).
+- `crates/axon/src/trace.rs::reading_the_whole_ring_holds_its_lock_for_one_page_at_most`: a test-only count of the
+  most spans copied in one hold is 256 after `Request::Traces` on a 65 536-span ring (65 536 today).
 - A bench row `perf trace_drain` in `crates/axon/guide/benchmarks.md`: the hold for one page, recording on 8 threads.
 
 ## 4. Error kinds

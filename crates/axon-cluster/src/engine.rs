@@ -567,22 +567,29 @@ impl Link {
 
     /// The end of a body: one byte, `ADMITTED` or `NO_REPLY`.
     fn body_end(&self, frame: Frame) {
-        let body = self.bodies.lock().get(&frame.id).cloned();
-        self.received(body.as_ref().map(|b| &*b.1), &frame);
+        let flow = {
+            let bodies = self.bodies.lock();
+            let body = bodies.get(&frame.id);
+            self.received(body.map(|b| &*b.1), &frame);
+            body.map(|(flow, _)| flow.clone())
+        };
         let code = match frame.payload[..] {
             [code @ (ADMITTED | NO_REPLY)] => code,
             _ => return self.sender.close(),
         };
-        if let Some((flow, _)) = body {
+        if let Some(flow) = flow {
             flow.end(ended(code));
         }
     }
 
     fn credit(&self, frame: Frame) {
         let flows = if frame.kind & BODY != 0 { &self.uploading } else { &self.producing };
-        let flow = flows.lock().get(&frame.id).cloned();
-        self.received(flow.as_ref().map(|f| &*f.1), &frame);
-        let flow = flow.map(|(flow, _)| flow);
+        let flow = {
+            let flows = flows.lock();
+            let entry = flows.get(&frame.id);
+            self.received(entry.map(|e| &*e.1), &frame);
+            entry.map(|(flow, _)| flow.clone())
+        };
         let Ok(credit) = <[u8; 4]>::try_from(&frame.payload[..]).map(u32::from_be_bytes) else {
             return self.sender.close();
         };
