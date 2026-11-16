@@ -19,6 +19,7 @@ fn full(notify: Option<Waker>) -> ActorRef<u32> {
 /// The owner's turn: takes one message and gives its capacity back.
 fn consume(address: &ActorRef<u32>) -> Option<u32> {
     let mut batch = VecDeque::new();
+    // `pull` hands over everything queued and this keeps the first only: safe as `full()` has one slot, so one at most.
     address.0.pull(1, &mut batch);
     let entry = batch.pop_front()?;
     address.0.finish_batch(1, entry.bytes, &batch);
@@ -315,5 +316,44 @@ fn a_message_queued_while_the_owner_holds_some_is_handed_out_after_them() {
         }
         assert_eq!(seen, [0, 1, 2, 3]);
         assert_eq!(address.diagnostics().mailbox_depth, 0);
+    });
+}
+
+/// A sender waits on a full mailbox of three while the owner holds the tail of a deeper queue. The owner's next turn
+/// of two hands out the held message and one queued behind it, and gives their room back while it holds the rest: the
+/// waiter is admitted by that release, and every message is handed out once, in order.
+#[test]
+fn a_sender_waiting_while_the_owner_holds_a_tail_gets_room_from_its_turn() {
+    check(|| {
+        let limits = MailboxLimits { messages: 3, ..Default::default() };
+        let incarnation = ActorIncarnation { runtime: 0, slot: 0, generation: 0 };
+        let mailbox = Mailbox::new(limits.into(), Clock::manual().clock(), incarnation, None);
+        mailbox.open();
+        let address = ActorRef(mailbox);
+        let mb = &address.0;
+        let (mut held, mut seen) = (VecDeque::new(), Vec::new());
+        // A turn of two, as the driver runs it; says how many the owner still holds.
+        let mut turn = |seen: &mut Vec<u32>| {
+            mb.pull(2, &mut held);
+            let taken: Vec<_> = held.drain(..2.min(held.len())).collect();
+            seen.extend(taken.iter().map(|e| e.msg));
+            mb.finish_batch(taken.len(), taken.iter().map(|e| e.bytes).sum(), &held);
+            held.len()
+        };
+        (0..3).for_each(|v| {
+            address.try_tell(v).expect("room");
+        });
+        assert_eq!(turn(&mut seen), 1, "the owner holds 2");
+        (3..5).for_each(|v| {
+            address.try_tell(v).expect("room the turn gave back");
+        });
+        assert!(address.try_tell(9).is_err(), "full, with 2 held and 3 and 4 queued");
+        let sender = address.clone();
+        let sent = thread::spawn(move || block_on(sender.send(5, None)).is_ok());
+        assert_eq!(turn(&mut seen), 1, "the owner holds 4");
+        assert!(sent.join().unwrap(), "the waiter got no room from a turn that handled a held message");
+        assert_eq!(turn(&mut seen), 0);
+        assert_eq!(seen, [0, 1, 2, 3, 4, 5]);
+        assert_eq!((address.diagnostics().mailbox_depth, address.diagnostics().waiters), (0, 0));
     });
 }
