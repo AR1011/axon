@@ -759,8 +759,9 @@ impl Pool {
         state.store(ASLEEP, Ordering::Relaxed);
         self.sleepers.asleep.fetch_add(1, Ordering::Relaxed);
         let mut ready = loop {
-            // A sender from outside wakes only the home worker, which may be stuck in one long turn with actors
-            // queued behind it. So while any worker is busy, one sleeper looks again now and then.
+            // A sender from outside wakes only the worker whose queue took the push, the home one or the next whose
+            // lock was free, which may be stuck in one long turn with actors queued behind it. So while any worker is
+            // busy, one sleeper looks again now and then.
             fence(Ordering::SeqCst);
             let busy = self.balance && self.queues.iter().any(|q| q.owner.state.load(Ordering::Relaxed) == BUSY);
             let found = self.steal(me, thief);
