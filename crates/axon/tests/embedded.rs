@@ -1590,6 +1590,82 @@ fn supervision_stop_interrupts_backoff_and_graceful_exits_do_not_restart() {
     assert!(!report.escalated && report.terminal.unwrap().reason == StopReason::Stopped);
 }
 
+/// What a turn leaves of a deep mailbox is handed out first by the next, before what came in since, and counts as
+/// queued, with its age, until then.
+#[test]
+fn turns_of_a_deep_mailbox_hand_out_the_oldest_first_and_what_they_leave_stays_queued() {
+    let mut r = rig_with(Recorder::default(), MailboxConfig::from(limits(1024)).with_timing(1), true);
+    let tell = |r: &Rig, range: std::ops::Range<u32>| {
+        range.for_each(|v| {
+            r.actor.try_tell(Msg::Push(v)).map_err(drop).expect("room");
+        });
+    };
+    let turn = |r: &mut Rig| r.driver.run_turn(TurnBudget::messages(256)).ordinary;
+    let queued = |r: &Rig| {
+        let d = r.actor.diagnostics();
+        (d.mailbox_depth, d.oldest_message_age)
+    };
+    let ms = Duration::from_millis;
+    tell(&r, 0..300);
+    r.clock.advance(ms(1));
+    assert_eq!((turn(&mut r), queued(&r)), (256, (44, Some(ms(1)))));
+    tell(&r, 300..310);
+    r.clock.advance(ms(1));
+    assert_eq!(queued(&r), (54, Some(ms(2))));
+    assert_eq!((turn(&mut r), queued(&r)), (54, (0, None)), "the 44 left, then the 10 behind them");
+
+    tell(&r, 310..567);
+    assert_eq!((turn(&mut r), queued(&r)), (256, (1, Some(ms(0)))));
+    tell(&r, 567..667);
+    r.clock.advance(ms(1));
+    assert_eq!((turn(&mut r), queued(&r)), (101, (0, None)), "the one left, then the 100 behind it");
+    assert_eq!(*r.log.lock().unwrap(), (0..667).collect::<Vec<_>>());
+}
+
+/// An actor that ends while it holds what a turn left of a deep mailbox discards that with what senders queued behind
+/// it, oldest first, and gives its room back; a drain handles all of it.
+#[test]
+fn an_actor_that_ends_holding_part_of_a_deep_mailbox_discards_it_oldest_first_and_frees_its_room() {
+    for end in ["stop", "stop in a turn", "drain", "drop"] {
+        let Rig { mut driver, log, actor, life, .. } = rig(1024);
+        let (older, newer) = (TraceContext::root(), TraceContext::root());
+        let tell = |msg| {
+            actor.try_tell(msg).map_err(drop).expect("room");
+        };
+        for v in 0..600u32 {
+            match v {
+                260 if end == "stop in a turn" => tell(Msg::Stop),
+                300 => older.enter(|| tell(Msg::Push(v))),
+                _ => tell(Msg::Push(v)),
+            }
+        }
+        assert_eq!(driver.run_turn(TurnBudget::messages(256)).ordinary, 256, "{end}");
+        newer.enter(|| tell(Msg::Push(600)));
+        (601..610).for_each(|v| tell(Msg::Push(v)));
+        match end {
+            "stop" => life.stop(),
+            "drain" => life.drain(None),
+            _ => {}
+        }
+        if end == "drop" {
+            drop(driver);
+        } else {
+            let turns = (0..8).take_while(|_| !driver.run_turn(TurnBudget::messages(256)).stopped).count();
+            assert!(turns < 8, "{end}: ended");
+        }
+        let exit = life.exit().unwrap();
+        let d = actor.diagnostics();
+        let first = exit.discarded.first().and_then(|g| g.trace).map(|t| t.trace);
+        let seen = (exit.discarded_messages(), first, log.lock().unwrap().len(), d.mailbox_depth, d.mailbox_bytes);
+        let expected = match end {
+            "stop in a turn" => (349, Some(older.trace), 260, 0, 0),
+            "drain" => (0, None, 610, 0, 0),
+            _ => (354, Some(older.trace), 256, 0, 0),
+        };
+        assert_eq!(seen, expected, "{end}");
+    }
+}
+
 #[test]
 fn timing_is_off_by_default_and_sampled_when_enabled() {
     let mut r = rig(8);

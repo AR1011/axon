@@ -66,7 +66,9 @@ fn failure(outcome: &Result<(), StopReason>) -> Option<&'static str> {
 
 /// Owned-message iterator over one turn's share of the mailbox.
 pub struct MailboxBatch<'a, M: Send + 'static> {
+    /// What the actor holds, of which the turn hands out the first `limit`.
     entries: &'a mut VecDeque<Entry<M>>,
+    limit: usize,
     mailbox: &'a Mailbox<M>,
     until: Option<Duration>,
     label: fn(&M) -> &'static str,
@@ -80,7 +82,7 @@ pub struct MailboxBatch<'a, M: Send + 'static> {
 
 impl<M: Send + 'static> MailboxBatch<'_, M> {
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.slots >= self.limit || self.entries.is_empty()
     }
 
     /// Ends the message handed out last: its timing sample and its span.
@@ -96,7 +98,7 @@ impl<M: Send + 'static> MailboxBatch<'_, M> {
 
     #[cold]
     fn close_sample(&mut self) {
-        if let (Some((label, at)), Some(t)) = (self.open.take(), &self.mailbox.timings) {
+        if let (Some((label, at)), Some(t)) = (self.open.take(), self.mailbox.timings()) {
             t.lock().record_message(label, self.mailbox.clock.now().saturating_sub(at));
         }
     }
@@ -115,7 +117,7 @@ impl<M: Send + 'static> MailboxBatch<'_, M> {
 
     #[cold]
     fn sample(&mut self, at: Duration, msg: &M) {
-        let Some(t) = &self.mailbox.timings else { return };
+        let Some(t) = self.mailbox.timings() else { return };
         let now = self.mailbox.clock.now();
         t.lock().mailbox_wait.record(now.saturating_sub(at));
         let label = (self.label)(msg);
@@ -133,6 +135,9 @@ impl<M: Send + 'static> Iterator for MailboxBatch<'_, M> {
             || self.mailbox.unstashed.load(Ordering::Relaxed)
             || self.mailbox.fenced()
         {
+            return None;
+        }
+        if self.slots >= self.limit {
             return None;
         }
         if self.slots > 0 && self.until.is_some_and(|u| self.mailbox.clock.now() >= u) {
@@ -163,6 +168,7 @@ struct Ending {
 pub(crate) struct Driver<A: Actor> {
     actor: Option<A>,
     core: Core<A::Message>,
+    /// The messages taken from the mailbox and not yet handled, oldest first.
     batch: VecDeque<Entry<A::Message>>,
     wake: Option<WakeId>,
     // Boxed: only an actor that is ending needs it.
@@ -226,7 +232,7 @@ impl<A: Actor> Driver<A> {
         let started = sampled(mb.sample_every, self.handler_observed).then(|| mb.clock.now());
         let result = self.invoke(f);
         let mb = &self.core.mailbox;
-        if let (Some(at), Some(t)) = (started, &mb.timings) {
+        if let (Some(at), Some(t)) = (started, mb.timings()) {
             t.lock().handler.record(mb.clock.now().saturating_sub(at));
         }
         result
@@ -296,7 +302,7 @@ impl<A: Actor> Driver<A> {
         }
         self.poll_ending();
 
-        if let (true, Some(at), Some(t)) = (timed, began, &mb.timings) {
+        if let (true, Some(at), Some(t)) = (timed, began, mb.timings()) {
             t.lock().turn.record(mb.clock.now().saturating_sub(at));
         }
         report.stopped = self.stopped;
@@ -393,7 +399,7 @@ impl<A: Actor> Driver<A> {
             let Some(entry) = self.core.timers.first_entry().filter(|e| e.key().0 <= now) else { break };
             let ((at, seq), kind) = entry.remove_entry();
             stop_check(mb)?;
-            if let Some(t) = mb.timings.as_ref().filter(|_| sampled(mb.sample_every, report.timers as u64 + 1)) {
+            if let Some(t) = mb.timings().filter(|_| sampled(mb.sample_every, report.timers as u64 + 1)) {
                 t.lock().timer_lag.record(now.saturating_sub(at));
             }
             let (msg, trace) = match kind {
@@ -436,12 +442,14 @@ impl<A: Actor> Driver<A> {
         let draining = mb.drain_requested.load(Ordering::SeqCst);
         let replaying = self.core.released() || spent(report.ordinary);
         let mut batch = std::mem::take(&mut self.batch);
-        let remaining = match mb.paused.load(Ordering::Relaxed) || replaying {
+        let limit = match mb.paused.load(Ordering::Relaxed) || replaying {
             true => 0,
-            false => mb.pull(max - report.ordinary, &mut batch),
+            false => max - report.ordinary,
         };
+        let remaining = if limit == 0 { 0 } else { mb.pull(limit, &mut batch) };
         let mut view = MailboxBatch {
             entries: &mut batch,
+            limit,
             mailbox: mb,
             until,
             label: A::label,
@@ -479,7 +487,7 @@ impl<A: Actor> Driver<A> {
             return stop_check(mb);
         }
         report.runnable = !paused && (remaining > 0 || !batch.is_empty() || replaying);
-        mb.finish_batch(slots, bytes, &mut batch);
+        mb.finish_batch(slots, bytes, &batch);
         self.batch = batch;
 
         if report.ordinary + report.completions + report.timers > 0 {
@@ -547,7 +555,7 @@ impl<A: Actor> Driver<A> {
         mb.close(Phase::Stopping);
         let queued = mb.discard();
         let batch = std::mem::take(&mut self.batch);
-        let held = queued.iter().chain(&batch).fold((0, 0), |(slots, bytes), e| (slots + 1, bytes + e.bytes));
+        let held = batch.iter().chain(&queued).fold((0, 0), |(slots, bytes), e| (slots + 1, bytes + e.bytes));
         mb.release(held.0, held.1);
         let (done, pending_jobs, watches, fired) = {
             match mb.jobs.lock().as_deref_mut() {
@@ -567,7 +575,8 @@ impl<A: Actor> Driver<A> {
         let maps = watches.iter().map(|(_, w)| w).chain(fired.iter().map(|(w, _)| w));
         let maps: Vec<_> = maps.filter_map(|w| w.map.lock().take()).collect();
         let stash = self.core.stash.take().map(|s| s.held).unwrap_or_default();
-        let lost = queued.iter().chain(&batch).map(|e| (&e.msg, e.trace));
+        // Oldest first: what the actor held came before what senders queued since.
+        let lost = batch.iter().chain(&queued).map(|e| (&e.msg, e.trace));
         let lost = lost.chain(done.iter().map(|(_, m, t)| (m, *t))).chain(stash.iter().map(|(m, t, _)| (m, *t)));
         let mut discarded: Vec<Discarded> = Vec::new();
         for (msg, trace) in lost {

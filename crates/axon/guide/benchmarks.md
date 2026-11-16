@@ -22,7 +22,7 @@ Trace context (added later) costs the untraced hosted path about 1–2 ns per me
 read at admission, 16 more bytes per mailbox entry; best of 8 interleaved runs: hosted 21.5 → 22.6 ns, contended
 23.1 → 25.1 ns, which is inside the run-to-run noise above); embedded is unchanged.
 
-Where the gain comes from: the consumer takes a whole turn's batch under one lock and releases
+Where the gain comes from: the consumer takes everything queued in one swap under one lock and releases
 capacity with atomics (lock only when a waiter exists), timers/jobs/counters are off the
 producer lock, workers swap the whole ready queue out per wake, and no `Arc` clone or clock
 read happens per message.
@@ -1675,6 +1675,67 @@ for a clone of the 16-byte message and a match per subscriber and one read lock 
 these runs. What it does not establish: publishers on
 several threads at once, which share the topic's read lock; misses, each of which takes the dead letters' lock; large
 messages, whose clone is the user's; nothing was pinned.
+
+### A turn and its senders
+
+A turn of a mailbox deeper than its budget used to copy the turn's messages out under the lock every sender takes, and
+a turn cut short put what it left back in front under it. A worker descheduled inside that copy holds every sender to
+that actor for the rest of its time slice. A sender that fans out stalls on one slow, nearly full actor whose mailbox
+still has room. Now a turn takes everything senders queued in one swap with the buffer it emptied. The owner keeps what
+is past its turn, and later turns hand that out before what came in since. Whatever the depth, the lock is held for a
+swap and a few stores. `mailbox_depth`, the length a least-loaded router reads and `oldest_message_age` count what the
+owner holds.
+
+`examples/stall.rs` sends with `try_tell` from one thread to each of `actors` actors in turn. Actor 0 spins `slow_us`
+per message, so its 4096-slot mailbox stays nearly full, and `load` threads spin on the workers' cores, so a worker is
+descheduled anywhere in a turn. The sender runs alone on its core with its SMT sibling idle, so its voluntary context
+switches are sleeps on a lock. Ryzen 9 9900X build box, which other users' work shared (the sender's involuntary
+switches ran from 200 to 5 000 per 10 s run). Five interleaved 10 s rounds of before (b64f862), this change ("swap"),
+and two others built to compare. "Split" takes the whole queue out, splits the turn off without the lock, and puts the
+rest back under it, moving the shorter side. "Chunk" copies the turn out in chunks and releases the lock between them.
+Medians per run, with `slow_us=1 load=132 words=128 actors=8 rate=200000`: 1 KiB messages, so a turn's copy is 256 KiB.
+
+| Per 10 s run | before | swap | split | chunk |
+|---|---|---|---|---|
+| sender's sleeps on a lock (range) | 35 542 (35 023–36 215) | 12 (9–25) | 188 (121–199) | 5 278 (3 890–7 542) |
+| sends to the slow actor over 100 µs that slept | 45 | 0 | 10 | 1 |
+| worst send to the slow actor: median second, run | 18.0 ms, 18.0 ms | 3.8 µs, 133 µs | 325 µs, 3.0 ms | 27 µs, 226 µs |
+| messages the slow actor handled | 1.13 M | 1.19 M | 0.94 M | 0.04 M |
+| sends to the others that slept, worst | 64, 18.0 ms | 12, 18.0 ms | 105, 18.8 ms | 4, 3.0 ms |
+| p99 of a send, slow actor and others | 0.3, 0.3 µs | 0.3, 0.3 µs | 0.3, 0.5 µs | 0.3, 0.1 µs |
+
+Chunk is out: its slow actor handled a twenty-fifth of what it did before and refused nearly every send. Split still
+copies under the lock when it puts the rest back. With no load, before and swap both slept 2 times a run and the slow
+actor's worst send was 38 and 46 µs. With every actor fast (`slow_us=0`) and the load on, before still slept 39 132
+times a run against 18: under load a fast actor's mailbox gets deep too. With 64 actors and 16-byte messages
+(`slow_us=10 load=88`), no build's sends to the slow actor slept, since 256 small entries copy quickly. There, split's
+sends to the others slept 14 times a run against 58 before and 62 for swap. Split's senders find the queue empty in
+the middle of a pull and notify, and that moves the slow actor to another worker. A swap build that notifies the same
+way matched split, 41 against 131, and its slow actor handled 266 k messages against 202 k. That is a scheduling effect,
+not the lock, and it changes when an actor is woken, so this change does not take it.
+
+The `perf` rows of before, swap and split, interleaved, `taskset -c 0-11`, load average 2–4, median (range), ns/msg:
+
+| Row | before | swap | split |
+|---|---|---|---|
+| embedded, 10 rounds | 16.1 (15.9–16.1) | 16.6 (16.5–16.7) | 16.0 (16.0–16.2) |
+| hosted, 10 rounds | 22.9 (22.1–24.3) | 22.9 (21.0–25.0) | 22.1 (21.2–24.0) |
+| contended, 10 rounds | 89.6 (86.7–105.8) | 91.6 (85.3–94.2) | 93.2 (88.7–103.0) |
+| fanout, 8 rounds | 76.5 (73.0–79.7) | 77.6 (76.2–85.2) | 78.6 (74.6–84.7) |
+| topic publish, 8 rounds | 73.8 (73.4–82.3) | 74.9 (73.7–77.8) | 75.1 (73.4–81.7) |
+
+Embedded's half a nanosecond is the sender reading the depth to say whether the mailbox was empty, which now counts
+what the owner holds. A build with the old read measured 16.0. Keeping the owner's count in an atomic of its own,
+8 bytes more, measured 16.8.
+
+What this establishes: on this box, under load, a sender no longer sleeps on a deep mailbox's lock while its owner is
+descheduled, and the throughput rows moved less than their spread, except embedded at +3 %. What it does not
+establish: the sender's worst send and its p99. The sender is one thread, so its worst send is set by the next lock it
+meets. Sends to the other actors still sleep up to 18 ms, 10 to 150 times a run, in every build. An instrumented copy,
+not committed, put those waits about evenly on two locks. One is an actor's own lock, held by a worker descheduled
+in the few stores of a swap or of the end of a turn. The other is the run queue's lock, which a sender takes
+when it wakes an idle actor. It also does not establish anything on the EPYC, whose baseline the gate keeps, or
+another shape of load.
 
 ## Durable pipeline (`axon`)
 

@@ -21,7 +21,7 @@ fn consume(address: &ActorRef<u32>) -> Option<u32> {
     let mut batch = VecDeque::new();
     address.0.pull(1, &mut batch);
     let entry = batch.pop_front()?;
-    address.0.finish_batch(1, entry.bytes, &mut batch);
+    address.0.finish_batch(1, entry.bytes, &batch);
     Some(entry.msg)
 }
 
@@ -275,5 +275,45 @@ fn a_pausing_job_settling_as_a_turn_starts_with_results_held_is_seen_or_gets_a_t
             "a pausing job settled as a turn started: not taken by it, and no turn will take it"
         );
         assert_eq!(mb.jobs.lock().as_ref().map(|jobs| jobs.done.len()), Some(1 + usize::from(taken.is_none())));
+    });
+}
+
+/// A turn of two takes all three queued messages and holds the third, while a sender queues a fourth. The fourth is
+/// handed out after the third, by a turn the owner runs anyway or one the send woke: a send that finds the senders'
+/// queue empty while the owner holds some does not wake it, and is not stranded either.
+#[test]
+fn a_message_queued_while_the_owner_holds_some_is_handed_out_after_them() {
+    check(|| {
+        let (scheduled, pushed, notify) = queued_turn();
+        let limits = MailboxLimits { messages: 4, ..Default::default() };
+        let incarnation = ActorIncarnation { runtime: 0, slot: 0, generation: 0 };
+        let mailbox = Mailbox::new(limits.into(), Clock::manual().clock(), incarnation, Some(notify));
+        mailbox.open();
+        let address = ActorRef(mailbox);
+        (0..3).for_each(|v| {
+            address.try_tell(v).expect("room");
+        });
+        let sender = address.clone();
+        let sent = thread::spawn(move || sender.try_tell(3).is_ok());
+        let mb = &address.0;
+        let (mut held, mut seen) = (VecDeque::new(), Vec::new());
+        // The driver's turns: free the place, take a turn, hand it out, finish; again while runnable.
+        let mut turn = |seen: &mut Vec<u32>| {
+            scheduled.begin();
+            let left = mb.pull(2, &mut held);
+            let taken: Vec<_> = held.drain(..2.min(held.len())).collect();
+            assert!(!taken.is_empty(), "a turn with nothing to hand out");
+            seen.extend(taken.iter().map(|e| e.msg));
+            mb.finish_batch(taken.len(), taken.iter().map(|e| e.bytes).sum(), &held);
+            left > 0 || !held.is_empty()
+        };
+        while turn(&mut seen) {}
+        assert!(sent.join().unwrap());
+        if seen.len() < 4 {
+            assert!(pushed.load(Ordering::SeqCst), "queued behind a held message: not handed out and given no turn");
+            while turn(&mut seen) {}
+        }
+        assert_eq!(seen, [0, 1, 2, 3]);
+        assert_eq!(address.diagnostics().mailbox_depth, 0);
     });
 }

@@ -49,10 +49,10 @@ fault into that feature.
 | one-way cut | n/a: in-process |
 | loss | n/a: in-process |
 | duplication | n/a: in-process |
-| reordering | `crates/axon/tests/embedded.rs::waiters_are_fifo_and_immediate_sends_cannot_bypass_them`, `crates/axon/src/mailbox/model.rs::a_sender_waiting_for_room_is_woken_by_the_release`, `crates/axon/src/mailbox/model.rs::two_waiting_senders_are_both_admitted_in_turn`, `crates/axon/src/mailbox/model.rs::a_waiter_that_gives_up_hands_its_wake_to_the_next`, `crates/axon/src/mailbox/model.rs::closing_wakes_a_waiting_sender_with_a_refusal` |
+| reordering | `crates/axon/tests/embedded.rs::waiters_are_fifo_and_immediate_sends_cannot_bypass_them`, `crates/axon/src/mailbox/model.rs::a_sender_waiting_for_room_is_woken_by_the_release`, `crates/axon/src/mailbox/model.rs::two_waiting_senders_are_both_admitted_in_turn`, `crates/axon/src/mailbox/model.rs::a_waiter_that_gives_up_hands_its_wake_to_the_next`, `crates/axon/src/mailbox/model.rs::closing_wakes_a_waiting_sender_with_a_refusal`, `crates/axon/src/mailbox/model.rs::a_message_queued_while_the_owner_holds_some_is_handed_out_after_them`, `crates/axon/tests/embedded.rs::turns_of_a_deep_mailbox_hand_out_the_oldest_first_and_what_they_leave_stays_queued` |
 | latency | n/a: in-process |
 | clock skew or step | n/a: deadlines use the monotonic clock |
-| CPU starvation | `crates/axon/tests/hosted.rs::a_handler_that_blocks_does_not_hold_up_the_actors_that_share_its_worker`, `crates/axon/tests/hosted.rs::two_actors_that_keep_waking_each_other_do_not_starve_a_third`, `crates/axon/tests/embedded.rs::time_budgets_are_cooperative_and_keep_the_suffix_queued`, `crates/axon-testkit/tests/world_faults.rs::a_turn_cost_trips_the_turn_budget_and_lapses_a_queued_calls_deadline` |
+| CPU starvation | `crates/axon/tests/hosted.rs::a_handler_that_blocks_does_not_hold_up_the_actors_that_share_its_worker`, `crates/axon/tests/hosted.rs::two_actors_that_keep_waking_each_other_do_not_starve_a_third`, `crates/axon/tests/embedded.rs::time_budgets_are_cooperative_and_keep_the_suffix_queued`, `crates/axon/src/mailbox.rs::a_turn_takes_a_queue_deeper_than_itself_in_one_swap`, `crates/axon-testkit/tests/world_faults.rs::a_turn_cost_trips_the_turn_budget_and_lapses_a_queued_calls_deadline` |
 | memory limit | `crates/axon/tests/embedded.rs::oversized_messages_and_custom_weights` |
 | disk full | n/a: no disk |
 | disk error | n/a: no disk |

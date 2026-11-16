@@ -142,6 +142,7 @@ struct Waiter {
 }
 
 struct Hot<M> {
+    /// What senders queued since the owner last took it; older messages wait in the owner's hands.
     queue: VecDeque<Entry<M>>,
     waiters: VecDeque<Waiter>,
     next_waiter: u64,
@@ -278,6 +279,13 @@ pub(crate) struct OwnerStats {
     pub ask_timeouts: AtomicU64,
 }
 
+/// What an actor that samples its timings keeps.
+pub(crate) struct Sampling {
+    pub(crate) timings: Mutex<Timings>,
+    /// What `publish_oldest` found in the owner's hands, in nanoseconds plus one; `0` for nothing.
+    held_oldest: AtomicU64,
+}
+
 pub(crate) struct Mailbox<M> {
     incarnation: ActorIncarnation,
     pub(crate) limits: MailboxLimits,
@@ -291,9 +299,10 @@ pub(crate) struct Mailbox<M> {
     phase: AtomicU8,
     opened: AtomicBool,
     hot: Mutex<Hot<M>>,
-    /// `hot.queue.len()`, set under `hot`; read without it by a least-loaded router, whose lock of every member for
-    /// every message met the workers taking turns there. Declared after `hot`, so it shares a line with the tail of
-    /// `Hot`, which a sender and a turn write anyway, and not one that either only reads.
+    /// The depth: `hot.queue` and what the owner holds past its turn. Written under `hot` only, so exact under it, and
+    /// read without it by a least-loaded router, whose lock of every member for every message met the workers taking
+    /// turns there. Declared after `hot`, so it shares a line with the tail of `Hot`, which a sender and a turn write
+    /// anyway, and not one that either only reads.
     queued: AtomicUsize,
     reservations: AtomicUsize,
     rejected: [AtomicU64; 6],
@@ -315,7 +324,7 @@ pub(crate) struct Mailbox<M> {
     pub(crate) signal: ExitSignal,
     pub(crate) stats: OwnerStats,
     // Boxed: over a kilobyte inline, and off by default.
-    pub(crate) timings: Option<Box<Mutex<Timings>>>,
+    pub(crate) sampling: Option<Box<Sampling>>,
     pub(crate) tracer: Option<Arc<Tracer>>,
     fence: Option<Fence>,
 }
@@ -392,10 +401,17 @@ impl<M: Send + 'static> Mailbox<M> {
             control: Mutex::default(),
             signal: ExitSignal::default(),
             stats: OwnerStats::default(),
-            timings: (every != 0).then(|| Box::new(Mutex::new(Timings { sample_every: every, ..Default::default() }))),
+            sampling: (every != 0).then(|| {
+                let timings = Mutex::new(Timings { sample_every: every, ..Default::default() });
+                Box::new(Sampling { timings, held_oldest: AtomicU64::new(0) })
+            }),
             tracer: config.tracer,
             fence: config.fence,
         })
+    }
+
+    pub(crate) fn timings(&self) -> Option<&Mutex<Timings>> {
+        self.sampling.as_deref().map(|s| &s.timings)
     }
 
     pub(crate) fn notify(&self) {
@@ -478,7 +494,7 @@ impl<M: Send + 'static> Mailbox<M> {
     /// Queues a message whose room is taken, under `hot`; says whether the queue was empty. A queue with no slots
     /// reserves `first_block` of them.
     fn enqueue(&self, hot: &mut Hot<M>, msg: M, bytes: usize, ambient: Option<TraceContext>) -> bool {
-        let was_empty = hot.queue.is_empty();
+        let depth = self.queued.load(Ordering::Relaxed);
         hot.admitted += 1;
         let (at, trace) = self.stamp(hot.admitted, ambient);
         if hot.queue.capacity() == 0 {
@@ -486,22 +502,42 @@ impl<M: Send + 'static> Mailbox<M> {
             let _ = hot.queue.try_reserve(self.first_block as usize);
         }
         hot.queue.push_back(Entry { msg, bytes, at, trace });
-        self.queued.store(hot.queue.len(), Ordering::Relaxed);
-        was_empty
+        self.queued.store(depth + 1, Ordering::Relaxed);
+        depth == 0
     }
 
-    /// Moves up to `max` messages out; returns how many stay queued.
-    pub(crate) fn pull(&self, max: usize, out: &mut VecDeque<Entry<M>>) -> usize {
+    /// Hands the owner, holding `held`, a turn of up to `max` at its front. Short of that, it takes everything senders
+    /// queued in one swap with `held`'s buffer, emptied, and puts back in front what `held` had once the lock is
+    /// released: a lock held through a copy is held against every sender by an owner descheduled inside it. Returns
+    /// how many messages senders queued that it left.
+    pub(crate) fn pull(&self, max: usize, held: &mut VecDeque<Entry<M>>) -> usize {
+        // The tail of what an earlier turn took: a few, set aside so that their buffer, emptied, can go to the senders.
+        let older = (!held.is_empty() && held.len() < max).then(|| {
+            let mut older = VecDeque::with_capacity(held.len());
+            older.append(held);
+            older
+        });
         let mut hot = self.hot.lock();
-        if out.is_empty() && !hot.queue.is_empty() && hot.queue.len() <= max {
-            std::mem::swap(&mut hot.queue, out);
-            self.queued.store(0, Ordering::Relaxed);
-            return 0;
+        if held.is_empty() {
+            std::mem::swap(&mut hot.queue, held);
         }
-        let n = max.min(hot.queue.len());
-        out.extend(hot.queue.drain(..n));
-        self.queued.store(hot.queue.len(), Ordering::Relaxed);
-        hot.queue.len()
+        let left = hot.queue.len();
+        let past_turn = (held.len() + older.as_ref().map_or(0, VecDeque::len)).saturating_sub(max);
+        self.queued.store(left + past_turn, Ordering::Relaxed);
+        drop(hot);
+        for e in older.into_iter().flatten().rev() {
+            held.push_front(e);
+        }
+        self.publish_oldest(held, max);
+        left
+    }
+
+    /// For `diagnostics`: the admission time of the first stamped message in `held` past its first `skip`, looking as
+    /// far as `diagnostics` looks into `hot.queue`.
+    fn publish_oldest(&self, held: &VecDeque<Entry<M>>, skip: usize) {
+        let Some(sampling) = &self.sampling else { return };
+        let at = held.range(skip.min(held.len())..).take(self.sample_every as usize).find_map(|e| e.at);
+        sampling.held_oldest.store(at.map_or(0, |at| nanos(at).saturating_add(1)), Ordering::Relaxed);
     }
 
     /// Gives back the capacity of what a turn took, or a permit held.
@@ -513,17 +549,15 @@ impl<M: Send + 'static> Mailbox<M> {
         wake_all(waker);
     }
 
-    /// Releases consumed capacity and returns any unconsumed suffix to the queue front.
-    pub(crate) fn finish_batch(&self, slots: usize, bytes: usize, leftover: &mut VecDeque<Entry<M>>) {
-        if leftover.is_empty() && slots == 0 {
+    /// Ends a turn: gives back the capacity of what it handled, and counts what the owner still holds as queued.
+    pub(crate) fn finish_batch(&self, slots: usize, bytes: usize, held: &VecDeque<Entry<M>>) {
+        if held.is_empty() && slots == 0 {
             return;
         }
+        self.publish_oldest(held, 0);
         let waker = {
             let mut hot = self.hot.lock();
-            while let Some(e) = leftover.pop_back() {
-                hot.queue.push_front(e);
-            }
-            self.queued.store(hot.queue.len(), Ordering::Relaxed);
+            self.queued.store(hot.queue.len() + held.len(), Ordering::Relaxed);
             freed(&mut hot, slots, bytes)
         };
         wake_all(waker);
@@ -555,6 +589,7 @@ impl<M: Send + 'static> Mailbox<M> {
         wake_all(waiters.into_iter().map(|w| w.waker));
     }
 
+    /// What senders queued, for an owner that discards what it holds too.
     pub(crate) fn discard(&self) -> VecDeque<Entry<M>> {
         let mut hot = self.hot.lock();
         self.queued.store(0, Ordering::Relaxed);
@@ -576,7 +611,8 @@ impl<M: Send + 'static> Mailbox<M> {
 
     /// `diagnostics().mailbox_depth` alone, for a driver's look for what is queued.
     pub(crate) fn depth(&self) -> usize {
-        self.hot.lock().queue.len()
+        let _hot = self.hot.lock();
+        self.queued.load(Ordering::Relaxed)
     }
 
     /// `depth()` without the lock, as of the last change another thread made visible.
@@ -588,8 +624,17 @@ impl<M: Send + 'static> Mailbox<M> {
         let (mailbox_depth, mailbox_bytes, waiters, admitted, oldest) = {
             let hot = self.hot.lock();
             // One entry in `sample_every` is stamped, so the walk under the lock is bounded by it; unsampled, by zero.
-            let oldest = hot.queue.iter().take(self.sample_every as usize).find_map(|e| e.at);
-            (hot.queue.len(), hot.bytes, hot.waiters.len(), hot.admitted, oldest)
+            // The walk starts in what the owner holds, as far as it published, and goes on into `hot.queue`.
+            let depth = self.queued.load(Ordering::Relaxed);
+            let held = depth - hot.queue.len();
+            let in_held = self
+                .sampling
+                .as_ref()
+                .filter(|_| held > 0)
+                .and_then(|s| s.held_oldest.load(Ordering::Relaxed).checked_sub(1).map(Duration::from_nanos));
+            let rest = (self.sample_every as usize).saturating_sub(held);
+            let oldest = in_held.or_else(|| hot.queue.iter().take(rest).find_map(|e| e.at));
+            (depth, hot.bytes, hot.waiters.len(), hot.admitted, oldest)
         };
         Diagnostics {
             mailbox_depth,
@@ -609,7 +654,7 @@ impl<M: Send + 'static> Mailbox<M> {
             // A live actor has lost nothing yet: what it holds becomes dead letters when it ends.
             dead_letters: 0,
             oldest_message_age: oldest.map(|at| self.clock.now().saturating_sub(at)),
-            timings: self.timings.as_ref().map(|t| Box::new(t.lock().clone())),
+            timings: self.sampling.as_ref().map(|s| Box::new(s.timings.lock().clone())),
         }
     }
 }
@@ -985,23 +1030,64 @@ fn the_length_a_router_reads_without_the_lock_follows_every_change_to_the_queue(
     mailbox.open();
     let address = ActorRef(mailbox);
     let mb = &address.0;
-    let same = || assert_eq!(mb.queued(), mb.depth());
-    for i in 0..5u64 {
+    let lengths = || (mb.queued(), mb.diagnostics().mailbox_depth);
+    (0..5u64).for_each(|i| {
         address.try_tell(i).expect("room");
-        same();
-    }
-    let mut batch = VecDeque::new();
-    mb.pull(2, &mut batch);
-    same();
-    mb.finish_batch(1, 0, &mut batch.split_off(1));
-    same();
-    let mut all = VecDeque::new();
-    mb.pull(usize::MAX, &mut all);
-    assert_eq!(mb.queued(), 0);
+    });
+    assert_eq!(lengths(), (5, 5));
+    let mut held = VecDeque::new();
+    mb.pull(2, &mut held);
+    assert_eq!(lengths(), (3, 3), "a turn of 2 out of 5");
+    held.pop_front();
+    mb.finish_batch(1, 0, &held);
+    assert_eq!(lengths(), (4, 4), "1 handled, the rest held");
+    address.try_tell(5u64).expect("room");
+    assert_eq!(lengths(), (5, 5));
+    mb.pull(usize::MAX, &mut held);
+    assert_eq!((lengths(), held.iter().map(|e| e.msg).collect::<Vec<_>>()), ((0, 0), vec![1, 2, 3, 4, 5]));
+    held.clear();
+    mb.finish_batch(5, 0, &held);
     address.try_tell(9u64).expect("room");
-    same();
+    assert_eq!(lengths(), (1, 1));
     mb.discard();
-    assert_eq!((mb.queued(), mb.depth()), (0, 0));
+    assert_eq!(lengths(), (0, 0));
+}
+
+/// A turn takes what senders queued in one swap, however deep: the lock they wait on is never held through a copy of
+/// a turn's messages, which a worker descheduled inside it would hold it for. What the turn leaves waits with its
+/// owner and still counts as queued.
+#[cfg(all(test, not(axon_loom)))]
+#[test]
+fn a_turn_takes_a_queue_deeper_than_itself_in_one_swap() {
+    struct Look(Arc<Mutex<Vec<(u64, usize, usize)>>>);
+    impl crate::Actor for Look {
+        type Message = u64;
+        type Error = ();
+        fn on_message(&mut self, msg: u64, cx: &mut crate::Context<'_, Self>) -> Result<(), ()> {
+            if msg.is_multiple_of(256) {
+                let mb = cx.address().0;
+                let senders = mb.hot.lock().queue.len();
+                self.0.lock().push((msg, senders, mb.diagnostics().mailbox_depth));
+            }
+            Ok(())
+        }
+    }
+    let looks = Arc::new(Mutex::new(Vec::new()));
+    let (mut driver, spawn) =
+        crate::EmbeddedDriver::new(Look(looks.clone()), MailboxLimits::default(), Clock::manual().clock()).unwrap();
+    driver.run_turn(TurnBudget::default());
+    let tell = |range: std::ops::Range<u64>| {
+        range.for_each(|v| {
+            spawn.address.try_tell(v).expect("room");
+        })
+    };
+    tell(0..600);
+    assert_eq!(driver.run_turn(TurnBudget::messages(256)).ordinary, 256);
+    tell(600..610);
+    assert_eq!(driver.run_turn(TurnBudget::messages(256)).ordinary, 256);
+    assert_eq!(driver.run_turn(TurnBudget::messages(256)).ordinary, 98);
+    // Each turn's first message: the senders' queue, then the depth: what waits past the turn.
+    assert_eq!(*looks.lock(), [(0, 0, 344), (256, 10, 98), (512, 0, 0)]);
 }
 
 /// Every interleaving of the admission handshake. A lost wakeup shows as a deadlock.
