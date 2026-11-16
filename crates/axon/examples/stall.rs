@@ -89,7 +89,7 @@ struct Hist {
     full: u64,
     /// Sends over 100 µs, far past the sub-µs of an uncontended one.
     long: u64,
-    max: u64,
+    worst: u64,
     /// Long sends during which the sender slept (its voluntary context switches rose), and the worst of them: a wait for
     /// a lock, where a long send that did not sleep is the sender descheduled.
     slept: u64,
@@ -98,7 +98,7 @@ struct Hist {
 
 impl Hist {
     fn new() -> Self {
-        Self { counts: vec![0; 64 * 16], sends: 0, full: 0, long: 0, max: 0, slept: 0, slept_max: 0 }
+        Self { counts: vec![0; 64 * 16], sends: 0, full: 0, long: 0, worst: 0, slept: 0, slept_max: 0 }
     }
 
     fn record(&mut self, ns: u64, full: bool) {
@@ -112,7 +112,7 @@ impl Hist {
         self.sends += 1;
         self.full += u64::from(full);
         self.long += u64::from(ns > 100_000);
-        self.max = self.max.max(ns);
+        self.worst = self.worst.max(ns);
     }
 
     fn floor(i: usize) -> u64 {
@@ -136,7 +136,7 @@ impl Hist {
             self.sends,
             self.full,
             us(self.p99()),
-            us(self.max),
+            us(self.worst),
             self.long,
             self.slept,
             us(self.slept_max),
@@ -275,7 +275,7 @@ fn send<const W: usize>(a: &Args, actors: &[ActorRef<[u64; W]>]) {
             total.sends += h.sends;
             total.full += h.full;
             total.long += h.long;
-            total.max = total.max.max(h.max);
+            total.worst = total.worst.max(h.worst);
             total.slept += h.slept;
             total.slept_max = total.slept_max.max(h.slept_max);
         }
