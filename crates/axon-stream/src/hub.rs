@@ -1636,14 +1636,19 @@ impl<A: Authorizer> StreamHub<A> {
             Phase::Waiting(_) | Phase::Snapshot(_) | Phase::Done => return Err(StreamError::NotRecovering),
         };
         let (room, held) = (|used: usize, max: usize| max.saturating_sub(used), sub.held());
+        let own = (room(held.records, sub.limits.max_records), room(held.bytes, sub.limits.max_bytes));
         let branch = ReadBounds {
-            max_records: room(held.records, sub.limits.max_records)
-                .min(bounds.max_records)
-                .min(limits.max_batch_records),
-            max_bytes: room(held.bytes, sub.limits.max_bytes).min(bounds.max_bytes).min(limits.max_batch_bytes),
+            max_records: own.0.min(bounds.max_records).min(limits.max_batch_records),
+            max_bytes: own.1.min(bounds.max_bytes).min(limits.max_batch_bytes),
         };
+        // Only the live tail is left, held until this replay ends: no poll and no child's answer frees the branch.
+        let stuck = sub.queue.len() <= sub.tail && sub.inflight == QueueUsage::default();
         if branch.max_records == 0 || branch.max_bytes == 0 || held.events >= sub.limits.max_events {
             self.stats.recovery_blocked += 1;
+            // Its own limits, not the node's pool: the reset of a subscriber too slow for them.
+            if stuck && (own.0 == 0 || own.1 == 0 || held.events >= sub.limits.max_events) {
+                self.terminate(id, StreamEvent::ResetRequired(ResetReason::SlowConsumer));
+            }
             return Ok(RecoveryProgress::Blocked);
         }
         let bounds = ReadBounds {
@@ -1663,8 +1668,10 @@ impl<A: Authorizer> StreamHub<A> {
         let pages = match source.read_after(&sub.key, after, cut.sequence, bounds) {
             Ok(pages) => pages,
             Err(RecoveryError::LimitExceeded) => {
-                // An empty branch bounded only by its own size can never hold the next record.
-                if held.events == 0 && bounds.max_bytes == sub.limits.max_bytes {
+                // A branch bounded only by its own size never holds the next record when it is empty, or stuck.
+                if (held.events == 0 && bounds.max_bytes == sub.limits.max_bytes)
+                    || (stuck && bounds.max_bytes == own.1)
+                {
                     self.terminate(id, StreamEvent::ResetRequired(ResetReason::SlowConsumer));
                 }
                 return Err(RecoveryError::LimitExceeded.into());

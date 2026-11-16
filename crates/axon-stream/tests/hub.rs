@@ -696,6 +696,74 @@ fn recovery_resets_rather_than_deadlock_when_the_global_pool_is_held_by_live_tai
     assert_eq!(hub.total_queued(), (0, 0));
 }
 
+/// Replaying from `start`, after record 3 of 40, `Ready` polled, with records 41 and 42 held live behind the replay.
+fn replaying_behind_a_live_tail(start: StartPosition, limits: BranchLimits) -> (StreamHub, u64) {
+    let (mut hub, store) = hub();
+    publish(&mut hub, &store, 1..=40, 40);
+    let id =
+        hub.subscribe(&me(), &key(), SubscribeOptions { start, limits, ..Default::default() }, Some(store.clone()));
+    let id = id.unwrap();
+    assert_eq!(hub.poll(id), Some(StreamEvent::Ready { start: Some(Cursor { generation: 7, sequence: 3 }) }));
+    publish(&mut hub, &store, 41..=42, 1);
+    (hub, id)
+}
+
+#[test]
+fn recovery_resets_rather_than_deadlock_when_its_own_branch_is_held_by_its_live_tail() {
+    let (d, bounds) = (BranchLimits::default(), ReadBounds { max_records: 100, max_bytes: 1 << 20 });
+    let at = Cursor { generation: 7, sequence: 3 };
+    // Room for one more record: a caller's empty budget is no reason to reset.
+    let (mut hub, id) = replaying_behind_a_live_tail(StartPosition::After(at), BranchLimits { max_records: 3, ..d });
+    assert_eq!(hub.drive_recovery(id, ReadBounds { max_records: 0, max_bytes: 0 }), Ok(RecoveryProgress::Blocked));
+    assert_eq!(hub.poll(id), None);
+    assert!(matches!(hub.drive_recovery(id, bounds), Ok(RecoveryProgress::Advanced(c)) if c.sequence == 4));
+    // The tail fills the branch's records, its events, all of its bytes, then all but 4 of them, less than one record.
+    let full = [
+        (BranchLimits { max_records: 2, ..d }, Ok(RecoveryProgress::Blocked), 1),
+        (BranchLimits { max_events: 2, ..d }, Ok(RecoveryProgress::Blocked), 1),
+        (BranchLimits { max_bytes: 16, ..d }, Ok(RecoveryProgress::Blocked), 1),
+        (BranchLimits { max_bytes: 20, ..d }, Err(StreamError::from(RecoveryError::LimitExceeded)), 0),
+    ];
+    for start in [StartPosition::After(at), StartPosition::FollowAfter(at)] {
+        for (limits, progress, blocked) in full.clone() {
+            let (mut hub, id) = replaying_behind_a_live_tail(start, limits);
+            assert_eq!(hub.drive_recovery(id, bounds), progress, "{start:?} {limits:?}");
+            assert_eq!(
+                hub.poll(id),
+                Some(StreamEvent::ResetRequired(ResetReason::SlowConsumer)),
+                "{start:?} {limits:?}"
+            );
+            assert_eq!(hub.poll(id), None);
+            assert_eq!(hub.total_queued(), (0, 0));
+            let s = hub.stats();
+            assert_eq!((s.subscriptions, s.recovering, s.replayed_records, s.recovery_blocked), (0, 0, 0, blocked));
+        }
+    }
+}
+
+#[test]
+fn a_recovering_branch_full_of_its_live_tail_waits_for_the_records_it_has_in_flight() {
+    let (mut hub, store) = hub();
+    publish(&mut hub, &store, 1..=40, 40);
+    let options = SubscribeOptions { limits: BranchLimits { max_records: 3, ..Default::default() }, ..after(3) };
+    let id = hub.subscribe(&me(), &key(), options, Some(store.clone())).unwrap();
+    let ready = StreamEvent::Ready { start: Some(Cursor { generation: 7, sequence: 3 }) };
+    assert_eq!(hub.poll_charged(id), Some((ready, QueueUsage::default())));
+    let bounds = ReadBounds { max_records: 1, max_bytes: 1 << 20 };
+    assert!(matches!(hub.drive_recovery(id, bounds), Ok(RecoveryProgress::Advanced(c)) if c.sequence == 4));
+    let (event, charge) = hub.poll_charged(id).unwrap();
+    assert_eq!(event, StreamEvent::Batch(batch(7, 4, 1)));
+    publish(&mut hub, &store, 41..=42, 1);
+    // Record 4 in flight and the tail fill the branch; the answer for record 4 gives one back.
+    assert_eq!(hub.drive_recovery(id, bounds), Ok(RecoveryProgress::Blocked));
+    assert_eq!(hub.poll(id), None);
+    assert!(hub.is_recovering(id));
+    assert!(hub.discharge(id, charge));
+    assert_eq!(hub.inflight(id), Some(QueueUsage::default()));
+    let (seen, end) = drain(&mut hub, id, 100);
+    assert_eq!((seen, end), ((5..=42).collect(), None));
+}
+
 struct Lying(Store);
 
 impl RecoverySource for Lying {

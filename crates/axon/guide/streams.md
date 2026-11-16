@@ -206,7 +206,8 @@ while let Some(event) = hub.poll(id) { /* capacity is released here */ }
   that cannot take a batch ends by its `SlowConsumerPolicy`: `Detach`, `Reset`, or `CoalesceLatest` (only on a
   `ReplaceableState` stream, one record per batch). A slow branch never holds back another.
 - Recovery never waits on a full global pool when the branch has nothing to poll: it resets with `GlobalCapacity`,
-  because retained live batches could hold every credit forever.
+  because retained live batches could hold every credit forever. When those batches fill the branch's own limits, and
+  nothing is left to poll or in flight to free them, it resets with `SlowConsumer`.
 - Authorization is exact-key, checked when a session acts. `update_authorizer` is the revocation boundary: it ends
   every subscription and drops every interest the new policy refuses. Nothing is re-checked per event.
 - `accept_batch` is the relay entry: positions already published are dropped by position, a gap fails without
