@@ -1726,19 +1726,79 @@ The `perf` rows of before, swap and split, interleaved, `taskset -c 0-11`, load 
 | fanout, 8 rounds | 76.5 (73.0–79.7) | 77.6 (76.2–85.2) | 78.6 (74.6–84.7) |
 | topic publish, 8 rounds | 73.8 (73.4–82.3) | 74.9 (73.7–77.8) | 75.1 (73.4–81.7) |
 
-Embedded's half a nanosecond is the sender reading the depth to say whether the mailbox was empty, which now counts
-what the owner holds. A build with the old read measured 16.0. Keeping the owner's count in an atomic of its own,
-8 bytes more, measured 16.8.
+Embedded's half a nanosecond came with how a send reads the depth, not with what it counts. Builds that count the
+same, interleaved: one read for both the wake and the depth stored, as 398aa4f, 16.6–16.7; that read moved later, 16.5;
+the owner's count kept in `Hot`, 8 bytes more, 16.4–16.5; the wake also asking whether the queue is empty, 16.3 with
+`&&` and 16.6 with `&`; two plain reads, as c6523fd keeps, 16.1 (16.0–16.2) against 16.6 (16.5–16.8), nine rounds
+(`20261116-031708-embA6`). Builds that left the owner's part out of the wake or the store measured 16.1, seven rounds
+(`20261116-030859-embdiag`). Which form is fast depends on the code the compiler makes; these runs do not show why. Run
+directories are under `target/bench/` on build-1.
 
 What this establishes: on this box, under load, a sender seldom sleeps on a deep mailbox's lock while its owner is
 descheduled: its sends to the slow actor slept 0 or 1 times a run (one of 27 ms), against 43 to 54. In an instrumented
 copy, not committed, waits over 100 µs on an actor's lock went from 74–130 a run to 7–22. The throughput rows moved less
-than their spread, except embedded at +3 %. What it does not establish: the sender's worst send and its p99. The sender
-is one thread, so its worst send is set by the next lock it meets. Sends to the other actors still sleep up to 18 ms, 10
-to 150 times a run, in every build. The instrumented copy put those waits about evenly on two locks. One is an actor's
-own lock, held by a worker descheduled in the few stores of a swap or of the end of a turn. The other is the run queue's
-lock, which a sender takes when it wakes an idle actor. It also does not establish anything on the EPYC, whose baseline
-the gate keeps, or another shape of load.
+than their spread, except embedded at +3 %, which c6523fd took back. What it does not establish: the sender's worst
+send and its p99. The sender is one thread, so its worst send is set by the next lock it meets. Sends to the other
+actors still slept up to 18 ms, 10 to 150 times a run, in every build. The instrumented copy put those waits about
+evenly on two locks. One is an actor's own lock, held by a worker descheduled in the few stores of a swap or of the end
+of a turn. The other is the run queue's lock, which a sender takes when it wakes an idle actor. It also does not
+establish anything on the EPYC, whose baseline the gate keeps, or another shape of load.
+
+### The locks a sender meets
+
+A copy instrumented at both locks, not committed (`20261116-024353-instr`), timed every hold and every wait of the
+sender. Holds that average 20–300 ns, of an actor's lock in a turn's pull and its end and of a run queue's lock in a
+pop, a theft and a thief adding what it took to its own queue, ran past 100 µs up to 60 times a run each, up to 18 ms:
+their holder was descheduled inside them. The sender's long waits followed those holders, on a run queue's lock most
+often behind a thief. Spinning before it sleeps cannot shorten such a wait, so no build tried that.
+
+Since e3a151f a send from outside a pool with balance goes past a home queue another thread holds, to the next queue
+whose lock is free. Only when it found every one held a few times round does it wait, on the next queue's lock. The
+actor queues there and keeps its home. An actor's turn can still wait behind a held run queue's lock. Medians (range) of
+eight interleaved 10 s runs against 398aa4f (`20261116-032711-stallF`; the harness's own load threads put the load
+average near 120), sends to the actors that are not slow:
+
+| Per 10 s run | 64 actors, `slow_us=10 load=88`: 398aa4f | e3a151f | 8 actors, as above: 398aa4f | e3a151f |
+|---|---|---|---|---|
+| sends over 100 µs | 82.5 (72–105) | 41.5 (35–57) | 28 (18–33) | 25 (19–44) |
+| of them slept on a lock | 72.5 (65–93) | 31 (25–43) | 14.5 (11–20) | 10 (4–11) |
+| worst send: median second, run | 12.0 ms, 15.1 ms | 12.0 ms, 14.0 ms | 18.0 ms, 18.5 ms | 16.3 ms, 20.0 ms |
+| p99 of a send, run and worst second | 0.2, 0.3 µs | 0.2, 0.2 µs | 0.3, 0.45 µs | 0.3, 0.4 µs |
+| messages the slow actor handled | 203 k | 203 k | 1.19 M | 1.20 M |
+
+A first five rounds (`20261116-025938-stallB`) gave 71 → 43 and 32 → 21 sends over 100 µs; a build that tried the
+home queue 64 times before moving on gave 52 and 17, the same within the spread. Instrumented at the mailbox only,
+three rounds each (`20261116-033233-instrF`), the sender's wakes over 100 µs went 37 → 1 and 4 → 0 a run, and its
+waits over 100 µs on an actor's own lock stayed at 108 and 19–21. Those now set its worst send. Only fewer or shorter
+holds of that lock would cut them; dropping one of a turn's two would free capacity later, which changes when `Full`
+is returned, and no build tried it.
+
+The `perf` rows, seven interleaved rounds, `taskset -c 0-11`, load average 2–4 (`20261116-032439-perfF`), ns/msg:
+
+| Row | b64f862 | 398aa4f | e3a151f |
+|---|---|---|---|
+| embedded | 16.1 (16.0–16.1) | 16.7 (16.6–16.9) | 16.1 (16.1–16.2) |
+| hosted | 23.9 (23.0–25.1) | 22.6 (22.3–23.7) | 23.1 (22.4–25.3) |
+| contended | 89.2 (83.4–92.5) | 90.5 (88.4–95.5) | 90.9 (88.6–93.7) |
+| fanout | 78.7 (75.7–88.9) | 78.6 (73.4–82.7) | 79.1 (75.8–79.8) |
+| topic publish | 73.3 (73.0–74.9) | 73.9 (73.3–74.5) | 74.5 (73.2–86.0) |
+
+Fanout, where one sender wakes 64 actors on 4 workers, moved 77.2 → 78.2 over ten rounds of its own with the first
+build of the change (`20261116-031819-fanB`), inside its spread.
+
+The rows that wake an actor from outside, the same way, load average 3–4, ns/msg, 398aa4f against e3a151f: start 1734
+against 1774, ask 192.2 against 192.7 and asks 228.9 against 229.1, seven rounds (`20261116-034752-perfP`). Route lost:
+in three runs (perfP; fifteen rounds each in `20261116-035127-routeB` and `20261116-040241-routeC`) round-robin took
+87.5, 87.0 and 87.2 against 90.0, 88.6 and 88.8, slower in 34 of 37 paired rounds, and least-loaded 120.5, 121.2 and
+119.6 against 125.0, 123.7 and 125.7, slower in 32 of 37. Hash was slower in 24 of 37, by 0.6–6 %. Direct runs fall near
+87 or near 115 in every build and did not separate. The ranges overlap in every row. Trying the home queue 64 times
+first gave the same, 88.7 and 123.0, and reading the depth twice alone did not lose (`routeB`), so the loss is in the
+push from outside; the runs do not show where in it.
+
+What this establishes: on this box, under this load, a sender's wakes over 100 µs went from 37 to 1 a run with 64 actors
+and from 4 to 0 with 8. With 64 actors its sends over 100 µs halved; with 8 they did not move beyond their spread. Its
+worst send and its p99 did not move beyond their spread; the actor's own lock sets the first, and no build changed how
+long that lock is held. It costs the round-robin and least-loaded route rows 2–5 %.
 
 ## Durable pipeline (`axon`)
 
