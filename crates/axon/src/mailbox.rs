@@ -494,7 +494,9 @@ impl<M: Send + 'static> Mailbox<M> {
     /// Queues a message whose room is taken, under `hot`; says whether the queue was empty. A queue with no slots
     /// reserves `first_block` of them.
     fn enqueue(&self, hot: &mut Hot<M>, msg: M, bytes: usize, ambient: Option<TraceContext>) -> bool {
-        let depth = self.queued.load(Ordering::Relaxed);
+        // Read twice, as the lock keeps it from changing in between. Of the forms measured, this one kept an embedded
+        // send at its old cost; one read for both, and other forms with two, cost it up to half a nanosecond.
+        let was_empty = self.queued.load(Ordering::Relaxed) == 0;
         hot.admitted += 1;
         let (at, trace) = self.stamp(hot.admitted, ambient);
         if hot.queue.capacity() == 0 {
@@ -502,8 +504,8 @@ impl<M: Send + 'static> Mailbox<M> {
             let _ = hot.queue.try_reserve(self.first_block as usize);
         }
         hot.queue.push_back(Entry { msg, bytes, at, trace });
-        self.queued.store(depth + 1, Ordering::Relaxed);
-        depth == 0
+        self.queued.store(self.queued.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+        was_empty
     }
 
     /// Hands the owner, holding `held`, a turn of up to `max` at its front. Short of that, it takes everything senders
