@@ -116,3 +116,43 @@ fn a_turn_that_unwinds_ends_the_actor_and_frees_its_thread() {
     assert_eq!(seen.load(Ordering::Relaxed), 11, "abandoned once, then dropped");
     assert!(cell.drive.lock().is_none() && cell.pool.queues[0].ready.lock().shutdown);
 }
+
+/// A sender from outside the pool does not wait for a thread that holds its actor's home queue, as a worker
+/// descheduled in a pop or a theft would hold it for the rest of its time slice: the actor queues on the other
+/// worker, which runs it.
+#[test]
+#[expect(clippy::disallowed_methods, reason = "the queue is held by a real thread")]
+fn a_tell_from_outside_does_not_wait_for_a_held_home_queue() {
+    let rt = Runtime::new(RuntimeConfig { workers: 2, ..Default::default() }).unwrap();
+    let handle = rt.spawn(Idle, Execution::Shared, MailboxLimits::default()).unwrap();
+    handle.wait_ready(Duration::from_secs(5)).unwrap();
+    let cell = rt.0.registry.lock().values().next().and_then(|(_, c)| c.upgrade()).unwrap();
+    let queue = &rt.0.pools[0].pool.queues[cell.home];
+    let (held, told) = (std::sync::Barrier::new(2), AtomicBool::new(false));
+    let released_late = std::thread::scope(|s| {
+        let holder = s.spawn(|| {
+            let ready = queue.ready.lock();
+            held.wait();
+            // Five seconds at most, so that a tell that waits for the lock ends.
+            let late = (0..5000).all(|_| {
+                std::thread::sleep(Duration::from_millis(1));
+                !told.load(Ordering::Acquire)
+            });
+            drop(ready);
+            late
+        });
+        held.wait();
+        handle.address.try_tell(()).unwrap();
+        told.store(true, Ordering::Release);
+        holder.join().unwrap()
+    });
+    assert!(!released_late, "the tell waited for the held queue");
+    for _ in 0..5000 {
+        if handle.address.diagnostics().processed > 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(handle.address.diagnostics().processed, 1);
+    rt.shutdown(Duration::from_secs(5));
+}

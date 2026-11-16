@@ -102,3 +102,30 @@ fn an_actor_queued_behind_a_turn_that_does_not_end_is_taken_by_a_sleeper() {
 fn a_sleeper_that_stops_watching_as_a_worker_turns_busy_again_is_counted_or_sees_it_busy() {
     queued_behind_a_turn_that_does_not_end(true);
 }
+
+/// A wake from outside while another thread holds the actor's home queue, as a worker descheduled in a pop or a theft
+/// does: the actor queues on the other worker, or on its home once the lock is free, and runs, whichever worker
+/// sleeps.
+#[test]
+fn a_wake_from_outside_past_a_held_home_queue_runs() {
+    check(2, || {
+        let pool = Pool::new(2, true, false);
+        let ran = Arc::new(Done::default());
+        let actor = cell(&pool, Turn { ran: ran.clone(), after: None });
+        let workers: Vec<_> = (0..2)
+            .map(|i| {
+                let pool = pool.clone();
+                thread::spawn(move || pool.work(i, Duration::ZERO))
+            })
+            .collect();
+        let holder = {
+            let pool = pool.clone();
+            thread::spawn(move || drop(pool.queues[0].ready.lock()))
+        };
+        actor.notify();
+        ran.wait();
+        holder.join().expect("the holder panicked");
+        pool.shutdown();
+        workers.into_iter().for_each(|w| w.join().expect("a worker panicked"));
+    });
+}

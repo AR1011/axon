@@ -353,12 +353,15 @@ impl Queue {
     }
 
     fn push(&self, cell: Arc<Cell>) {
-        let woke = {
-            let mut ready = self.ready.lock();
-            ready.cells.push_back(cell);
-            self.queued.len.store(ready.cells.len(), Ordering::Relaxed);
-            ready.claim_wake().then(|| ready.pump.take())
-        };
+        self.push_into(self.ready.lock(), cell);
+    }
+
+    /// `push`, under the lock the caller took.
+    fn push_into(&self, mut ready: sync::MutexGuard<'_, Ready>, cell: Arc<Cell>) {
+        ready.cells.push_back(cell);
+        self.queued.len.store(ready.cells.len(), Ordering::Relaxed);
+        let woke = ready.claim_wake().then(|| ready.pump.take());
+        drop(ready);
         if let Some(pump) = woke {
             self.wake.notify_one();
             if let Some(pump) = pump {
@@ -450,7 +453,8 @@ impl Queue {
 
 /// Workers that share actors. A cell woken by a turn runs next on that turn's worker, where what it was sent is
 /// still in cache, unless something already waits there, when it queues behind it; one woken from outside goes to
-/// its home worker's queue; a worker with nothing to do takes half of another's queue.
+/// its home worker's queue, or to the next one whose lock is free while another thread holds that one's; a worker with
+/// nothing to do takes half of another's queue.
 ///
 /// Every queue's owner is awake whenever something is added to it, except by a push from another thread, which
 /// wakes it. So `nudge` only buys parallelism, and one it misses costs no progress, only a wait for what queues
@@ -577,9 +581,9 @@ impl Pool {
                 WORKER.set((0, 0));
                 return NEXT.set(Some(cell));
             }
-            // The home worker is woken if asleep. Reading how busy it is would cost the sender a cache miss on
-            // every wake; with balance, a worker looking for work takes it if the home worker stays busy or asleep.
-            return self.queues[home].push(cell);
+            // The worker whose queue takes it is woken if asleep. Reading how busy it is would cost the sender a cache
+            // miss on every wake; with balance, a worker looking for work takes it if that worker stays busy or asleep.
+            return self.push_outside(cell, home);
         }
         // The slot only while nothing waits here, so a woken cell never jumps the queue, and a sender's messages
         // still pile up for one turn of their receiver.
@@ -589,6 +593,25 @@ impl Pool {
         }
         queue.push(cell);
         self.nudge();
+    }
+
+    /// A push from outside the pool, to `home`'s queue. With balance, while another thread holds that queue's lock, to
+    /// the next queue whose lock is free: a worker descheduled while it holds its queue's lock would hold the sender
+    /// for the rest of its time slice. It goes round a few times, as a worker that runs frees its lock within a
+    /// fraction of a microsecond, and then waits for the next queue's lock rather than the one it found held first.
+    fn push_outside(&self, cell: Arc<Cell>, home: usize) {
+        let n = self.queues.len();
+        if !self.balance || n == 1 {
+            return self.queues[home].push(cell);
+        }
+        for k in 0..n * 8 {
+            let queue = &self.queues[(home + k) % n];
+            if let Some(ready) = queue.ready.try_lock() {
+                return queue.push_into(ready, cell);
+            }
+            std::hint::spin_loop();
+        }
+        self.queues[(home + 1) % n].push(cell);
     }
 
     /// Wakes a sleeping worker to take what a busy worker just queued, unless one is already looking.
@@ -868,10 +891,11 @@ impl Cell {
         skip <= HERE_FRESH
     }
 
-    /// To its home worker's queue, for a cell whose place this thread holds.
+    /// As a wake from outside the pool, for a cell whose place this thread holds.
     fn requeue(self: Arc<Self>) {
         let pool = self.pool.clone();
-        pool.queues[self.home].push(self);
+        let home = self.home;
+        pool.push_outside(self, home);
     }
 
     fn turn(&self, mut drive: sync::MutexGuard<'_, Option<Box<dyn Drive>>>, budget: TurnBudget) -> bool {

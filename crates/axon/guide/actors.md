@@ -1400,10 +1400,10 @@ fn main() {
 ## How it runs
 
 - `workers` threads (default: cores, at most 8). Each actor has a home worker, where a message from outside the pool
-  queues it. A message sent from a handler runs its receiver next on the sender's worker when nothing else waits
-  there, while what it was sent is still in cache; otherwise the receiver queues there behind the rest. A worker with
-  nothing to do takes half of another's queue when that worker is asleep, stuck in one turn, or has eight or more
-  waiting.
+  queues it, or on another worker while another thread holds the home worker's queue. A message sent from a handler
+  runs its receiver next on the sender's worker when nothing else waits there, while what it was sent is still in
+  cache; otherwise the receiver queues there behind the rest. A worker with nothing to do takes half of another's
+  queue when that worker is asleep, stuck in one turn, or has eight or more waiting.
   So a shared actor may run on any worker; one that must stay on one thread uses `Execution::Dedicated` or a pool
   without `balance` (below).
 - A worker gives an actor up to 64 messages per turn, then moves on to the next actor. `Actor::on_batch` sees the
