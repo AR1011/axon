@@ -1691,9 +1691,10 @@ per message, so its 4096-slot mailbox stays nearly full, and `load` threads spin
 descheduled anywhere in a turn. The sender runs alone on its core with its SMT sibling idle, so its voluntary context
 switches are sleeps on a lock. Ryzen 9 9900X build box, which other work shared (the sender's involuntary
 switches ran from 200 to 5 000 per 10 s run). Five interleaved 10 s rounds of before (b64f862), this change ("swap"),
-and two others built to compare. "Split" takes the whole queue out, splits the turn off without the lock, and puts the
-rest back under it, moving the shorter side. "Chunk" copies the turn out in chunks and releases the lock between them.
-Medians per run, with `slow_us=1 load=132 words=128 actors=8 rate=200000`: 1 KiB messages, so a turn's copy is 256 KiB.
+and two others built to compare (`20261116-011458-main-stall`). "Split" takes the whole queue out, splits the turn off
+without the lock, and puts the rest back under it, moving the shorter side. "Chunk" copies the turn out in chunks and
+releases the lock between them. Medians per run, with `slow_us=1 load=132 words=128 actors=8 rate=200000`: 1 KiB
+messages, so a turn's copy is 256 KiB.
 
 | Per 10 s run | before | swap | split | chunk |
 |---|---|---|---|---|
@@ -1709,14 +1710,16 @@ which was not looked into further. Split still copies under the lock when it put
 and swap both slept 2 times a run and the slow actor's worst send was 38 and 46 µs. With every actor fast (`slow_us=0`)
 and the load on, before still slept 39 132 times a run against 18: under load a fast actor's mailbox gets deep too. With
 64 actors and 16-byte messages (`slow_us=10 load=88`), no build's sends to the slow actor slept. The first shape with
-16-byte messages, three rounds, slept 47 times a run before and 15 after, 2 and 0 of them on sends to the slow actor:
-256 small entries copy quickly, so a worker is seldom descheduled inside the copy. With 64 actors, split's sends to the
-others slept 14 times a run against 58 before and 62 for swap. Split's senders find the queue empty in the middle of a
-pull and wake the actor, which before and swap do not. A swap build that wakes it the same way matched split, 41 against
-131, and its slow actor handled 266 k messages against 202 k. That is a scheduling effect, not the lock, and it changes
-when an actor is woken, so this change does not take it.
+16-byte messages, three rounds (`20261116-022446-final-stall`), slept 47 times a run before and 15 after, 2 and 0 of
+them on sends to the slow actor: 256 small entries copy quickly, so a worker is seldom descheduled inside the copy. With
+64 actors, split's sends to the others slept 14 times a run against 58 before and 62 for swap. Split's senders find the
+queue empty in the middle of a pull and wake the actor, which before and swap do not. A swap build that wakes it the
+same way matched split, 41 against 131 (`20261116-015344-s1notify-stall`), and its slow actor handled 266 k messages
+against 202 k. That is a scheduling effect, not the lock, and it changes when an actor is woken, so this change does not
+take it.
 
-The `perf` rows of before, swap and split, interleaved, `taskset -c 0-11`, load average 2–4, median (range), ns/msg:
+The `perf` rows of before, swap and split, interleaved, `taskset -c 0-11`, load average 2–4, median (range), ns/msg
+(`20261116-012935-perf2-stall`, and fanout and topic publish `20261116-020039-perf3-stall`):
 
 | Row | before | swap | split |
 |---|---|---|---|
@@ -1736,13 +1739,13 @@ directories are under `target/bench/` on build-1.
 
 What this establishes: on this box, under load, a sender seldom sleeps on a deep mailbox's lock while its owner is
 descheduled: its sends to the slow actor slept 0 or 1 times a run (one of 27 ms), against 43 to 54. In an instrumented
-copy, not committed, waits over 100 µs on an actor's lock went from 74–130 a run to 7–22. The throughput rows moved less
-than their spread, except embedded at +3 %, which c6523fd took back. What it does not establish: the sender's worst
-send and its p99. The sender is one thread, so its worst send is set by the next lock it meets. Sends to the other
-actors still slept up to 18 ms, 10 to 150 times a run, in every build. The instrumented copy put those waits about
-evenly on two locks. One is an actor's own lock, held by a worker descheduled in the few stores of a swap or of the end
-of a turn. The other is the run queue's lock, which a sender takes when it wakes an idle actor. It also does not
-establish anything on the EPYC, whose baseline the gate keeps, or another shape of load.
+copy, not committed (`20261116-014015-instr-stall`), waits over 100 µs on an actor's lock went from 74–130 a run to
+7–22. The throughput rows moved less than their spread, except embedded at +3 %, which c6523fd took back. What it does
+not establish: the sender's worst send and its p99. The sender is one thread, so its worst send is set by the next lock
+it meets. Sends to the other actors still slept up to 18 ms, 10 to 150 times a run, in every build. The instrumented
+copy put those waits about evenly on two locks. One is an actor's own lock, held by a worker descheduled in the few
+stores of a swap or of the end of a turn. The other is the run queue's lock, which a sender takes when it wakes an idle
+actor. It also does not establish anything on the EPYC, whose baseline the gate keeps, or another shape of load.
 
 ### The locks a sender meets
 
