@@ -10,9 +10,10 @@
 #
 # BIN=dir runs the binaries there instead of building; ROUNDS=n overrides every job's rounds (record requires n >= 5);
 # CORES=list overrides pinned jobs' taskset cores; BENCH_HOST names the host in the CSV header; COMMIT names the tree
-# where there is no .git (a box.sh copy). Each run lands in target/bench/<time>-<commit>/: every log with its command,
-# uptime before and after, steal ticks, wall time and exit code; results.csv; compare.txt. On a box others measure on,
-# run it under their lock.
+# where there is no .git (a box.sh copy). For fixture tests (scripts/test-bench.sh), `check-machine` runs only the
+# machine/governor check with optional CPUINFO_FILE and CPUFREQ_DIR overrides. Each run lands in
+# target/bench/<time>-<commit>/: every log with its command, uptime before and after, steal ticks, wall time and exit
+# code; results.csv; compare.txt. On a box others measure on, run it under their lock.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -82,18 +83,16 @@ machine() {
     baseline=scripts/bench/$(tr 'A-Z' 'a-z' <<<"$cpu" | tr -cs 'a-z0-9' '-' | sed 's/-*$//').csv
     [ "$record" ] || [ -f "$baseline" ] || fail "no baseline for $cpu ($baseline): scripts/bench.sh record on an idle box first"
     governor_note=''
-    local governors
+    local governors=''
     if compgen -G "$cpufreq/cpu*/cpufreq/scaling_governor" >/dev/null; then
         governors=$(sort -u "$cpufreq"/cpu*/cpufreq/scaling_governor 2>/dev/null | paste -sd' ' - || true)
-        [ "$governors" = performance ] || fail "governor '${governors:-none}', not performance on every CPU:" \
-            "echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor"
     elif grep -Eq '^flags[[:space:]]*:.*(^|[[:space:]])hypervisor([[:space:]]|$)' "$cpuinfo" 2>/dev/null; then
         governor_note='governor: absent (guest)'
         printf 'note: %s; skipping cpufreq check\n' "$governor_note" >&2
-    else
-        fail "governor 'none', not performance on every CPU (and no hypervisor flag in $cpuinfo):" \
-            "echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor"
     fi
+    [ "$governor_note" ] || [ "$governors" = performance ] ||
+        fail "governor '${governors:-none}', not performance on every CPU:" \
+            "echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor"
 }
 
 steal_ticks() {
@@ -117,7 +116,7 @@ interleave() {
             [ "$r" -le "$rounds" ] || continue
             log=$run/logs/$name.r$r.log
             local pin=()
-            [ "$cores" ] && [ -n "${CORES:-}" ] && cores=$CORES
+            [ "$cores" ] && [ "${CORES:-}" ] && cores=$CORES
             [ "$cores" ] && pin=(taskset -c "$cores")
             steal0=$(steal_ticks)
             printf '# job %s round %s, commit %s\n# cmd: %s%s%s\n# start %s steal=%s uptime: %s\n' "$name" "$r" "$commit" \
@@ -141,8 +140,15 @@ measure() {
     full='' record=''
     [ "${1:-}" = record ] && { record=1; shift; }
     [ "${1:-}" = full ] && { full=1; shift; }
-    if [ "$record" ] && [ -n "${ROUNDS:-}" ]; then
-        [[ "$ROUNDS" =~ ^[0-9]+$ ]] && [ "$ROUNDS" -ge 5 ] || fail "record with ROUNDS requires ROUNDS >= 5"
+    if [ "${ROUNDS:-}" ]; then
+        [[ "$ROUNDS" =~ ^[1-9][0-9]*$ ]] || fail "ROUNDS must be a positive integer (got '$ROUNDS')"
+        [ -z "$record" ] || [ "$ROUNDS" -ge 5 ] || fail "record with ROUNDS requires ROUNDS >= 5"
+    fi
+    if [ "${CORES:-}" ]; then
+        [[ "$CORES" =~ ^[0-9]+([-,][0-9]+)*$ ]] || fail "invalid CORES '$CORES'"
+    fi
+    if [ "${BENCH_HOST:-}" ]; then
+        [[ "$BENCH_HOST" != *$'\n'* && "$BENCH_HOST" != *$'\r'* ]] || fail "invalid BENCH_HOST"
     fi
     local pattern=${1:-.} run load host meta
     machine

@@ -8,6 +8,13 @@ cd "$(dirname "$0")/.."
 t=$(mktemp -d)
 trap 'rm -rf "$t"' EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
+expect_rc() {
+    local want=$1 match=$2 msg=$3 rc=0 out
+    shift 3
+    out=$("$@" 2>&1) || rc=$?
+    [[ $rc == "$want" ]] || fail "$msg (exited $rc, not $want: $out)"
+    [ -z "$match" ] || grep -qF "$match" <<<"$out" || fail "$msg (missing '$match' in: $out)"
+}
 
 # parse: each row's unit and direction, and its values as printed.
 mkdir -p "$t/run/logs"
@@ -21,7 +28,18 @@ sed 's/p99=504.8us/p99=495.2us/' "$t/run/logs/pipeline-w64.r1.log" >"$t/run/logs
 cat >"$t/run/logs/remote_calls.r1.log" <<'EOF'
 sequential request, 256 B: p50 16.972µs  p99 20.288µs  p99.9 23.754µs
   16 concurrent requests:    381056 req/s
+  16 concurrent requests cpu: 13255.0 ns/req (26.510 s cpu)
+  16 shared concurrent requests:    370100 req/s
+  16 shared concurrent requests cpu: 13500.0 ns/req (6.750 s cpu)
+  16 second protocol concurrent requests:    365000 req/s
+  16 second protocol concurrent requests cpu: 13800.0 ns/req (6.900 s cpu)
 tell, 256 B:   4458795 msg/s sent, 4995487 delivered, 4513 dropped
+tell cpu:  1684.0 ns/tell (8.420 s total, 1684.0 ns/sent during send)
+named tell, 256 B:   4300000 msg/s sent, 5000000 delivered, 0 dropped
+named tell cpu:  1720.0 ns/tell (8.600 s total, 1720.0 ns/sent during send)
+second protocol tell, 256 B:   4100000 msg/s sent, 5000000 delivered, 0 dropped
+second protocol tell cpu:  1810.0 ns/tell (9.050 s total, 1810.0 ns/sent during send)
+batches client_tx=1000 server_tx=500 total_tx_frames=20000
 EOF
 cat >"$t/run/logs/fanout.r1.log" <<'EOF'
 batch 16 x 64 B, median of 7
@@ -41,12 +59,22 @@ has 'pipeline-w64,w64,req/s,req/s,higher,6.01151e+06,6011512 6011512'
 has 'pipeline-w64,w64,max,µs,,5603.3,5603.3 5603.3'
 has 'remote_calls,sequential request,p99.9,µs,lower,23.754,23.754'
 has 'remote_calls,16 in flight,throughput,req/s,higher,381056,381056'
+has 'remote_calls,16 in flight,cpu,ns/req,lower,13255,13255.0'
+has 'remote_calls,16 shared in flight,throughput,req/s,higher,370100,370100'
+has 'remote_calls,16 shared in flight,cpu,ns/req,lower,13500,13500.0'
+has 'remote_calls,16 second protocol in flight,throughput,req/s,higher,365000,365000'
+has 'remote_calls,16 second protocol in flight,cpu,ns/req,lower,13800,13800.0'
 has 'remote_calls,tell,sent,msg/s,higher,4.4588e+06,4458795'
+has 'remote_calls,tell,cpu,ns/tell,lower,1684,1684.0'
+has 'remote_calls,named tell,sent,msg/s,higher,4.3e+06,4300000'
+has 'remote_calls,named tell,cpu,ns/tell,lower,1720,1720.0'
+has 'remote_calls,second protocol tell,sent,msg/s,higher,4.1e+06,4100000'
+has 'remote_calls,second protocol tell,cpu,ns/tell,lower,1810,1810.0'
 has 'fanout,fanout 1000 subscribers,cost,ns/record/subscriber,lower,2,2.0'
 has 'fanout,publish replay required,cost,ns/record,lower,10.6,10.6'
 has 'log-roll,"zero-filled, 64 a write",p99.9,µs,lower,3407,3407'
 has 'log-roll,"zero-filled, 64 a write",max,µs,,4194,4194'
-(( $(wc -l <<<"$parsed") == 21 )) || fail "parse: $(wc -l <<<"$parsed") lines, not 21"
+(( $(wc -l <<<"$parsed") == 33 )) || fail "parse: $(wc -l <<<"$parsed") lines, not 33"
 
 cat >"$t/base.csv" <<'EOF'
 # scripts/bench.sh record: fixture
@@ -111,10 +139,8 @@ grep -q '^5 REGRESSION, 1 MISSING, 2 improved, 4 within noise, 1 reported, 1 new
     -e '^scale-nodes' "$t/now.csv"; grep -e '^remote_calls,' -e 'idle, no telemetry' "$t/base.csv"; } >"$t/fine.csv"
 scripts/bench.sh compare "$t/base.csv" "$t/fine.csv" >/dev/null || fail "a run without regressions exited non-zero"
 grep -v '^remote_calls,tell' "$t/fine.csv" >"$t/missing.csv"
-rc=0; scripts/bench.sh compare "$t/base.csv" "$t/missing.csv" >/dev/null || rc=$?
-[[ $rc == 1 ]] || fail "a run with a MISSING row exited $rc, not 1"
-rc=0; scripts/bench.sh compare "$t/base.csv" "$t/nonexistent.csv" >/dev/null 2>&1 || rc=$?
-[[ $rc == 2 ]] || fail "a comparison that cannot run exited $rc, not 2"
+expect_rc 1 "" "a run with a MISSING row" scripts/bench.sh compare "$t/base.csv" "$t/missing.csv"
+expect_rc 2 "" "a comparison that cannot run" scripts/bench.sh compare "$t/base.csv" "$t/nonexistent.csv"
 
 # merge: the jobs the run has replace theirs (remote_calls loses its tell row), the rest stay.
 merged=$(python3 scripts/bench.py merge "$t/base.csv" "$t/now.csv")
@@ -123,23 +149,26 @@ grep -q '^overhead,embedded,timings off,' <<<"$merged" || fail "merge dropped a 
 ! grep -q '^remote_calls,tell' <<<"$merged" || fail "merge kept a row its job no longer prints: $merged"
 (( $(wc -l <<<"$merged") == 15 )) || fail "merge: $(wc -l <<<"$merged") lines, not 15"
 
-# governor check: bare metal needs performance; guest without cpufreq passes only with hypervisor flag.
-mkdir -p "$t/cpu-perf/cpu0/cpufreq" "$t/cpu-save/cpu0/cpufreq" "$t/cpu-none"
+# governor and option validation: bare metal needs performance; guest without cpufreq passes only with hypervisor flag.
+mkdir -p "$t/cpu-perf/cpu0/cpufreq" "$t/cpu-save/cpu0/cpufreq" "$t/cpu-empty/cpu0/cpufreq" "$t/cpu-none"
 printf 'model name\t: Fixture CPU\nflags\t\t: fpu sse avx2\n' >"$t/cpuinfo-bare"
 printf 'model name\t: Fixture CPU\nflags\t\t: fpu sse avx2 hypervisor\n' >"$t/cpuinfo-guest"
 echo performance >"$t/cpu-perf/cpu0/cpufreq/scaling_governor"
 echo powersave >"$t/cpu-save/cpu0/cpufreq/scaling_governor"
+: >"$t/cpu-empty/cpu0/cpufreq/scaling_governor"
 
 CPUINFO_FILE="$t/cpuinfo-bare" CPUFREQ_DIR="$t/cpu-perf" scripts/bench.sh check-machine ||
     fail "bare metal with performance governor failed"
-rc=0; CPUINFO_FILE="$t/cpuinfo-bare" CPUFREQ_DIR="$t/cpu-save" scripts/bench.sh check-machine >/dev/null 2>&1 || rc=$?
-[[ $rc == 2 ]] || fail "bare metal with powersave governor exited $rc, not 2"
-rc=0; CPUINFO_FILE="$t/cpuinfo-bare" CPUFREQ_DIR="$t/cpu-none" scripts/bench.sh check-machine >/dev/null 2>&1 || rc=$?
-[[ $rc == 2 ]] || fail "bare metal with no governor exited $rc, not 2"
-rc=0; CPUINFO_FILE="$t/cpuinfo-guest" CPUFREQ_DIR="$t/cpu-save" scripts/bench.sh check-machine >/dev/null 2>&1 || rc=$?
-[[ $rc == 2 ]] || fail "guest with powersave governor exited $rc, not 2"
+expect_rc 2 "governor 'powersave'" "bare metal with powersave governor" env CPUINFO_FILE="$t/cpuinfo-bare" CPUFREQ_DIR="$t/cpu-save" scripts/bench.sh check-machine
+expect_rc 2 "governor 'none'" "bare metal with no governor" env CPUINFO_FILE="$t/cpuinfo-bare" CPUFREQ_DIR="$t/cpu-none" scripts/bench.sh check-machine
+expect_rc 2 "governor 'powersave'" "guest with powersave governor" env CPUINFO_FILE="$t/cpuinfo-guest" CPUFREQ_DIR="$t/cpu-save" scripts/bench.sh check-machine
+expect_rc 2 "governor 'none'" "guest with empty governor file" env CPUINFO_FILE="$t/cpuinfo-guest" CPUFREQ_DIR="$t/cpu-empty" scripts/bench.sh check-machine
 guest_out=$(CPUINFO_FILE="$t/cpuinfo-guest" CPUFREQ_DIR="$t/cpu-none" scripts/bench.sh check-machine 2>&1) ||
     fail "hypervisor guest without governor failed: $guest_out"
 grep -q 'governor: absent (guest)' <<<"$guest_out" || fail "guest skip note missing: $guest_out"
+
+expect_rc 2 "record with ROUNDS requires ROUNDS >= 5" "record with ROUNDS < 5" env ROUNDS=3 scripts/bench.sh record
+expect_rc 2 "ROUNDS must be a positive integer" "non-numeric ROUNDS" env ROUNDS='1/g;q' scripts/bench.sh
+expect_rc 2 "invalid CORES" "invalid CORES" env CORES='0-7;id' scripts/bench.sh
 
 echo "OK: bench.sh parse, compare, merge, governor"

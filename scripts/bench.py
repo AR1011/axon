@@ -9,8 +9,8 @@ import csv, math, os, re, statistics, sys, traceback
 
 FLOOR = 3.0
 UNITS = {"ns": 1e-9, "µs": 1e-6, "us": 1e-6, "ms": 1e-3, "s": 1.0}
-LOWER = {"ns/msg", "ns/frame", "ns/record", "ns/record/subscriber", "ns/thread", "µs", "µs/batch", "ms", "s", "cores",
-         "B", "MB", "ratio", "leases", "records", "resets"}
+LOWER = {"ns/msg", "ns/frame", "ns/record", "ns/record/subscriber", "ns/thread", "ns/req", "ns/tell", "µs", "µs/batch",
+         "ms", "s", "cores", "B", "MB", "ratio", "leases", "records", "resets"}
 HIGHER = {"req/s", "frames/s", "msg/s", "M calls/s", "M records/s", "/s"}
 FIELDS = ["job", "mode", "metric", "unit", "better", "median", "runs"]
 
@@ -58,11 +58,19 @@ def parse(job, text):
             if m := re.match(r"sequential (\S+), 256 B: p50 (\S+)\s+p99 (\S+)\s+p99.9 (\S+)", l):
                 for k, v in zip(["p50", "p99", "p99.9"], m.groups()[1:]):
                     add(f"sequential {m[1]}", k, dur(v, "us"), "µs")
-            elif m := re.match(r"\s*(\d+) concurrent requests:\s+(\d+)", l):
-                add(f"{m[1]} in flight", "throughput", m[2], "req/s")
-            elif m := re.match(r"tell, 256 B:\s+(\d+) msg/s sent, (\d+) delivered, (\d+) dropped", l):
-                add("tell", "sent", m[1], "msg/s")
-                add("tell", "dropped", m[3], "msgs")
+            elif m := re.match(r"\s*(\d+) (?:(shared|second protocol) )?concurrent requests:\s+(\d+)", l):
+                kind = f"{m[2]} " if m[2] else ""
+                add(f"{m[1]} {kind}in flight", "throughput", m[3], "req/s")
+            elif m := re.match(r"\s*(\d+) (?:(shared|second protocol) )?concurrent requests cpu:\s+([\d.]+) ns/req", l):
+                kind = f"{m[2]} " if m[2] else ""
+                add(f"{m[1]} {kind}in flight", "cpu", m[3], "ns/req")
+            elif m := re.match(r"(?:(named|second protocol) )?tell, 256 B:\s+(\d+) msg/s sent, (\d+) delivered, (\d+) dropped", l):
+                mode = f"{m[1]} tell" if m[1] else "tell"
+                add(mode, "sent", m[2], "msg/s")
+                add(mode, "dropped", m[4], "msgs")
+            elif m := re.match(r"(?:(named|second protocol) )?tell cpu:\s+([\d.]+) ns/tell", l):
+                mode = f"{m[1]} tell" if m[1] else "tell"
+                add(mode, "cpu", m[2], "ns/tell")
     elif job.startswith("quota-check"):
         first = None
         for l in lines:
