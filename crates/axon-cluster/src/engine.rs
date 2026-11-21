@@ -9,6 +9,7 @@
 
 #[cfg(axon_loom)]
 use loom::sync::atomic::AtomicU8;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, btree_map};
 use std::future::Future;
 use std::net::SocketAddr;
@@ -520,7 +521,7 @@ impl Link {
     fn received(&self, meter: Option<&Meter>, frame: &Frame) {
         match meter {
             Some(meter) => meter.received(frame),
-            None => self.meters.received(0, frame),
+            None => self.meters.meter(0).received(frame),
         }
     }
 
@@ -1126,8 +1127,8 @@ impl Engine {
     fn inbound(self: &Arc<Self>, link: &Arc<Link>, frame: Frame) {
         self.counters.inbound.fetch_add(1, Relaxed);
         let (kind, id, peer) = (frame.kind & !(TRACED | DEADLINE | PARTS | BODY), frame.id, link.sender.peer());
-        let meter_protocol = self.protocol_of(frame.protocol);
-        link.meters.received(meter_protocol, &frame);
+        let mut meter = Some(link.meters.get(self.protocol_of(frame.protocol)));
+        meter.as_deref().expect("meter resolved").received(&frame);
         let mut payload = frame.payload;
         let protocol = payload.try_get_u64().ok();
         let trace = (frame.kind & TRACED != 0 && payload.len() >= TraceContext::WIRE_LEN)
@@ -1159,38 +1160,44 @@ impl Engine {
         };
         let core = match kind {
             REQUEST => {
-                let refuse = || {
+                let refuse = |meter: &Meter| {
                     self.counters.refuse(Rejection::Full);
-                    drop(link.meters.try_submit(meter_protocol, &link.sender, end(id, Rejection::Full as u8)));
+                    drop(meter.try_submit(&link.sender, end(id, Rejection::Full as u8)));
                 };
-                let Ok(permit) = self.replies.clone().try_acquire_owned() else { return refuse() };
-                let meter = link.meters.meter(meter_protocol);
+                let Ok(permit) = self.replies.clone().try_acquire_owned() else {
+                    return refuse(meter.as_deref().expect("meter resolved"));
+                };
                 let flow = parts.then(|| Flow::new(window));
                 let body = (frame.kind & BODY != 0).then(|| Flow::new(parts::WINDOW));
-                {
+                let meter = {
                     let (mut producing, mut bodies) = (link.producing.lock(), link.bodies.lock());
                     let full = |list: &BTreeMap<u64, _>, flow: &Option<_>| flow.is_some() && list.len() >= parts::MOST;
                     let taken = |list: &BTreeMap<u64, _>, flow: &Option<_>| flow.is_some() && list.contains_key(&id);
                     if full(&producing, &flow) || full(&bodies, &body) {
                         drop((producing, bodies));
-                        return refuse();
+                        return refuse(meter.as_deref().expect("meter resolved"));
                     }
                     if taken(&producing, &flow) || taken(&bodies, &body) {
                         // The peer reused the id of a reply or a body in parts still under way.
                         drop((producing, bodies));
                         return link.sender.close();
                     }
+                    let meter = meter.take().expect("meter resolved").into_owned();
                     producing.extend(flow.iter().map(|flow| (id, (flow.clone(), meter.clone()))));
                     bodies.extend(body.iter().map(|body| (id, (body.clone(), meter.clone()))));
-                }
+                    meter
+                };
                 let wait = self.cfg.transport.write_timeout;
                 let tokio = self.tokio.clone();
-                let sink = Sink::Remote { link: link.clone(), meter: meter.clone(), id, tokio, wait, parts: flow };
+                let upload = body.map(|body| {
+                    let grants =
+                        Grants { link: link.clone(), meter: meter.clone(), id, tokio: tokio.clone(), wait, body: true };
+                    Upload::new(body, Some(grants), self.cfg.request_timeout)
+                });
+                let sink = Sink::Remote { link: link.clone(), meter, id, tokio, wait, parts: flow };
                 let core = ReplyCore::new(sink, deadline, peer.max_frame, Some(permit));
-                if let Some(body) = body {
-                    let (link, tokio) = (link.clone(), self.tokio.clone());
-                    let grants = Grants { link, meter, id, tokio, wait, body: true };
-                    *core.body.lock() = Some(Upload::new(body, Some(grants), self.cfg.request_timeout));
+                if let Some(upload) = upload {
+                    *core.body.lock() = Some(upload);
                 }
                 Some(core)
             }
@@ -1203,7 +1210,10 @@ impl Engine {
             enter(trace, || self.dispatch(kind, peer, to, payload, core.as_ref()))
         };
         let admitted = match admitted {
-            Ok(Some(wait)) => return self.wait(link, meter_protocol, id, core, deadline, Scoped::new(trace, wait)),
+            Ok(Some(wait)) => {
+                let meter = meter.map(Cow::into_owned);
+                return self.wait(link, meter, id, core, deadline, Scoped::new(trace, wait));
+            }
             admitted => admitted.map(drop),
         };
         match kind {
@@ -1213,7 +1223,7 @@ impl Engine {
                 if let Err(rejection) = admitted {
                     if rejection == Rejection::UnknownActor && frame.protocol >= FIRST_DYNAMIC {
                         let verdict = Frame { protocol: frame.protocol, ..end(id, rejection as u8) };
-                        drop(link.meters.try_submit(meter_protocol, &link.sender, verdict));
+                        drop(meter.as_deref().expect("tell has meter").try_submit(&link.sender, verdict));
                     }
                     self.counters.refuse(rejection);
                     let target = self.registry.read().by_id.get(&frame.protocol).map(|e| e.name.clone());
@@ -1231,7 +1241,7 @@ impl Engine {
                     self.cfg.dead.record(letter, trace);
                 }
             }
-            _ => self.answer(link, meter_protocol, id, core.as_deref(), admitted),
+            _ => self.answer(link, meter.as_deref().map(Arc::as_ref), id, core.as_deref(), admitted),
         }
     }
 
@@ -1249,17 +1259,24 @@ impl Engine {
     }
 
     /// The verdict on a send or a request. If the outbox is full a send's is dropped and the caller times out.
-    fn answer(&self, link: &Link, protocol: u64, id: u64, core: Option<&ReplyCore>, admitted: Result<(), Rejection>) {
+    fn answer(
+        &self,
+        link: &Link,
+        meter: Option<&Meter>,
+        id: u64,
+        core: Option<&ReplyCore>,
+        admitted: Result<(), Rejection>,
+    ) {
         if let Err(rejection) = admitted {
             self.counters.refuse(rejection);
         }
         match core {
             Some(core) => core.settle(admitted),
-            None => drop(link.meters.try_submit(
-                protocol,
-                &link.sender,
-                end(id, admitted.map_or_else(|r| r as u8, |()| ADMITTED)),
-            )),
+            None => drop(
+                meter
+                    .expect("send has meter")
+                    .try_submit(&link.sender, end(id, admitted.map_or_else(|r| r as u8, |()| ADMITTED))),
+            ),
         }
     }
 
@@ -1269,7 +1286,7 @@ impl Engine {
     fn wait(
         self: &Arc<Self>,
         link: &Arc<Link>,
-        protocol: u64,
+        meter: Option<Arc<Meter>>,
         id: u64,
         core: Option<Arc<ReplyCore>>,
         deadline: Option<Instant>,
@@ -1279,7 +1296,7 @@ impl Engine {
             Some(_) => None,
             None => match self.replies.clone().try_acquire_owned() {
                 Ok(permit) => Some(permit),
-                Err(_) => return self.answer(link, protocol, id, None, Err(Rejection::Full)),
+                Err(_) => return self.answer(link, meter.as_deref(), id, None, Err(Rejection::Full)),
             },
         };
         // The link, not only its sender: its meters take the answer before they close.
@@ -1299,7 +1316,7 @@ impl Engine {
             };
             // A send's slot is free before its answer can reach the caller; a request's frees in `finish`.
             drop(permit);
-            engine.answer(&link, protocol, id, core.as_deref(), admitted);
+            engine.answer(&link, meter.as_deref(), id, core.as_deref(), admitted);
         });
     }
 
@@ -2007,7 +2024,8 @@ impl Engine {
         if kind & !DEADLINE == TELL {
             let (link, frame) = self.prepare(target, cache, kind, payload, compress, deadline, trace).await?;
             link.meters
-                .submit(target.protocol, &link.sender, frame, Some(deadline))
+                .get(target.protocol)
+                .submit(&link.sender, frame, Some(deadline))
                 .await
                 .map_err(|e| self.not_sent(target, e.reason))?;
             return Ok(Outcome::End(ADMITTED));
@@ -2029,15 +2047,15 @@ impl Engine {
         trace: Option<TraceContext>,
     ) -> Result<Admitted, CallError> {
         let (link, frame) = self.prepare(target, cache, kind, payload, compress, deadline, trace).await?;
-        let meter = link.meters.meter(target.protocol);
         let ((tx, rx), id) = (oneshot::channel(), frame.id);
-        link.pending.lock().insert(id, (Waiter::One(tx), meter.clone()));
         let every = self.cfg.transport.timing_sample_every as u64;
         // A watch is held open by design: its wait is not a round trip.
         let timed = every != 0 && id.is_multiple_of(every) && target.endpoint != WATCH;
         let admitted = Admitted { rx, entry: Some((link, id, timed.then(Instant::now))) };
         // Sent through the entry, which a refusal or a drop here takes back.
         if let Some((link, ..)) = &admitted.entry {
+            let meter = link.meters.get(target.protocol);
+            link.pending.lock().insert(id, (Waiter::One(tx), Arc::clone(&meter)));
             meter.submit(&link.sender, frame, Some(deadline)).await.map_err(|e| self.not_sent(target, e.reason))?;
         }
         Ok(admitted)
