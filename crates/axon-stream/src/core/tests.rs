@@ -738,6 +738,157 @@ fn a_relay_asks_again_after_the_position_its_stream_closed_at() {
     assert_eq!(starts, vec![StartPosition::After(Cursor { generation: 1, sequence: 33 })]);
 }
 
+/// A change in the view asks a parent that lacked the key again at once, but does not start over the wait before a
+/// node gives up a position no parent holds: a change every 2 s, under `upstream_timeout`, does not hold the reset off.
+#[cfg(feature = "cluster")]
+#[test]
+fn a_change_in_the_view_does_not_start_the_wait_to_give_a_position_up_over() {
+    let mut now = Instant::now();
+    let (o, l) = (PeerId::new("o", 1), PeerId::new("l", 1));
+    let mut origin = origin(&scaled(), 1, 16);
+    let mut leaf = RelayCore::new(&l, AllowAll, CoreConfig { relay: true, ..scaled() }).expect("a valid config");
+    let follower = leaf.subscribe(&key(0), SubscribeOptions::default()).expect("follows");
+    ask(&mut origin, &o, &mut leaf, &l, now);
+    origin.publish(&key(0), vec![Bytes::from_static(b"x")]).expect("publishes");
+    deliver(&mut origin, &o, &mut leaf, &l, now);
+    assert_eq!(records(&mut leaf, follower), vec![17]);
+    let parents = [PeerId::new("p1", 1), PeerId::new("p2", 1)];
+    let statuses = [Status::HistoryUnavailable, Status::UnknownStream];
+    for round in 1..=40 {
+        now += Duration::from_millis(500);
+        if round % 4 == 0 {
+            leaf.membership_changed(now);
+        }
+        for (peer, interest) in leaf.reconcile(&parents[..], now) {
+            let i = parents.iter().position(|p| *p == peer).expect("one of the parents");
+            leaf.interest_result(&peer, interest.revision, Some(vec![statuses[i].into(); interest.wants.len()]), now);
+        }
+    }
+    assert_eq!(leaf.stats().local_resets, 1);
+}
+
+/// Each round, `leaf` asks its `parents` and the one fed by `origin` is answered by it, the others by their `statuses`;
+/// then `origin` delivers what it has. 500 ms a round.
+fn rounds(
+    origin: &mut RelayCore,
+    leaf: &mut RelayCore,
+    parents: &[(PeerId, Status)],
+    now: &mut Instant,
+    n: usize,
+) -> Vec<PeerId> {
+    let (o, l) = (PeerId::new("o", 1), PeerId::new("l", 1));
+    let candidates: Vec<_> = parents.iter().map(|(p, _)| p.clone()).collect();
+    let mut asked = Vec::new();
+    for _ in 0..n {
+        *now += Duration::from_millis(500);
+        for (peer, interest) in leaf.reconcile(&candidates[..], *now) {
+            asked.push(peer.clone());
+            let reply: Reply = match parents.iter().find(|(p, _)| *p == peer) {
+                Some((p, _)) if *p == o => origin.handle_interest(&l, interest.clone(), *now).into(),
+                Some((_, status)) => Some(vec![(*status).into(); interest.wants.len()]).into(),
+                None => panic!("asked {peer:?}, not a parent"),
+            };
+            leaf.interest_result(&peer, interest.revision, reply, *now);
+        }
+        deliver(origin, &o, leaf, &l, *now);
+    }
+    asked
+}
+
+/// A parent that catches a node up holds its position, so a later lack of one waits `upstream_timeout` from then: the
+/// node left with no parent at a position it held through a stretch on such a parent does not reset at once for a lack
+/// of the key it saw before.
+#[test]
+fn a_parent_that_caught_the_node_up_starts_the_wait_to_give_its_position_up_afresh() {
+    let mut now = Instant::now();
+    let (o, l) = (PeerId::new("o", 1), PeerId::new("l", 1));
+    let mut origin = origin(&scaled(), 1, 16);
+    let mut leaf = RelayCore::new(&l, AllowAll, CoreConfig { relay: true, ..scaled() }).expect("a valid config");
+    let follower = leaf.subscribe(&key(0), SubscribeOptions::default()).expect("follows");
+    ask(&mut origin, &o, &mut leaf, &l, now);
+    origin.publish(&key(0), vec![Bytes::from_static(b"x")]).expect("publishes");
+    deliver(&mut origin, &o, &mut leaf, &l, now);
+    assert_eq!(records(&mut leaf, follower), vec![17]);
+    let (r, s) = (PeerId::new("r", 1), PeerId::new("s", 1));
+    let lacking = [(r.clone(), Status::HistoryUnavailable), (s.clone(), Status::UnknownStream)];
+    // 2 s with no parent for 17: r lacks the history, s the key.
+    rounds(&mut origin, &mut leaf, &lacking, &mut now, 4);
+    assert_eq!(leaf.stats().local_resets, 0);
+    // o comes into view and holds 17: it catches the node up and feeds it, with nothing new, for 10 s.
+    let with_o = [lacking[0].clone(), lacking[1].clone(), (o.clone(), Status::Ok)];
+    rounds(&mut origin, &mut leaf, &with_o, &mut now, 20);
+    assert_eq!(leaf.parent_of(&key(0)), Some(&o));
+    // o leaves: the wait runs from now, not from the first lack, 11 s ago.
+    rounds(&mut origin, &mut leaf, &lacking, &mut now, 5);
+    assert_eq!(leaf.stats().local_resets, 0, "within upstream_timeout of o leaving");
+    rounds(&mut origin, &mut leaf, &lacking, &mut now, 4);
+    assert_eq!(leaf.stats().local_resets, 1, "past upstream_timeout of o leaving");
+}
+
+/// A parent asked again long after its last refusal, as in a later lack of the key, is asked again at the first
+/// backoff: strikes from a lack that ended in a reset do not keep it from being asked within `upstream_timeout`.
+#[test]
+fn a_parent_refusing_long_after_its_last_refusal_is_asked_again_at_the_first_backoff() {
+    let mut now = Instant::now();
+    let (o, l) = (PeerId::new("o", 1), PeerId::new("l", 1));
+    let mut origin = origin(&scaled(), 1, 16);
+    let mut leaf = RelayCore::new(&l, AllowAll, CoreConfig { relay: true, ..scaled() }).expect("a valid config");
+    let follower = leaf.subscribe(&key(0), SubscribeOptions::default()).expect("follows");
+    ask(&mut origin, &o, &mut leaf, &l, now);
+    origin.publish(&key(0), vec![Bytes::from_static(b"x")]).expect("publishes");
+    deliver(&mut origin, &o, &mut leaf, &l, now);
+    assert_eq!(records(&mut leaf, follower), vec![17]);
+    let (r, s) = (PeerId::new("r", 1), PeerId::new("s", 1));
+    let lacking = [(r.clone(), Status::HistoryUnavailable), (s.clone(), Status::UnknownStream)];
+    // A first lack: s refuses at 1 s and 3 s, two strikes, and the node gives 17 up.
+    for round in 0.. {
+        assert!(round < 20, "never reset");
+        if leaf.stats().local_resets > 0 {
+            break;
+        }
+        rounds(&mut origin, &mut leaf, &lacking, &mut now, 1);
+    }
+    // o, ranked first, feeds the node for 100 s, past s's longest backoff; s, ranked last, is not asked.
+    let with_o = [(o.clone(), Status::Ok), lacking[0].clone(), lacking[1].clone()];
+    rounds(&mut origin, &mut leaf, &with_o, &mut now, 4);
+    origin.publish(&key(0), vec![Bytes::from_static(b"y")]).expect("publishes");
+    let asked = rounds(&mut origin, &mut leaf, &with_o, &mut now, 196);
+    assert_eq!(leaf.parent_of(&key(0)), Some(&o));
+    assert!(!asked.contains(&s), "s is not asked while o feeds the node");
+    assert_eq!(leaf.cursor(&key(0)), Some(Cursor { generation: 1, sequence: 18 }));
+    // o leaves and s never opens the key: before the node gives 18 up, s is asked again after one retry_refused.
+    let mut asked = Vec::new();
+    for round in 1.. {
+        assert!(round <= 20, "never reset: {asked:?}");
+        let these = rounds(&mut origin, &mut leaf, &lacking, &mut now, 1);
+        if leaf.stats().local_resets > 1 {
+            break;
+        }
+        asked.extend(these.into_iter().map(|p| format!("{round} {}", p.node)));
+    }
+    assert_eq!(asked.iter().filter(|a| a.ends_with(" s")).count(), 2, "{asked:?}");
+}
+
+/// A parent that keeps refusing is asked at a backoff that doubles from `retry_refused`: s refuses at 1 s, 3 s, 7 s and
+/// 15 s, so about 4 times in 30 s, where a backoff that stayed at 2 s would ask it 12 times.
+#[test]
+fn a_parent_that_keeps_refusing_is_asked_at_a_backoff_that_doubles() {
+    let mut now = Instant::now();
+    let (o, l) = (PeerId::new("o", 1), PeerId::new("l", 1));
+    let mut origin = origin(&scaled(), 1, 16);
+    let mut leaf = RelayCore::new(&l, AllowAll, CoreConfig { relay: true, ..scaled() }).expect("a valid config");
+    let follower = leaf.subscribe(&key(0), SubscribeOptions::default()).expect("follows");
+    ask(&mut origin, &o, &mut leaf, &l, now);
+    origin.publish(&key(0), vec![Bytes::from_static(b"x")]).expect("publishes");
+    deliver(&mut origin, &o, &mut leaf, &l, now);
+    assert_eq!(records(&mut leaf, follower), vec![17]);
+    let s = PeerId::new("s", 1);
+    let refusing = [(PeerId::new("u", 1), Status::Unavailable), (s.clone(), Status::UnknownStream)];
+    let asked = rounds(&mut origin, &mut leaf, &refusing, &mut now, 60);
+    let n = asked.iter().filter(|p| **p == s).count();
+    assert!((3..=5).contains(&n), "s asked {n} times: {asked:?}");
+}
+
 /// A node opens a key it relays only in a generation no older than its own: an `open_stream` or an
 /// `open_stream_after` of an older one is refused `GenerationMismatch`, while the relay holds a position in the newer
 /// one and after its parent closed the key, where only its follower holds one. The node goes on relaying, and the

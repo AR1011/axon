@@ -51,7 +51,9 @@ supplies", but no `StreamNodeConfig` field reaches it. Disk history serves only 
   expiry goes first, then the one read from longest ago. Replay beyond the ring is then axon's own, and the World tests
   it.
 - A start behind every relay's ring. A relay refuses it `HistoryUnavailable` (`core.rs:1435-1437`); the child asks its
-  other candidates and waits for one that holds it while any is still appearing (`reconcile`, `core.rs:2176-2190`). The
+  other candidates and waits for one that holds it while any is still appearing, or while one that answers
+  `UnknownStream`, as a source that does not relay does between a close and an open in the same generation, first
+  left it with none for its position less than `upstream_timeout` ago (`reconcile`, `core.rs:2320-2346`). The
   origin must be among the child's candidates (`upstream_for`): the guide says so, and a test holds it. A relay that
   forwards such a start upstream is left open (§ Open).
 - A replay from a source goes through the push window like any branch (`core.rs:1561-1566`): one read is at most what

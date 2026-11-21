@@ -258,15 +258,20 @@ event as a message; see the sources section of the actors guide.
 - **Failback.** When a better parent has been available for `hold_down` (10 s) the child subscribes to it while the
   old one still feeds the stream; overlap is dropped by position, and the old branch is released when the new one
   reports `CaughtUp`. A parent that refuses a stream is retried with exponential backoff from `retry_refused`.
-- **Per-stream fallthrough.** A parent that lacks a stream, or the history a child needs, refuses that stream only;
-  the child asks the next candidate for it. A parent that denies the child `Access::Replay` refuses a start behind
-  its own position as lacking the history (`HistoryUnavailable`), so the child takes the stream live rather than
-  asking for the position again and again. If every candidate lacks the history, and none has appeared for
-  `upstream_timeout` (3 s), counting one that left the view and came back however briefly, the stream rejoins live:
-  local subscribers get `ResetRequired(HistoryUnavailable)`, a `Live` one a new `Ready` when the stream comes back in a
-  newer generation and `ResetRequired(HistoryUnavailable)` when it comes back in the same one, past what the node
-  lost. The wait is for a heal, after which a relay that restarted and took the stream up live can answer before the
-  origin, which holds the history, is back in view.
+- **Per-stream fallthrough.** A parent that lacks a stream, or the history a child needs, refuses that stream only; the
+  child asks the next candidate for it. A parent that denies the child `Access::Replay` refuses a start behind its own
+  position as lacking the history (`HistoryUnavailable`), so the child takes the stream live rather than asking for the
+  position again and again. If every candidate lacks the history or the stream, at least one the history, and for
+  `upstream_timeout` (3 s) none has appeared, counting one that left the view and came back however briefly, and, while
+  one lacks the stream, the node has held its position that long since such a parent first left it with none for it
+  after a parent last caught it up, the stream rejoins live: local subscribers get `ResetRequired(HistoryUnavailable)`,
+  a `Live` one a new `Ready` when the stream comes back in a newer generation and `ResetRequired(HistoryUnavailable)`
+  when it comes back in the same one, past what the node lost. The wait is for a heal, after which a relay that
+  restarted and took the stream up live can answer before the origin, which holds the history, is back in view, and for
+  a source that does not relay, which lacks the stream between a close and an open in the same generation. The node
+  goes on from its position if it asks the source again, at its backoff, within the wait and finds the key open; a
+  backoff that runs past the wait still resets it. A parent that lacks the stream, asked again more than 32 times
+  `retry_refused` after its last refusal ran out, starts its backoff afresh.
 - **A relay that loses its own upstream** for `upstream_timeout` (3 s) ends its downstream branches with
   `UpstreamLost`, so children fail over instead of waiting on a silent link.
 - **Timings per namespace.** `upstream_timeout` and `hold_down` are a key's, in `core.timings` (`RelayTimings`).

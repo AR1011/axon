@@ -1845,3 +1845,75 @@ fn only_a_refused_position_gives_a_held_position_up() {
     assert_eq!(resets([UnknownStream, UnknownStream]), 0, "all unknown");
 }
 
+/// A parent that lacks the key and is asked again well within `upstream_timeout` each time does not hold the reset
+/// off: the wait runs from the first time it left the node with no parent for its position, not from its latest answer.
+#[test]
+fn a_parent_that_lacks_the_key_and_is_asked_often_does_not_hold_a_reset_off() {
+    // Retries well within upstream_timeout: 32 times this is 1.6 s.
+    let often = CoreConfig { retry_refused: Duration::from_millis(50), ..Default::default() };
+    assert_eq!(resets_when_parents_answer(often, [Status::HistoryUnavailable, Status::UnknownStream]), 1);
+}
+
+/// A source that does not relay lacks its key between a close and the open that goes on in the same generation, and
+/// answers `UnknownStream` meanwhile. A node that fell behind its relay's ring, with no change to its parents, waits for
+/// the source as for a parent that just appeared, and goes on from its own position once the key is open again: before,
+/// the relay's `HistoryUnavailable` beside the source's `UnknownStream` reset it at once.
+#[test]
+fn a_node_behind_its_relay_waits_for_a_source_that_opens_its_key_again_in_the_same_generation() {
+    let mut now = Instant::now();
+    // l falls behind r without leaving its parents: a branch of two batches resets it as a slow child.
+    let small = CoreConfig {
+        rings: short_ring(),
+        max_push_items: 2,
+        branch: BranchLimits { max_events: 2, ..BranchLimits::default() },
+        ..Default::default()
+    };
+    let mut cores = Cores::from([
+        ("o", origin(AllowAll, CoreConfig::default())),
+        ("r", node("r", small)),
+        ("l", node("l", CoreConfig::default())),
+    ]);
+    let _held = start(&mut cores, "r", StartPosition::Live);
+    let id = start(&mut cores, "l", StartPosition::Live);
+    let all: Tree = &[("r", &["o"]), ("l", &["r", "o"])];
+    drive(&mut cores, all, &mut now, 6);
+    publish(&mut cores, 3);
+    drive(&mut cores, all, &mut now, 4);
+    assert_eq!(batches(&mut cores.get_mut("l").unwrap().1, id), ["1 1..3"]);
+    assert_eq!(cores["l"].1.parent_of(&key()).map(|p| p.node.to_string()).as_deref(), Some("r"));
+
+    // l stops reading while r takes 4..13, two a round: r's ring holds 10..13 only.
+    for _ in 0..5 {
+        publish(&mut cores, 2);
+        drive(&mut cores, &[("r", &["o"])], &mut now, 1);
+    }
+    // The source closes the key; r, cut from it, never hears of the close and keeps its ring.
+    cores.get_mut("o").unwrap().1.close_stream(&key()).unwrap();
+    let back: Tree = &[("l", &["r", "o"])];
+    for round in 0.. {
+        assert!(round < 10, "l never asked the source");
+        if cores["l"].1.stats().refusals[Status::UnknownStream as usize] > 0 {
+            break;
+        }
+        drive(&mut cores, back, &mut now, 1);
+    }
+    assert!(cores["l"].1.stats().refusals[Status::HistoryUnavailable as usize] > 0, "{:?}", cores["l"].1.stats());
+    // The source opens the key again after its last record, within one backoff of its first refusal.
+    let o = &mut cores.get_mut("o").unwrap().1;
+    o.set_history(key().namespace(), std::sync::Arc::new(Numbered(0)));
+    o.open_stream_after(&key(), Cursor { generation: 1, sequence: 13 }, DeliveryPolicy::ReplayRequired).unwrap();
+    drive(&mut cores, all, &mut now, 10);
+    publish(&mut cores, 2);
+    drive(&mut cores, all, &mut now, 4);
+
+    let followed = drain(&mut cores.get_mut("l").unwrap().1, id);
+    assert!(!followed.iter().any(|e| e.starts_with("ResetRequired")), "{followed:?}");
+    let mut next = 4;
+    for batch in followed.iter().filter(|e| e.starts_with("1 ")) {
+        let (first, last) = batch[2..].split_once("..").expect("a batch");
+        assert_eq!(first.parse::<u64>().unwrap(), next, "{followed:?}");
+        next = last.parse::<u64>().unwrap() + 1;
+    }
+    assert_eq!(next, 16, "every record once, in order: {followed:?}");
+    assert_eq!(cores["l"].1.stats().local_resets, 0);
+}

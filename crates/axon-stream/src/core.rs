@@ -457,6 +457,9 @@ struct Feed {
     lost_told: bool,
     /// When the membership last changed, until a parent refuses the key as unavailable or unknown.
     view_changed: Option<Instant>,
+    /// The position this node held when a parent that lacks the key was first among the refusals that leave it with
+    /// no parent for that position, and when. A reset, a close here or a parent that catches this node up clears it.
+    lacked: Option<(Option<Cursor>, Instant)>,
     /// The earliest of `wants`, which the parents are asked from while this node has no position for the stream.
     wanted_from: StartPosition,
     /// The start each subscription and branch on this node asked for, by id, while it had no position.
@@ -1165,6 +1168,7 @@ impl<A: Authorizer> RelayCore<A> {
         let _ = self.hub.open_relay_stream(&self.local, key, DeliveryPolicy::ReplayRequired);
         let feed = self.feeds.entry(key.clone()).or_default();
         (feed.current, feed.wanted_from, feed.gave_up, feed.generation) = (None, StartPosition::Live, false, 0);
+        feed.lacked = None;
         feed.first = Some(last.map_or(StartPosition::First, StartPosition::After));
         // What the followers parked at the close hold is asked for, so they go on without a gap.
         feed.wants = self.hub.waiting(key).into_iter().collect();
@@ -1962,6 +1966,7 @@ impl<A: Authorizer> RelayCore<A> {
             feed.first = (reason == ResetReason::GenerationChanged).then_some(StartPosition::First);
             feed.wants.clear();
             feed.gave_up = reason == ResetReason::HistoryUnavailable && feed.generation > 0;
+            feed.lacked = None;
         }
         lock(&self.store).remove(key);
         self.wake_key(key);
@@ -1994,7 +1999,9 @@ impl<A: Authorizer> RelayCore<A> {
         } else {
             return;
         }
-        let strikes = feed.refused.get(peer).map_or(0, |r| r.strikes).min(5);
+        // A parent asked again past its longest backoff, as in a later lack of the key, starts its strikes afresh.
+        let recent = |r: &&Refusal| now < r.until + self.cfg.retry_refused * (1 << 5);
+        let strikes = feed.refused.get(peer).filter(recent).map_or(0, |r| r.strikes).min(5);
         // The parent answers from its own view, which may not have the change this node saw yet: its first refusal
         // within a backoff of the change is asked again at once, as a refusal before the change was, without a strike.
         let mended = matches!(status, Status::Unavailable | Status::UnknownStream);
@@ -2144,6 +2151,7 @@ impl<A: Authorizer> RelayCore<A> {
                 }
                 Item::CaughtUp if joining => {
                     let feed = self.feeds.get_mut(&key).expect("looked up above");
+                    feed.lacked = None;
                     let old = std::mem::replace(&mut feed.current, feed.joining.take());
                     self.stats.switches += 1;
                     let old = old.map_or_else(String::new, |l| format!(" from {}", l.peer.node));
@@ -2151,7 +2159,8 @@ impl<A: Authorizer> RelayCore<A> {
                     self.announce(&key);
                     self.touch(&key);
                 }
-                Item::CaughtUp => {}
+                // A parent that caught this node up holds its position: a later lack of one waits from then.
+                Item::CaughtUp => self.feeds.get_mut(&key).expect("looked up above").lacked = None,
                 Item::Reset(ResetReason::GenerationChanged) if current => {
                     self.local_reset(&key, ResetReason::GenerationChanged, now);
                     self.rebranch(&key, &link);
@@ -2319,8 +2328,21 @@ impl<A: Authorizer> RelayCore<A> {
                     let any_position = candidates.iter().any(|p| feed.refused.get(p).is_some_and(position));
                     if any_position && every(&|r| position(r) || (r.until > now && r.status == Status::UnknownStream)) {
                         // Candidates show up one by one: after a heal, a relay that restarted and took the key up live
-                        // can answer before the origin, which holds the history, is back in view.
-                        let newest = candidates.iter().map(|p| self.available_since[p]).max();
+                        // can answer before the origin, which holds the history, is back in view. A source that does not
+                        // relay lacks the key between a close and an open in the same generation: it is waited for from
+                        // when it first left this node so at this position, which its retries and a change in the view
+                        // do not move.
+                        let lacking = candidates
+                            .iter()
+                            .any(|p| feed.refused.get(p).is_some_and(|r| r.status == Status::UnknownStream));
+                        let lacked = lacking.then(|| {
+                            let at = self.hub.cursor(key).ok().flatten();
+                            match feed.lacked {
+                                Some((held, since)) if held == at => since,
+                                _ => feed.lacked.insert((at, now)).1,
+                            }
+                        });
+                        let newest = candidates.iter().map(|p| self.available_since[p]).chain(lacked).max();
                         match newest.map(|since| since + timings.upstream_timeout) {
                             Some(settled) if now < settled => at(settled),
                             _ => broken.push(key.clone()),
