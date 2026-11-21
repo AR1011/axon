@@ -8,7 +8,7 @@ use bytes::Bytes;
 use parking_lot::Mutex;
 use tokio::time::{Instant, sleep_until, timeout_at};
 
-use crate::engine::{Engine, LONGEST, Parts, Target};
+use crate::engine::{Engine, LONGEST, LinkCache, Parts, Target};
 use crate::wire::{REQUEST, SEND, TELL, WireProtocol};
 use crate::{CallError, ClusterError, Placement, Retry, WeakCluster};
 
@@ -18,12 +18,19 @@ pub struct RemoteRef<P> {
     engine: Arc<Engine>,
     target: Target,
     epoch: Option<u64>,
+    link: LinkCache,
     protocol: PhantomData<fn() -> P>,
 }
 
 impl<P> Clone for RemoteRef<P> {
     fn clone(&self) -> Self {
-        Self { engine: self.engine.clone(), target: self.target.clone(), epoch: self.epoch, protocol: PhantomData }
+        Self {
+            engine: self.engine.clone(),
+            target: self.target.clone(),
+            epoch: self.epoch,
+            link: self.link.clone(),
+            protocol: PhantomData,
+        }
     }
 }
 
@@ -36,7 +43,7 @@ impl<P> std::fmt::Debug for RemoteRef<P> {
 impl<P: WireProtocol> RemoteRef<P> {
     /// `target` takes `P`: `Route::target` checked it.
     pub(crate) fn new(engine: Arc<Engine>, target: Target, epoch: Option<u64>) -> Self {
-        Self { engine, target, epoch, protocol: PhantomData }
+        Self { engine, target, epoch, link: LinkCache::default(), protocol: PhantomData }
     }
 
     pub(crate) fn target(&self) -> &Target {
@@ -58,13 +65,13 @@ impl<P: WireProtocol> RemoteRef<P> {
 
     /// Fire and forget: returns once the local outbox has the message.
     pub async fn tell(&self, message: P::Message) -> Result<(), CallError> {
-        self.engine.call(&self.target, TELL, P::encode(message)?).await.map(drop)
+        self.engine.call_opt(&self.target, Some(&self.link), TELL, P::encode(message)?, false, None).await.map(drop)
     }
 
     /// Returns once the destination mailbox admitted the message. A full one refuses it at once with
     /// `Rejected(Full)` rather than waiting, which would hold back every later call to that node.
     pub async fn send(&self, message: P::Message) -> Result<(), CallError> {
-        self.engine.call(&self.target, SEND, P::encode(message)?).await.map(drop)
+        self.engine.call_opt(&self.target, Some(&self.link), SEND, P::encode(message)?, false, None).await.map(drop)
     }
 
     pub async fn request(&self, message: P::Message) -> Result<P::Reply, CallError> {
@@ -101,13 +108,13 @@ impl<P: WireProtocol> RemoteRef<P> {
     /// [`request`](Self::request) gives. Each wait for a part is bounded by `request_timeout`, after which the reader
     /// gets `Timeout` and the far side is stopped. The handler answers with [`Reply::send_parts`](crate::Reply::send_parts).
     pub async fn request_parts(&self, message: P::Message) -> Result<Parts<P>, CallError> {
-        self.engine.call_parts(&self.target, P::encode(message)?, None).await
+        self.engine.call_parts(&self.target, Some(&self.link), P::encode(message)?, None).await
     }
 
     /// [`request_parts`](Self::request_parts) with the whole reply bounded by `within`, which travels as
     /// [`request_within`](Self::request_within)'s does.
     pub async fn request_parts_within(&self, message: P::Message, within: Duration) -> Result<Parts<P>, CallError> {
-        self.engine.call_parts(&self.target, P::encode(message)?, Some(within)).await
+        self.engine.call_parts(&self.target, Some(&self.link), P::encode(message)?, Some(within)).await
     }
 
     /// A request larger than a frame: `message` as for [`request`](Self::request), then its body, the `parts` stream
@@ -123,7 +130,7 @@ impl<P: WireProtocol> RemoteRef<P> {
     where
         S: axon::Stream<Item = Result<Bytes, CallError>>,
     {
-        let body = self.engine.call_upload(&self.target, P::encode(message)?, parts).await?;
+        let body = self.engine.call_upload(&self.target, Some(&self.link), P::encode(message)?, parts).await?;
         P::decode_reply(body.ok_or(CallError::NoReply)?)
     }
 
@@ -135,11 +142,12 @@ impl<P: WireProtocol> RemoteRef<P> {
     where
         S: axon::Stream<Item = Result<Bytes, CallError>> + Send + 'static,
     {
-        self.engine.call_upload_parts(&self.target, P::encode(message)?, parts).await
+        self.engine.call_upload_parts(&self.target, Some(&self.link), P::encode(message)?, parts).await
     }
 
     async fn request_by(&self, message: P::Message, within: Option<Duration>) -> Result<P::Reply, CallError> {
-        let body = self.engine.call_with(&self.target, REQUEST, P::encode(message)?, false, within).await?;
+        let body =
+            self.engine.call_opt(&self.target, Some(&self.link), REQUEST, P::encode(message)?, false, within).await?;
         P::decode_reply(body.ok_or(CallError::NoReply)?)
     }
 }
