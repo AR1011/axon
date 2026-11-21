@@ -1755,7 +1755,7 @@ fn a_node_that_gave_up_a_position_takes_the_next_generation_from_its_record_1() 
 
 /// Two origins share an upstream tier; one carries the key and the other answers `UnknownStream`. When a follower lags
 /// past the carrying origin's ring in the same generation, the `UnknownStream` refusal from the other origin does not
-/// block the local reset (in either rank order), while an `Unavailable` + `UnknownStream` pair never resets.
+/// block the local reset (in either rank order).
 #[test]
 fn a_candidate_answering_unknown_stream_does_not_block_a_history_reset() {
     let cases: [Tree; 2] = [&[("l", &["o2", "o"])], &[("l", &["o", "o2"])]];
@@ -1803,22 +1803,45 @@ fn a_candidate_answering_unknown_stream_does_not_block_a_history_reset() {
         assert!(stats.refusals[Status::HistoryUnavailable as usize] >= 1, "{up:?}: {:?}", stats.refusals);
         assert!(stats.refusals[Status::UnknownStream as usize] >= 1, "{up:?}: {:?}", stats.refusals);
     }
-
-    // Negative check: Unavailable + UnknownStream must not trigger a local reset even after upstream_timeout.
-    let mut now = Instant::now();
-    let mut leaf = core("l");
-    let (p1, p2) = (PeerId::new("p1", 1), PeerId::new("p2", 1));
-    let peers = [p1.clone(), p2.clone()];
-    // Seed available_since first so the settle window has already passed when both refusals are active.
-    let _ = leaf.reconcile(&peers[..], now);
-    now += Duration::from_secs(10);
-    let _id = leaf.subscribe(&key(), SubscribeOptions::default()).unwrap();
-    for (peer, status) in [(&p1, Status::Unavailable), (&p2, Status::UnknownStream)] {
-        let asked = leaf.reconcile(&peers[..], now);
-        let rev = asked.iter().find(|(p, _)| p == peer).expect("asked peer").1.revision;
-        leaf.interest_result(peer, rev, Some(vec![status.into()]), now);
-    }
-    now += Duration::from_millis(100);
-    let _ = leaf.reconcile(&peers[..], now);
-    assert_eq!(leaf.stats().local_resets, 0);
 }
+
+/// The local resets of a node with `cfg` that holds a position, 1..3 from its origin, once its parents become `p1` and
+/// `p2` and answer every ask with these statuses for 20 s, well past `upstream_timeout` and a few backoffs.
+fn resets_when_parents_answer(cfg: CoreConfig, statuses: [Status; 2]) -> u64 {
+    let mut now = Instant::now();
+    let mut cores = Cores::from([("o", origin(AllowAll, CoreConfig::default())), ("l", node("l", cfg))]);
+    let id = start(&mut cores, "l", StartPosition::Live);
+    drive(&mut cores, &[("l", &["o"])], &mut now, 4);
+    publish(&mut cores, 3);
+    drive(&mut cores, &[("l", &["o"])], &mut now, 4);
+    let leaf = &mut cores.get_mut("l").unwrap().1;
+    assert_eq!(batches(leaf, id), ["1 1..3"]);
+    assert_eq!(leaf.cursor(&key()), Some(Cursor { generation: 1, sequence: 3 }));
+    let parents = [PeerId::new("p1", 1), PeerId::new("p2", 1)];
+    let mut asked = [0; 2];
+    for _ in 0..40 {
+        now += Duration::from_millis(500);
+        for (peer, interest) in leaf.reconcile(&parents[..], now) {
+            let i = parents.iter().position(|p| *p == peer).expect("one of the parents");
+            asked[i] += interest.wants.len();
+            leaf.interest_result(&peer, interest.revision, Some(vec![statuses[i].into(); interest.wants.len()]), now);
+        }
+    }
+    assert!(asked.iter().all(|n| *n >= 2), "{statuses:?}: each parent answered more than once: {asked:?}");
+    leaf.stats().local_resets
+}
+
+/// A node gives a position up only when a parent refuses that position: one that lacks the history beside one that
+/// lacks the stream resets it, while parents that are unavailable or lack the stream never do, however long they keep
+/// answering so.
+#[test]
+fn only_a_refused_position_gives_a_held_position_up() {
+    use Status::{HistoryUnavailable, Unavailable, UnknownStream};
+    let resets = |statuses| resets_when_parents_answer(CoreConfig::default(), statuses);
+    assert_eq!(resets([HistoryUnavailable, UnknownStream]), 1);
+    assert_eq!(resets([UnknownStream, HistoryUnavailable]), 1);
+    assert_eq!(resets([Unavailable, UnknownStream]), 0, "unavailable and unknown");
+    assert_eq!(resets([UnknownStream, Unavailable]), 0, "unknown and unavailable");
+    assert_eq!(resets([UnknownStream, UnknownStream]), 0, "all unknown");
+}
+
