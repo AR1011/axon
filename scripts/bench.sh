@@ -8,10 +8,11 @@
 #   scripts/bench.sh build              the harnesses into target/bench/bin, to copy to a box that must not build
 #   scripts/bench.sh compare <base.csv> <now.csv>   the comparison alone
 #
-# BIN=dir runs the binaries there instead of building; ROUNDS=n overrides every job's rounds (not with record); COMMIT
-# names the tree where there is no .git (a box.sh copy). Each run lands in target/bench/<time>-<commit>/: every log
-# with its command, uptime before and after, wall time and exit code; results.csv; compare.txt. On a box others
-# measure on, run it under their lock.
+# BIN=dir runs the binaries there instead of building; ROUNDS=n overrides every job's rounds (record requires n >= 5);
+# CORES=list overrides pinned jobs' taskset cores; BENCH_HOST names the host in the CSV header; COMMIT names the tree
+# where there is no .git (a box.sh copy). Each run lands in target/bench/<time>-<commit>/: every log with its command,
+# uptime before and after, steal ticks, wall time and exit code; results.csv; compare.txt. On a box others measure on,
+# run it under their lock.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -75,14 +76,28 @@ build() {
 }
 
 machine() {
-    cpu=$(sed -n 's/^model name[[:space:]]*: //p' /proc/cpuinfo 2>/dev/null | head -1 || true)
-    [ "$cpu" ] || fail "no /proc/cpuinfo: bench.sh measures on a Linux bench box"
+    local cpuinfo=${CPUINFO_FILE:-/proc/cpuinfo} cpufreq=${CPUFREQ_DIR:-/sys/devices/system/cpu}
+    cpu=$(sed -n 's/^model name[[:space:]]*: //p' "$cpuinfo" 2>/dev/null | head -1 || true)
+    [ "$cpu" ] || fail "no $cpuinfo: bench.sh measures on a Linux bench box"
     baseline=scripts/bench/$(tr 'A-Z' 'a-z' <<<"$cpu" | tr -cs 'a-z0-9' '-' | sed 's/-*$//').csv
     [ "$record" ] || [ -f "$baseline" ] || fail "no baseline for $cpu ($baseline): scripts/bench.sh record on an idle box first"
+    governor_note=''
     local governors
-    governors=$(sort -u /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null | paste -sd' ' - || true)
-    [ "$governors" = performance ] || fail "governor '${governors:-none}', not performance on every CPU:" \
-        "echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor"
+    if compgen -G "$cpufreq/cpu*/cpufreq/scaling_governor" >/dev/null; then
+        governors=$(sort -u "$cpufreq"/cpu*/cpufreq/scaling_governor 2>/dev/null | paste -sd' ' - || true)
+        [ "$governors" = performance ] || fail "governor '${governors:-none}', not performance on every CPU:" \
+            "echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor"
+    elif grep -Eq '^flags[[:space:]]*:.*(^|[[:space:]])hypervisor([[:space:]]|$)' "$cpuinfo" 2>/dev/null; then
+        governor_note='governor: absent (guest)'
+        printf 'note: %s; skipping cpufreq check\n' "$governor_note" >&2
+    else
+        fail "governor 'none', not performance on every CPU (and no hypervisor flag in $cpuinfo):" \
+            "echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor"
+    fi
+}
+
+steal_ticks() {
+    awk '/^cpu / { print $9 + 0; exit }' /proc/stat 2>/dev/null || echo 0
 }
 
 quiet() {
@@ -95,22 +110,25 @@ quiet() {
 }
 
 interleave() {
-    local run=$1 max r name rounds cores envs cmd log s rc failed=0
+    local run=$1 max r name rounds cores envs cmd log s rc steal0 steal1 failed=0
     max=$(cut -d'|' -f2 "$run/jobs.txt" | sort -n | tail -1)
     for r in $(seq 1 "$max"); do
         while IFS='|' read -r name rounds cores envs cmd; do
             [ "$r" -le "$rounds" ] || continue
             log=$run/logs/$name.r$r.log
             local pin=()
+            [ "$cores" ] && [ -n "${CORES:-}" ] && cores=$CORES
             [ "$cores" ] && pin=(taskset -c "$cores")
-            printf '# job %s round %s, commit %s\n# cmd: %s%s%s\n# start %s uptime: %s\n' "$name" "$r" "$commit" \
-                "${envs:+$envs }" "${pin[*]:+${pin[*]} }" "$cmd" "$(date -Is)" "$(uptime)" >"$log"
+            steal0=$(steal_ticks)
+            printf '# job %s round %s, commit %s\n# cmd: %s%s%s\n# start %s steal=%s uptime: %s\n' "$name" "$r" "$commit" \
+                "${envs:+$envs }" "${pin[*]:+${pin[*]} }" "$cmd" "$(date -Is)" "$steal0" "$(uptime)" >"$log"
             s=$(date +%s%N)
             # --foreground keeps the harness in the terminal's process group, so Ctrl-C reaches it.
             # shellcheck disable=SC2086 # the command's words
             (cd "$run" && env $envs "${pin[@]}" timeout --foreground 45m "$bin/"$cmd) >>"$log" 2>&1 </dev/null && rc=0 || rc=$?
-            printf '# end %s rc=%s wall_ms=%s uptime: %s\n' "$(date -Is)" "$rc" $((($(date +%s%N) - s) / 1000000)) \
-                "$(uptime)" >>"$log"
+            steal1=$(steal_ticks)
+            printf '# end %s rc=%s wall_ms=%s steal_delta=%s uptime: %s\n' "$(date -Is)" "$rc" $((($(date +%s%N) - s) / 1000000)) \
+                "$((steal1 - steal0))" "$(uptime)" >>"$log"
             printf '%s r%s %-24s rc=%s\n' "$(date +%T)" "$r" "$name" "$rc"
             [ "$rc" != 130 ] || fail "interrupted"  # timeout exits 130 when Ctrl-C ends the harness
             [ "$rc" = 0 ] || failed=1
@@ -123,8 +141,10 @@ measure() {
     full='' record=''
     [ "${1:-}" = record ] && { record=1; shift; }
     [ "${1:-}" = full ] && { full=1; shift; }
-    [ -z "$record" ] || [ -z "${ROUNDS:-}" ] || fail "record takes each job's own rounds: its bands come from them"
-    local pattern=${1:-.} run load
+    if [ "$record" ] && [ -n "${ROUNDS:-}" ]; then
+        [[ "$ROUNDS" =~ ^[0-9]+$ ]] && [ "$ROUNDS" -ge 5 ] || fail "record with ROUNDS requires ROUNDS >= 5"
+    fi
+    local pattern=${1:-.} run load host meta
     machine
     commit=${COMMIT:-$(git rev-parse --short HEAD 2>/dev/null || echo unknown)}
     bin=${BIN:-}
@@ -142,8 +162,10 @@ measure() {
     python3 scripts/bench.py parse "$run" >"$run/results.csv" || fail "cannot parse $run"
     if [ "$record" ]; then
         mkdir -p scripts/bench
+        host=${BENCH_HOST:-$(hostname)}
+        meta="${governor_note:+, $governor_note}${CORES:+, cores=$CORES}${ROUNDS:+, rounds=$ROUNDS}"
         { grep -s '^#' "$baseline" || true
-          echo "# scripts/bench.sh record $pattern: $cpu, $(hostname), $(uname -r), commit $commit, $(date -Is), before: $load"
+          echo "# scripts/bench.sh record $pattern: $cpu, $host, $(uname -r), commit $commit$meta, $(date -Is), before: $load"
           python3 scripts/bench.py merge "$baseline" "$run/results.csv"; } >"$run/baseline.csv" || fail "cannot merge"
         mv "$run/baseline.csv" "$baseline"
         echo "== recorded $(($(wc -l <"$run/results.csv") - 1)) rows into $baseline"
@@ -157,8 +179,9 @@ measure() {
 }
 
 case ${1:-} in
-    compare) python3 scripts/bench.py compare "${2:?base.csv}" "${3:?now.csv}" ;;
-    build)   build; echo target/bench/bin ;;
-    -*|help) sed -n '/^#   /p' "$0"; exit 2 ;;
-    *)       measure "$@" ;;
+    compare)       python3 scripts/bench.py compare "${2:?base.csv}" "${3:?now.csv}" ;;
+    build)         build; echo target/bench/bin ;;
+    check-machine) record=1; machine ;;
+    -*|help)       sed -n '/^#   /p' "$0"; exit 2 ;;
+    *)             measure "$@" ;;
 esac

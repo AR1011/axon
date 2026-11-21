@@ -1,0 +1,30 @@
+# scripts/bench.sh record ^remote_calls|^loopback: AMD EPYC 9V45 96-Core Processor, epyc-9v45-16c, 7.0.0-1020-azure, commit db69be3, governor: absent (guest), cores=0-7, 2026-11-20T23:24:59+00:00, before:  23:23:06 up  1:07,  2 users,  load average: 0.88, 2.60, 2.31
+job,mode,metric,unit,better,median,runs
+loopback,repeated None,one-way,frames/s,higher,4.2024e+06,4101465 4202401 4187498 4232999 4213718
+loopback,repeated None,echo RTT p50,µs,lower,25.7,27.1 25.7 25.9 25.3 25.2
+loopback,repeated None,echo RTT p99,µs,lower,35.1,35.1 35.3 48.5 32.6 32.7
+loopback,repeated Lz4,one-way,frames/s,higher,3.23489e+06,3234890 3202505 3240595 3222089 3264723
+loopback,repeated Lz4,echo RTT p50,µs,lower,25.7,25.6 26.8 26.0 25.7 25.4
+loopback,repeated Lz4,echo RTT p99,µs,lower,33,32.9 33.7 34.9 33.0 32.3
+loopback,repeated Zstd,one-way,frames/s,higher,734693,734693 730688 732424 745728 742309
+loopback,repeated Zstd,echo RTT p50,µs,lower,27.9,28.9 27.9 27.9 27.4 27.3
+loopback,repeated Zstd,echo RTT p99,µs,lower,36.6,36.6 41.9 36.1 36.9 35.2
+loopback,pseudorandom None,one-way,frames/s,higher,4.18003e+06,4099864 4180028 4211690 4241977 4145594
+loopback,pseudorandom None,echo RTT p50,µs,lower,25.7,26.7 25.7 25.8 25.3 25.3
+loopback,pseudorandom None,echo RTT p99,µs,lower,33.1,34.5 32.6 33.2 32.7 33.1
+loopback,pseudorandom Lz4,one-way,frames/s,higher,1.82415e+06,1842763 1873594 1821816 1824146 1813242
+loopback,pseudorandom Lz4,echo RTT p50,µs,lower,26.3,26.3 25.8 26.7 26.0 26.3
+loopback,pseudorandom Lz4,echo RTT p99,µs,lower,34.8,33.7 33.0 39.8 35.1 34.8
+loopback,pseudorandom Zstd,one-way,frames/s,higher,938687,938687 948301 947819 932324 938465
+loopback,pseudorandom Zstd,echo RTT p50,µs,lower,26.7,26.7 27.0 27.0 26.6 26.6
+loopback,pseudorandom Zstd,echo RTT p99,µs,lower,34.4,33.9 41.3 34.4 34.5 34.3
+remote_calls,sequential request,p50,µs,lower,31.187,30.946 31.187 31.578 31.277 31.116
+remote_calls,sequential request,p99,µs,lower,38.989,38.878 44.628 46.25 38.989 38.187
+remote_calls,sequential request,p99.9,µs,lower,50.886,47.902 81.813 71.337 50.886 46.47
+remote_calls,sequential request_within,p50,µs,lower,31.298,31.717 30.606 31.298 31.187 31.808
+remote_calls,sequential request_within,p99,µs,lower,39.499,40.511 37.577 39.499 38.568 45.819
+remote_calls,sequential request_within,p99.9,µs,lower,49.144,53.941 40.281 49.013 49.144 79.509
+remote_calls,16 in flight,throughput,req/s,higher,266102,266458 260298 264574 266256 266102
+remote_calls,256 in flight,throughput,req/s,higher,834046,834046 833854 818374 845097 846975
+remote_calls,tell,sent,msg/s,higher,2.61072e+06,2632343 2558071 2647564 2575554 2610723
+remote_calls,tell,dropped,msgs,,0,0 5642 6047 0 0

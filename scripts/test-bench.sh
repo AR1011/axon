@@ -122,4 +122,24 @@ grep -qx 'perf-hosted,hosted,hosted,ns/msg,lower,18.0,17.8 18.0 18.4' <<<"$merge
 grep -q '^overhead,embedded,timings off,' <<<"$merged" || fail "merge dropped a job not run: $merged"
 ! grep -q '^remote_calls,tell' <<<"$merged" || fail "merge kept a row its job no longer prints: $merged"
 (( $(wc -l <<<"$merged") == 15 )) || fail "merge: $(wc -l <<<"$merged") lines, not 15"
-echo "OK: bench.sh parse, compare, merge"
+
+# governor check: bare metal needs performance; guest without cpufreq passes only with hypervisor flag.
+mkdir -p "$t/cpu-perf/cpu0/cpufreq" "$t/cpu-save/cpu0/cpufreq" "$t/cpu-none"
+printf 'model name\t: Fixture CPU\nflags\t\t: fpu sse avx2\n' >"$t/cpuinfo-bare"
+printf 'model name\t: Fixture CPU\nflags\t\t: fpu sse avx2 hypervisor\n' >"$t/cpuinfo-guest"
+echo performance >"$t/cpu-perf/cpu0/cpufreq/scaling_governor"
+echo powersave >"$t/cpu-save/cpu0/cpufreq/scaling_governor"
+
+CPUINFO_FILE="$t/cpuinfo-bare" CPUFREQ_DIR="$t/cpu-perf" scripts/bench.sh check-machine ||
+    fail "bare metal with performance governor failed"
+rc=0; CPUINFO_FILE="$t/cpuinfo-bare" CPUFREQ_DIR="$t/cpu-save" scripts/bench.sh check-machine >/dev/null 2>&1 || rc=$?
+[[ $rc == 2 ]] || fail "bare metal with powersave governor exited $rc, not 2"
+rc=0; CPUINFO_FILE="$t/cpuinfo-bare" CPUFREQ_DIR="$t/cpu-none" scripts/bench.sh check-machine >/dev/null 2>&1 || rc=$?
+[[ $rc == 2 ]] || fail "bare metal with no governor exited $rc, not 2"
+rc=0; CPUINFO_FILE="$t/cpuinfo-guest" CPUFREQ_DIR="$t/cpu-save" scripts/bench.sh check-machine >/dev/null 2>&1 || rc=$?
+[[ $rc == 2 ]] || fail "guest with powersave governor exited $rc, not 2"
+guest_out=$(CPUINFO_FILE="$t/cpuinfo-guest" CPUFREQ_DIR="$t/cpu-none" scripts/bench.sh check-machine 2>&1) ||
+    fail "hypervisor guest without governor failed: $guest_out"
+grep -q 'governor: absent (guest)' <<<"$guest_out" || fail "guest skip note missing: $guest_out"
+
+echo "OK: bench.sh parse, compare, merge, governor"
