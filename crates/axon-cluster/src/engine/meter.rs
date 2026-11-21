@@ -60,22 +60,68 @@ pub(crate) struct LinkMeters {
     lane: Lane,
     region: OnceLock<Arc<str>>,
     sender: Sender,
+    /// First non-zero, non-control protocol seen on this link: avoids the map lock and `Arc` clone on steady-state
+    /// frames. The meter also stays in `protocols`, so `Totals::add` still sees it.
+    fast: OnceLock<(u64, Arc<Meter>)>,
     protocols: RwLock<BTreeMap<u64, Arc<Meter>>>,
     book: Arc<Meters>,
     membership: Arc<Membership>,
 }
 
 impl LinkMeters {
+    fn fast(&self, protocol: u64) -> Option<&Arc<Meter>> {
+        self.fast.get().filter(|(cached, _)| *cached == protocol).map(|(_, meter)| meter)
+    }
+
     /// The meter of `protocol` on this link; 0 where the protocol is unknown: a call that has gone, an endpoint that is
     /// not here and was not withdrawn lately, and the verdict on a tell to an endpoint that has gone, at its sender. A
     /// protocol's first frame also looks for the peer's region, so that a link the view named while it was up keeps it.
     pub fn meter(&self, protocol: u64) -> Arc<Meter> {
+        if let Some(meter) = self.fast(protocol) {
+            return meter.clone();
+        }
         // Read-locked on the path every frame takes, so the callers on one link do not queue on each other.
         if let Some(meter) = self.protocols.read().get(&protocol) {
             return meter.clone();
         }
         self.region();
-        self.protocols.write().entry(protocol).or_default().clone()
+        let meter = self.protocols.write().entry(protocol).or_default().clone();
+        if protocol != 0 && protocol != CONTROL_PROTOCOL {
+            let _ = self.fast.set((protocol, meter.clone()));
+        }
+        meter
+    }
+
+    /// Counts a received `frame` under `protocol`, borrowing the fast-slot meter without cloning its `Arc` on hit.
+    pub fn received(&self, protocol: u64, frame: &Frame) {
+        if let Some(meter) = self.fast(protocol) {
+            return meter.received(frame);
+        }
+        self.meter(protocol).received(frame);
+    }
+
+    /// Puts `frame` in `sender`'s outbox now and counts it under `protocol`, without cloning its `Arc` on a fast-slot
+    /// hit.
+    pub fn try_submit(&self, protocol: u64, sender: &Sender, frame: Frame) -> Result<(), SubmitError> {
+        if let Some(meter) = self.fast(protocol) {
+            return meter.try_submit(sender, frame);
+        }
+        self.meter(protocol).try_submit(sender, frame)
+    }
+
+    /// Waits for room in `sender`'s outbox until `deadline` and counts `frame` under `protocol`, without cloning its
+    /// `Arc` on a fast-slot hit.
+    pub async fn submit(
+        &self,
+        protocol: u64,
+        sender: &Sender,
+        frame: Frame,
+        deadline: Option<Instant>,
+    ) -> Result<(), SubmitError> {
+        if let Some(meter) = self.fast(protocol) {
+            return meter.submit(sender, frame, deadline).await;
+        }
+        self.meter(protocol).submit(sender, frame, deadline).await
     }
 
     /// The peer's `region` label, `""` for none, fixed once the view has named the peer.
@@ -140,6 +186,7 @@ impl Meters {
             lane: peer.lane,
             region: OnceLock::new(),
             sender: sender.clone(),
+            fast: OnceLock::new(),
             protocols: RwLock::default(),
             book: self.clone(),
             membership: membership.clone(),
@@ -215,4 +262,131 @@ pub struct LinkMeter {
     pub frame_bytes: u64,
     /// The sessions' bytes after compression, above TLS, without the handshake.
     pub wire_bytes: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use axon_net::{AcceptLimits, Listener, SharedSecret};
+    use bytes::Bytes;
+
+    use super::*;
+    use crate::discovery::{NodeRecord, Snapshot};
+
+    async fn loopback_pair() -> (axon_net::Session, axon_net::Session) {
+        let secret = || SharedSecret::new(*b"0123456789abcdef0123").unwrap();
+        let mut server_cfg = axon_net::Config::new("peer", secret());
+        server_cfg.allow_plaintext = true;
+        let mut client_cfg = axon_net::Config::new("self", secret());
+        client_cfg.allow_plaintext = true;
+        let mut listener =
+            Listener::bind("127.0.0.1:0".parse().unwrap(), None, server_cfg, AcceptLimits::default()).await.unwrap();
+        let addr = listener.local_addr();
+        let (client, server) = tokio::join!(axon_net::connect(addr, Lane::Live, None, &client_cfg), listener.accept());
+        let (client, server) = (client.unwrap(), server.expect("accepted"));
+        listener.close().await;
+        (client, server)
+    }
+
+    fn frame(len: usize) -> Frame {
+        Frame { payload: Bytes::from(vec![7u8; len]), ..Frame::default() }
+    }
+
+    #[tokio::test]
+    async fn fast_slot_keeps_exact_counts_per_protocol_across_open_and_close() {
+        let (client, _server) = loopback_pair().await;
+        let membership = Membership::new(8);
+        let peer = NodeRecord {
+            id: "peer".into(),
+            incarnation: 1,
+            address: "127.0.0.1:1".parse().unwrap(),
+            metadata: BTreeMap::from([("region".into(), "eu-1".into())]),
+            version: 1,
+        };
+        membership.apply(Snapshot { revision: 1, nodes: vec![peer] });
+
+        let meters = Arc::new(Meters::default());
+        let link = meters.open(&client.sender, &membership);
+        let (p1, p2) = (0xA1u64, 0xA2u64);
+
+        // Protocol 0 and control do not claim the fast slot; p1 claims it, and p2 falls back to the map.
+        link.received(0, &frame(10));
+        link.received(CONTROL_PROTOCOL, &frame(20));
+        link.received(p1, &frame(100));
+        link.received(p1, &frame(100));
+        link.try_submit(p1, &client.sender, frame(50)).unwrap();
+        link.submit(p1, &client.sender, frame(70), None).await.unwrap();
+        link.received(p2, &frame(30));
+        link.try_submit(p2, &client.sender, frame(40)).unwrap();
+        link.submit(p2, &client.sender, frame(60), None).await.unwrap();
+        link.submit(CONTROL_PROTOCOL, &client.sender, frame(25), None).await.unwrap();
+
+        assert!(Arc::ptr_eq(&link.meter(p1), &link.meter(p1)));
+        assert!(!Arc::ptr_eq(&link.meter(p1), &link.meter(p2)));
+
+        let check = |when: &str| {
+            let rows: BTreeMap<_, _> = meters
+                .read("us-1")
+                .into_iter()
+                .filter_map(|r| {
+                    Some(((r.src_region, r.dst_region, r.direction, r.protocol?), (r.frames, r.frame_bytes)))
+                })
+                .collect();
+            let h = HEADER_LEN as u64;
+            let got = |dir: &'static str, proto: &str| {
+                let (src, dst) = if dir == "sent" { ("us-1", "eu-1") } else { ("eu-1", "us-1") };
+                rows.get(&(src.into(), dst.into(), dir, proto.into())).copied()
+            };
+            assert_eq!(got("received", "0000000000000000"), Some((1, h + 10)), "{when}");
+            assert_eq!(got("sent", "0000000000000000"), Some((0, 0)), "{when}");
+            assert_eq!(got("received", "axon.control"), Some((1, h + 20)), "{when}");
+            assert_eq!(got("sent", "axon.control"), Some((1, h + 25)), "{when}");
+            assert_eq!(got("received", "00000000000000a1"), Some((2, 2 * (h + 100))), "{when}");
+            assert_eq!(got("sent", "00000000000000a1"), Some((2, 2 * h + 120)), "{when}");
+            assert_eq!(got("received", "00000000000000a2"), Some((1, h + 30)), "{when}");
+            assert_eq!(got("sent", "00000000000000a2"), Some((2, 2 * h + 100)), "{when}");
+        };
+
+        check("while open");
+        link.close();
+        check("after close");
+    }
+
+    #[tokio::test]
+    async fn fast_slot_frames_before_peer_joins_view_are_filed_under_its_region_once_known() {
+        let (client, _server) = loopback_pair().await;
+        let membership = Membership::new(8);
+        let meters = Arc::new(Meters::default());
+        let link = meters.open(&client.sender, &membership);
+        let p1 = 0xB1u64;
+
+        link.received(p1, &frame(80));
+        link.submit(p1, &client.sender, frame(40), None).await.unwrap();
+        assert!(meters.read("us-1").is_empty(), "peer not yet in view");
+
+        let peer = NodeRecord {
+            id: "peer".into(),
+            incarnation: 1,
+            address: "127.0.0.1:1".parse().unwrap(),
+            metadata: BTreeMap::from([("region".into(), "ap-1".into())]),
+            version: 1,
+        };
+        membership.apply(Snapshot { revision: 1, nodes: vec![peer] });
+        // Subsequent fast-slot hit and close both carry the earlier counts under ap-1.
+        link.received(p1, &frame(20));
+        link.close();
+
+        let h = HEADER_LEN as u64;
+        let rows: BTreeMap<_, _> = meters
+            .read("us-1")
+            .into_iter()
+            .filter_map(|r| Some(((r.src_region, r.dst_region, r.direction, r.protocol?), (r.frames, r.frame_bytes))))
+            .collect();
+        assert_eq!(
+            rows.get(&("ap-1".into(), "us-1".into(), "received", "00000000000000b1".into())),
+            Some(&(2, 2 * h + 100))
+        );
+        assert_eq!(rows.get(&("us-1".into(), "ap-1".into(), "sent", "00000000000000b1".into())), Some(&(1, h + 40)));
+    }
 }

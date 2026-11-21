@@ -517,7 +517,7 @@ impl Link {
     fn received(&self, meter: Option<&Meter>, frame: &Frame) {
         match meter {
             Some(meter) => meter.received(frame),
-            None => self.meters.meter(0).received(frame),
+            None => self.meters.received(0, frame),
         }
     }
 
@@ -1074,8 +1074,8 @@ impl Engine {
     fn inbound(self: &Arc<Self>, link: &Arc<Link>, frame: Frame) {
         self.counters.inbound.fetch_add(1, Relaxed);
         let (kind, id, peer) = (frame.kind & !(TRACED | DEADLINE | PARTS | BODY), frame.id, link.sender.peer());
-        let meter = link.meters.meter(self.protocol_of(frame.protocol));
-        meter.received(&frame);
+        let meter_protocol = self.protocol_of(frame.protocol);
+        link.meters.received(meter_protocol, &frame);
         let mut payload = frame.payload;
         let protocol = payload.try_get_u64().ok();
         let trace = (frame.kind & TRACED != 0 && payload.len() >= TraceContext::WIRE_LEN)
@@ -1109,9 +1109,10 @@ impl Engine {
             REQUEST => {
                 let refuse = || {
                     self.counters.refuse(Rejection::Full);
-                    drop(meter.try_submit(&link.sender, end(id, Rejection::Full as u8)));
+                    drop(link.meters.try_submit(meter_protocol, &link.sender, end(id, Rejection::Full as u8)));
                 };
                 let Ok(permit) = self.replies.clone().try_acquire_owned() else { return refuse() };
+                let meter = link.meters.meter(meter_protocol);
                 let flow = parts.then(|| Flow::new(window));
                 let body = (frame.kind & BODY != 0).then(|| Flow::new(parts::WINDOW));
                 {
@@ -1135,7 +1136,7 @@ impl Engine {
                 let sink = Sink::Remote { link: link.clone(), meter: meter.clone(), id, tokio, wait, parts: flow };
                 let core = ReplyCore::new(sink, deadline, peer.max_frame, Some(permit));
                 if let Some(body) = body {
-                    let (link, meter, tokio) = (link.clone(), meter.clone(), self.tokio.clone());
+                    let (link, tokio) = (link.clone(), self.tokio.clone());
                     let grants = Grants { link, meter, id, tokio, wait, body: true };
                     *core.body.lock() = Some(Upload::new(body, Some(grants), self.cfg.request_timeout));
                 }
@@ -1150,7 +1151,7 @@ impl Engine {
             enter(trace, || self.dispatch(kind, peer, to, payload, core.as_ref()))
         };
         let admitted = match admitted {
-            Ok(Some(wait)) => return self.wait(link, meter, id, core, deadline, Scoped::new(trace, wait)),
+            Ok(Some(wait)) => return self.wait(link, meter_protocol, id, core, deadline, Scoped::new(trace, wait)),
             admitted => admitted.map(drop),
         };
         match kind {
@@ -1160,7 +1161,7 @@ impl Engine {
                 if let Err(rejection) = admitted {
                     if rejection == Rejection::UnknownActor && frame.protocol >= FIRST_DYNAMIC {
                         let verdict = Frame { protocol: frame.protocol, ..end(id, rejection as u8) };
-                        drop(meter.try_submit(&link.sender, verdict));
+                        drop(link.meters.try_submit(meter_protocol, &link.sender, verdict));
                     }
                     self.counters.refuse(rejection);
                     let target = self.registry.read().by_id.get(&frame.protocol).map(|e| e.name.clone());
@@ -1178,7 +1179,7 @@ impl Engine {
                     self.cfg.dead.record(letter, trace);
                 }
             }
-            _ => self.answer(&link.sender, &meter, id, core.as_deref(), admitted),
+            _ => self.answer(link, meter_protocol, id, core.as_deref(), admitted),
         }
     }
 
@@ -1196,20 +1197,17 @@ impl Engine {
     }
 
     /// The verdict on a send or a request. If the outbox is full a send's is dropped and the caller times out.
-    fn answer(
-        &self,
-        sender: &Sender,
-        meter: &Meter,
-        id: u64,
-        core: Option<&ReplyCore>,
-        admitted: Result<(), Rejection>,
-    ) {
+    fn answer(&self, link: &Link, protocol: u64, id: u64, core: Option<&ReplyCore>, admitted: Result<(), Rejection>) {
         if let Err(rejection) = admitted {
             self.counters.refuse(rejection);
         }
         match core {
             Some(core) => core.settle(admitted),
-            None => drop(meter.try_submit(sender, end(id, admitted.map_or_else(|r| r as u8, |()| ADMITTED)))),
+            None => drop(link.meters.try_submit(
+                protocol,
+                &link.sender,
+                end(id, admitted.map_or_else(|r| r as u8, |()| ADMITTED)),
+            )),
         }
     }
 
@@ -1219,7 +1217,7 @@ impl Engine {
     fn wait(
         self: &Arc<Self>,
         link: &Arc<Link>,
-        meter: Arc<Meter>,
+        protocol: u64,
         id: u64,
         core: Option<Arc<ReplyCore>>,
         deadline: Option<Instant>,
@@ -1229,7 +1227,7 @@ impl Engine {
             Some(_) => None,
             None => match self.replies.clone().try_acquire_owned() {
                 Ok(permit) => Some(permit),
-                Err(_) => return self.answer(&link.sender, &meter, id, None, Err(Rejection::Full)),
+                Err(_) => return self.answer(link, protocol, id, None, Err(Rejection::Full)),
             },
         };
         // The link, not only its sender: its meters take the answer before they close.
@@ -1249,7 +1247,7 @@ impl Engine {
             };
             // A send's slot is free before its answer can reach the caller; a request's frees in `finish`.
             drop(permit);
-            engine.answer(&link.sender, &meter, id, core.as_deref(), admitted);
+            engine.answer(&link, protocol, id, core.as_deref(), admitted);
         });
     }
 
@@ -1855,8 +1853,8 @@ impl Engine {
         Ok(Admitted { rx, entry: None })
     }
 
-    /// The session to `target`, the meter of its protocol there and the call's frame. `DEADLINE` in `kind` sends the
-    /// time left before `deadline`, and `PARTS` the window.
+    /// The session to `target` and the call's frame. `DEADLINE` in `kind` sends the time left before `deadline`, and
+    /// `PARTS` the window.
     async fn prepare(
         self: &Arc<Self>,
         target: &Target,
@@ -1865,7 +1863,7 @@ impl Engine {
         compress: bool,
         deadline: Instant,
         trace: Option<TraceContext>,
-    ) -> Result<(Arc<Link>, Arc<Meter>, Frame), CallError> {
+    ) -> Result<(Arc<Link>, Frame), CallError> {
         let link = self.link(&target.node, target.lane, deadline).await?;
         if link.sender.peer().identity.incarnation != target.incarnation {
             return Err(CallError::StaleNode);
@@ -1892,8 +1890,7 @@ impl Engine {
             prefix,
             ..Frame::default()
         };
-        let meter = link.meters.meter(target.protocol);
-        Ok((link, meter, frame))
+        Ok((link, frame))
     }
 
     /// A frame the session to `target` refused. One closed under a call because its node left the view is `NoRoute`,
@@ -1921,8 +1918,11 @@ impl Engine {
     ) -> Result<Outcome, CallError> {
         let _permit = self.pending.try_acquire().map_err(|_| CallError::Busy)?;
         if kind & !DEADLINE == TELL {
-            let (link, meter, frame) = self.prepare(target, kind, payload, compress, deadline, trace).await?;
-            meter.submit(&link.sender, frame, Some(deadline)).await.map_err(|e| self.not_sent(target, e.reason))?;
+            let (link, frame) = self.prepare(target, kind, payload, compress, deadline, trace).await?;
+            link.meters
+                .submit(target.protocol, &link.sender, frame, Some(deadline))
+                .await
+                .map_err(|e| self.not_sent(target, e.reason))?;
             return Ok(Outcome::End(ADMITTED));
         }
         let admitted = self.send_request(target, kind, payload, compress, deadline, trace).await?;
@@ -1939,7 +1939,8 @@ impl Engine {
         deadline: Instant,
         trace: Option<TraceContext>,
     ) -> Result<Admitted, CallError> {
-        let (link, meter, frame) = self.prepare(target, kind, payload, compress, deadline, trace).await?;
+        let (link, frame) = self.prepare(target, kind, payload, compress, deadline, trace).await?;
+        let meter = link.meters.meter(target.protocol);
         let ((tx, rx), id) = (oneshot::channel(), frame.id);
         link.pending.lock().insert(id, (Waiter::One(tx), meter.clone()));
         let every = self.cfg.transport.timing_sample_every as u64;
@@ -2029,7 +2030,8 @@ impl Engine {
                 parts
             } else {
                 let kind = REQUEST | PARTS | if within.is_some() { DEADLINE } else { 0 };
-                let (link, meter, frame) = self.prepare(target, kind, body, false, deadline, here).await?;
+                let (link, frame) = self.prepare(target, kind, body, false, deadline, here).await?;
+                let meter = link.meters.meter(target.protocol);
                 let (id, sender) = (frame.id, link.sender.clone());
                 link.pending.lock().insert(id, (Waiter::Parts(flow.clone()), meter.clone()));
                 let (tokio, wait) = (self.tokio.clone(), self.cfg.transport.write_timeout);
@@ -2124,7 +2126,8 @@ impl Engine {
             return Ok(body);
         }
         let kind = REQUEST | BODY | if reply.is_some() { PARTS } else { 0 };
-        let (link, meter, frame) = self.prepare(target, kind, head, false, deadline, here).await?;
+        let (link, frame) = self.prepare(target, kind, head, false, deadline, here).await?;
+        let meter = link.meters.meter(target.protocol);
         let (id, sender, tokio, wait) =
             (frame.id, link.sender.clone(), self.tokio.clone(), self.cfg.transport.write_timeout);
         let one = matches!(waiter, Waiter::One(_));
