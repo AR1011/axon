@@ -1752,3 +1752,73 @@ fn a_node_that_gave_up_a_position_takes_the_next_generation_from_its_record_1() 
     let new: Vec<&str> = batches.iter().map(String::as_str).filter(|b| b.starts_with("2 ")).collect();
     assert_eq!(new, ["2 1..2", "2 3..3"], "{batches:?}");
 }
+
+/// Two origins share an upstream tier; one carries the key and the other answers `UnknownStream`. When a follower lags
+/// past the carrying origin's ring in the same generation, the `UnknownStream` refusal from the other origin does not
+/// block the local reset (in either rank order), while an `Unavailable` + `UnknownStream` pair never resets.
+#[test]
+fn a_candidate_answering_unknown_stream_does_not_block_a_history_reset() {
+    let cases: [Tree; 2] = [&[("l", &["o2", "o"])], &[("l", &["o", "o2"])]];
+    for up in cases {
+        let mut now = Instant::now();
+        let o2 = (
+            1,
+            RelayCore::new(&PeerId::new("o2", 1), AllowAll, CoreConfig { relay: false, ..Default::default() }).unwrap(),
+        );
+        let mut cores = Cores::from([
+            ("o", origin(AllowAll, CoreConfig { rings: short_ring(), ..Default::default() })),
+            ("o2", o2),
+            ("l", node("l", CoreConfig::default())),
+        ]);
+        let id = start(&mut cores, "l", StartPosition::Live);
+        drive(&mut cores, up, &mut now, 6);
+        publish(&mut cores, 3);
+        drive(&mut cores, up, &mut now, 4);
+        assert_eq!(batches(&mut cores.get_mut("l").unwrap().1, id), ["1 1..3"]);
+
+        // Cut l off while o rolls past its 4-record ring in generation 1.
+        drive(&mut cores, &[("l", &[])], &mut now, 1);
+        publish(&mut cores, 10);
+        for round in 0.. {
+            assert!(round < 30, "order {up:?}: l never reset");
+            if cores["l"].1.stats().local_resets > 0 {
+                break;
+            }
+            drive(&mut cores, up, &mut now, 1);
+        }
+        publish(&mut cores, 2);
+        drive(&mut cores, up, &mut now, 6);
+        let after = start(&mut cores, "l", StartPosition::Live);
+        publish(&mut cores, 1);
+        drive(&mut cores, up, &mut now, 4);
+        let followed = drain(&mut cores.get_mut("l").unwrap().1, id);
+        assert_eq!(
+            followed.last().map(String::as_str),
+            Some("ResetRequired(HistoryUnavailable)"),
+            "{up:?}: {followed:?}"
+        );
+        assert_eq!(batches(&mut cores.get_mut("l").unwrap().1, after), ["1 16..16"], "{up:?}");
+        let stats = cores["l"].1.stats();
+        assert_eq!(stats.local_resets, 1, "{up:?}");
+        assert!(stats.refusals[Status::HistoryUnavailable as usize] >= 1, "{up:?}: {:?}", stats.refusals);
+        assert!(stats.refusals[Status::UnknownStream as usize] >= 1, "{up:?}: {:?}", stats.refusals);
+    }
+
+    // Negative check: Unavailable + UnknownStream must not trigger a local reset even after upstream_timeout.
+    let mut now = Instant::now();
+    let mut leaf = core("l");
+    let (p1, p2) = (PeerId::new("p1", 1), PeerId::new("p2", 1));
+    let peers = [p1.clone(), p2.clone()];
+    // Seed available_since first so the settle window has already passed when both refusals are active.
+    let _ = leaf.reconcile(&peers[..], now);
+    now += Duration::from_secs(10);
+    let _id = leaf.subscribe(&key(), SubscribeOptions::default()).unwrap();
+    for (peer, status) in [(&p1, Status::Unavailable), (&p2, Status::UnknownStream)] {
+        let asked = leaf.reconcile(&peers[..], now);
+        let rev = asked.iter().find(|(p, _)| p == peer).expect("asked peer").1.revision;
+        leaf.interest_result(peer, rev, Some(vec![status.into()]), now);
+    }
+    now += Duration::from_millis(100);
+    let _ = leaf.reconcile(&peers[..], now);
+    assert_eq!(leaf.stats().local_resets, 0);
+}

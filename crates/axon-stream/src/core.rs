@@ -2313,9 +2313,11 @@ impl<A: Authorizer> RelayCore<A> {
                 }
                 (Some(_), _) => feed.joining = None,
                 (None, None) => {
-                    if every(&|r| {
+                    let position = |r: &Refusal| {
                         r.until > now && matches!(r.status, Status::HistoryUnavailable | Status::GenerationMismatch)
-                    }) {
+                    };
+                    let any_position = candidates.iter().any(|p| feed.refused.get(p).is_some_and(position));
+                    if any_position && every(&|r| position(r) || (r.until > now && r.status == Status::UnknownStream)) {
                         // Candidates show up one by one: after a heal, a relay that restarted and took the key up live
                         // can answer before the origin, which holds the history, is back in view.
                         let newest = candidates.iter().map(|p| self.available_since[p]).max();

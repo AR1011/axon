@@ -507,3 +507,90 @@ async fn start_refuses_a_namespace_on_control_and_a_push_larger_than_its_lanes_f
     drop((node, cluster));
     system.shutdown().await.unwrap();
 }
+
+/// Two origins share one role; only one opens the key. When a follower lags past that origin's ring in the same
+/// generation, the other origin's `UnknownStream` refusal must not block the local reset: the follower resets and
+/// resumes live on the origin that carries the stream.
+#[tokio::test(flavor = "multi_thread")]
+async fn lagged_follower_resets_when_a_second_origin_does_not_carry_the_stream() {
+    let discovery = MemoryDiscovery::new();
+    let start_node = async |id: &str, role: &str, max_records: usize| {
+        let mut transport = axon_net::Config::new(id, SharedSecret::new(*b"0123456789abcdef0123").unwrap());
+        transport.allow_plaintext = true;
+        let mut cfg = ClusterConfig::new("127.0.0.1:0".parse().unwrap(), transport, discovery.clone());
+        common::short_cluster(&mut cfg);
+        cfg.labels = labels(&[("role", role)]);
+        let system = ActorSystem::builder().build().unwrap();
+        let cluster = Cluster::start(&system, cfg).await.unwrap();
+        let upstream = if role == "origin" { vec![] } else { vec![labels(&[("role", "origin")])] };
+        let mut cfg = StreamNodeConfig::new(upstream);
+        common::short_stream(&mut cfg);
+        cfg.core.rings = vec![RingLimits { namespace: key().namespace().into(), max_records, max_bytes: 1 << 20 }];
+        let stream = StreamNode::start(&cluster, cfg).await.unwrap();
+        Node { stream, cluster, system }
+    };
+
+    let origin_a = start_node("origin-a", "origin", 4).await;
+    let origin_b = start_node("origin-b", "origin", 4).await;
+    let leaf = start_node("leaf", "leaf", 64).await;
+    origin_a.stream.open_stream(&key(), 1, DeliveryPolicy::ReplayRequired).await.unwrap();
+    let publish = |range: std::ops::RangeInclusive<u64>| {
+        for n in range {
+            origin_a.stream.publish(&key(), vec![Bytes::copy_from_slice(&n.to_be_bytes())]).unwrap();
+        }
+    };
+
+    let mut follower = leaf.stream.subscribe(&key(), SubscribeOptions::default()).unwrap();
+    eventually("leaf follows origin-a", || async {
+        leaf.stream.cursor(&key()).is_some() && leaf.stream.parent_of(&key()).as_deref() == Some("origin-a")
+    })
+    .await;
+    publish(1..=3);
+    let mut last = 0;
+    tokio::time::timeout(Duration::from_secs(10), read_to(&mut follower, &mut last, 3)).await.expect("initial records");
+
+    // Hold leaf off origin-a until its downstream branch expires, then roll past the 4-record ring.
+    origin_a.cluster.set_authorizer(Some(Arc::new(NoStreams("leaf"))));
+    eventually("origin-a drops leaf", || async { origin_a.stream.stats().downstream.is_empty() }).await;
+    publish(4..=20);
+    origin_a.cluster.set_authorizer(None);
+
+    let reset = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match follower.next().await.expect("subscription open") {
+                StreamEvent::ResetRequired(reason) => return reason,
+                StreamEvent::Batch(batch) => panic!("unexpected batch after gap: {batch:?}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("leaf resets after ring rollover with second origin up");
+    assert_eq!(reset, ResetReason::HistoryUnavailable);
+
+    // Resubscribe and prove the stream resumes live on origin-a.
+    let mut resumed = leaf.stream.subscribe(&key(), SubscribeOptions::default()).unwrap();
+    eventually("leaf reattaches to origin-a", || async {
+        leaf.stream.parent_of(&key()).as_deref() == Some("origin-a") && leaf.stream.cursor(&key()).is_some()
+    })
+    .await;
+    let mut resume_last = leaf.stream.cursor(&key()).unwrap().sequence;
+    publish(21..=25);
+    tokio::time::timeout(Duration::from_secs(10), read_to(&mut resumed, &mut resume_last, 25))
+        .await
+        .expect("resumed records");
+
+    let stats = leaf.stream.stats();
+    assert!(stats.local_resets >= 1, "expected local_resets >= 1, got {}", stats.local_resets);
+    assert!(
+        stats.refusals[Status::HistoryUnavailable as usize] >= 1,
+        "expected HistoryUnavailable refusal, got {:?}",
+        stats.refusals
+    );
+    assert!(
+        stats.refusals[Status::UnknownStream as usize] >= 1,
+        "expected UnknownStream refusal from origin-b, got {:?}",
+        stats.refusals
+    );
+    assert!(origin_b.stream.cursor(&key()).is_none());
+}
