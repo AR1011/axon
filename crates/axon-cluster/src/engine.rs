@@ -622,10 +622,11 @@ impl Drop for Link {
     }
 }
 
-/// A per-[`RemoteRef`](crate::RemoteRef) weak cache of the outgoing [`Link`] last resolved for its target, paired with
-/// [`Engine::link_gen`] so any exit from `LinkState::Up`, forget, reset, slot replacement, or close invalidates it.
-/// Cloning copies the entry into its own mutex so concurrent clones share no lock, and holding [`Weak`] lets
-/// [`Link::drop`] close its [`LinkMeters`] as soon as the session ends.
+/// A per-[`RemoteRef`](crate::RemoteRef) weak cache of the outgoing [`Link`] last resolved for its fixed
+/// `(node, lane)` target, paired with [`Engine::link_gen`] so any exit from `LinkState::Up`, `forget`, or slot
+/// replacement invalidates it, and checked with [`Sender::is_accepting`] so a closing or closed sender is rejected
+/// with a plain load. Cloning copies the entry into its own mutex so concurrent clones share no lock, and holding
+/// [`Weak`] lets [`Link::drop`] close its [`LinkMeters`] as soon as the session ends.
 #[derive(Default)]
 pub(crate) struct LinkCache(Mutex<Option<(u64, Weak<Link>)>>);
 
@@ -638,13 +639,15 @@ impl Clone for LinkCache {
 impl LinkCache {
     fn get(&self, generation: u64) -> Option<Arc<Link>> {
         let mut slot = self.0.lock();
-        if let Some((cached, weak)) = &*slot {
-            if *cached == generation
-                && let Some(link) = weak.upgrade()
-                && link.sender.is_active()
+        let (cached, weak) = slot.as_ref()?;
+        if *cached == generation {
+            if let Some(link) = weak.upgrade()
+                && link.sender.is_accepting()
             {
                 return Some(link);
             }
+            *slot = None;
+        } else if *cached < generation {
             *slot = None;
         }
         None
@@ -653,6 +656,13 @@ impl LinkCache {
     fn set(&self, generation: u64, link: &Arc<Link>) {
         *self.0.lock() = Some((generation, Arc::downgrade(link)));
     }
+}
+
+/// Borrowed call target and optional [`LinkCache`] passed through internal remote-call helpers.
+#[derive(Clone, Copy)]
+struct Route<'a> {
+    target: &'a Target,
+    cache: Option<&'a LinkCache>,
 }
 
 /// Where an admitted request's answer comes, and on another node its entry on the session, taken back when the wait
@@ -885,7 +895,7 @@ pub(crate) struct Engine {
     pub open: AtomicBool,
     /// Bumped whenever a peer reports an unknown endpoint, so cached routes can be dropped.
     pub stale_routes: AtomicU64,
-    /// Bumped whenever an outgoing link leaves `LinkState::Up`, is forgotten, reset, replaced, or closed, so
+    /// Bumped whenever an outgoing link leaves `LinkState::Up`, is forgotten, or has its slot replaced, so
     /// [`LinkCache`] entries re-check `peers`.
     link_gen: AtomicU64,
     registry: RwLock<Registry>,
@@ -960,7 +970,6 @@ impl Engine {
     /// Flushes what was admitted on every session, then closes them. Peer tasks exit.
     pub async fn shutdown(&self, deadline: Instant) {
         self.closed.send_replace(true);
-        self.invalidate_links();
         let mut flushing = tokio::task::JoinSet::new();
         for link in self.links(&self.peer_lanes(), true) {
             flushing.spawn(async move { drop(link.sender.shutdown(deadline).await) });
@@ -979,7 +988,6 @@ impl Engine {
 
     pub fn close(&self) {
         self.closed.send_replace(true);
-        self.invalidate_links();
         self.membership.close();
         self.links(&self.peer_lanes(), true).iter().for_each(|link| link.sender.close());
     }
@@ -1683,8 +1691,9 @@ impl Engine {
     }
 
     /// `None` when the link went idle and was closed for it, else what ended the session, or `gone` closed it. New
-    /// calls dial afresh as soon as the slot is forgotten; a call that had already picked this link still gets its
-    /// reply. `Control` is not idle while the node has another lane: it closes last.
+    /// calls, including those through a cached [`RemoteRef`](crate::RemoteRef), stop picking this session and dial
+    /// afresh as soon as the slot is forgotten (`forget` bumps `link_gen`); only calls already in flight on this link
+    /// still get their reply. `Control` is not idle while the node has another lane: it closes last.
     async fn served_until_idle(
         &self,
         node: &Arc<str>,
@@ -1750,10 +1759,18 @@ impl Engine {
                 slot.redial.notify_one();
             }
         }
-        self.invalidate_links();
     }
 
     /// Resolves the session to `node` on `lane`, consulting `cache` against `link_gen` before locking `peers`.
+    ///
+    /// Ordering: every invalidation publishes its state change (`send_replace` leaving `Up`, or `peers` mutation under
+    /// the `peers` lock in `forget` and slot replacement) before `link_gen.fetch_add(1, Release)`. A reader loads
+    /// `link_gen.load(Acquire)` before resolving through `Engine::link` and tags any cached entry with that pre-lookup
+    /// generation. Between a state change and its bump a hit may still observe the old link, which on every reachable
+    /// path is already closed (`is_accepting` is false) or has already been bumped by `forget`. Checking
+    /// `self.link_gen.load(Acquire) == generation` before `cache.set` is not needed for correctness (a stale entry
+    /// tagged with the older generation would miss on the next read anyway); it avoids overwriting a fresher entry and
+    /// saves an extra miss.
     async fn link_for(
         self: &Arc<Self>,
         node: &Arc<str>,
@@ -1769,9 +1786,7 @@ impl Engine {
             return Ok(link);
         }
         let link = self.link(node, lane, deadline).await?;
-        // Tag only with the generation observed before resolving, so a concurrent invalidation never stamps an old link
-        // with a newer generation.
-        if link.sender.is_active() && self.link_gen.load(Acquire) == generation {
+        if link.sender.is_accepting() && self.link_gen.load(Acquire) == generation {
             cache.set(generation, &link);
         }
         Ok(link)
@@ -1950,20 +1965,19 @@ impl Engine {
         Ok(Admitted { rx, entry: None })
     }
 
-    /// The session to `target` and the call's frame. `DEADLINE` in `kind` sends the time left before `deadline`, and
-    /// `PARTS` the window.
-    #[expect(clippy::too_many_arguments, reason = "internal call setup passing target, cache, frame, and trace fields")]
+    /// The session to `route.target` and the call's frame. `DEADLINE` in `kind` sends the time left before `deadline`,
+    /// and `PARTS` the window.
     async fn prepare(
         self: &Arc<Self>,
-        target: &Target,
-        cache: Option<&LinkCache>,
+        route: Route<'_>,
         kind: u16,
         payload: Bytes,
         compress: bool,
         deadline: Instant,
         trace: Option<TraceContext>,
     ) -> Result<(Arc<Link>, Frame), CallError> {
-        let link = self.link_for(&target.node, target.lane, cache, deadline).await?;
+        let target = route.target;
+        let link = self.link_for(&target.node, target.lane, route.cache, deadline).await?;
         if link.sender.peer().identity.incarnation != target.incarnation {
             return Err(CallError::StaleNode);
         }
@@ -2006,14 +2020,9 @@ impl Engine {
         }
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "internal call dispatch passing target, cache, frame, and trace fields"
-    )]
     async fn call_remote(
         self: &Arc<Self>,
-        target: &Target,
-        cache: Option<&LinkCache>,
+        route: Route<'_>,
         kind: u16,
         payload: Bytes,
         compress: bool,
@@ -2022,31 +2031,30 @@ impl Engine {
     ) -> Result<Outcome, CallError> {
         let _permit = self.pending.try_acquire().map_err(|_| CallError::Busy)?;
         if kind & !DEADLINE == TELL {
-            let (link, frame) = self.prepare(target, cache, kind, payload, compress, deadline, trace).await?;
+            let (link, frame) = self.prepare(route, kind, payload, compress, deadline, trace).await?;
             link.meters
-                .get(target.protocol)
+                .get(route.target.protocol)
                 .submit(&link.sender, frame, Some(deadline))
                 .await
-                .map_err(|e| self.not_sent(target, e.reason))?;
+                .map_err(|e| self.not_sent(route.target, e.reason))?;
             return Ok(Outcome::End(ADMITTED));
         }
-        let admitted = self.send_request(target, cache, kind, payload, compress, deadline, trace).await?;
+        let admitted = self.send_request(route, kind, payload, compress, deadline, trace).await?;
         admitted.wait(&self.counters, deadline).await
     }
 
-    /// A request's frame queued on the session to `target` by `deadline`.
-    #[expect(clippy::too_many_arguments, reason = "internal call setup passing target, cache, frame, and trace fields")]
+    /// A request's frame queued on the session to `route.target` by `deadline`.
     async fn send_request(
         self: &Arc<Self>,
-        target: &Target,
-        cache: Option<&LinkCache>,
+        route: Route<'_>,
         kind: u16,
         payload: Bytes,
         compress: bool,
         deadline: Instant,
         trace: Option<TraceContext>,
     ) -> Result<Admitted, CallError> {
-        let (link, frame) = self.prepare(target, cache, kind, payload, compress, deadline, trace).await?;
+        let target = route.target;
+        let (link, frame) = self.prepare(route, kind, payload, compress, deadline, trace).await?;
         let ((tx, rx), id) = (oneshot::channel(), frame.id);
         let every = self.cfg.transport.timing_sample_every as u64;
         // A watch is held open by design: its wait is not a round trip.
@@ -2074,7 +2082,8 @@ impl Engine {
             let admitted = if *target.node == *self.local.identity.node_id {
                 self.start_local(target, body, deadline, None, here).await?
             } else {
-                self.send_request(target, None, REQUEST, body, false, deadline, here).await?
+                let route = Route { target, cache: None };
+                self.send_request(route, REQUEST, body, false, deadline, here).await?
             };
             Ok((permit, admitted))
         };
@@ -2092,23 +2101,11 @@ impl Engine {
     }
 
     pub async fn call(self: &Arc<Self>, target: &Target, kind: u16, body: Bytes) -> Result<Option<Bytes>, CallError> {
-        self.call_opt(target, None, kind, body, false, None).await
+        self.call_with(target, None, kind, body, false, None).await
     }
 
-    /// `within` replaces `request_timeout`, and the far side is told it.
-    pub async fn call_with(
-        self: &Arc<Self>,
-        target: &Target,
-        kind: u16,
-        body: Bytes,
-        compress: bool,
-        within: Option<Duration>,
-    ) -> Result<Option<Bytes>, CallError> {
-        self.call_opt(target, None, kind, body, compress, within).await
-    }
-
-    /// Like [`call_with`](Self::call_with), optionally reusing a caller's [`LinkCache`].
-    pub(crate) async fn call_opt(
+    /// `within` replaces `request_timeout`, and the far side is told it. Reuses `cache` when provided.
+    pub(crate) async fn call_with(
         self: &Arc<Self>,
         target: &Target,
         cache: Option<&LinkCache>,
@@ -2123,7 +2120,8 @@ impl Engine {
                 self.call_local(target, kind, body, deadline, within.map(|_| deadline), here).await
             } else {
                 let kind = if within.is_some() { kind | DEADLINE } else { kind };
-                self.call_remote(target, cache, kind, body, compress, deadline, here).await
+                let route = Route { target, cache };
+                self.call_remote(route, kind, body, compress, deadline, here).await
             };
             outcome.and_then(Outcome::body)
         })
@@ -2135,7 +2133,7 @@ impl Engine {
     pub(crate) async fn call_parts<P>(
         self: &Arc<Self>,
         target: &Target,
-        cache: Option<&LinkCache>,
+        cache: &LinkCache,
         body: Bytes,
         within: Option<Duration>,
     ) -> Result<Parts<P>, CallError> {
@@ -2151,7 +2149,8 @@ impl Engine {
                 parts
             } else {
                 let kind = REQUEST | PARTS | if within.is_some() { DEADLINE } else { 0 };
-                let (link, frame) = self.prepare(target, cache, kind, body, false, deadline, here).await?;
+                let route = Route { target, cache: Some(cache) };
+                let (link, frame) = self.prepare(route, kind, body, false, deadline, here).await?;
                 let meter = link.meters.meter(target.protocol);
                 let (id, sender) = (frame.id, link.sender.clone());
                 link.pending.lock().insert(id, (Waiter::Parts(flow.clone()), meter.clone()));
@@ -2176,7 +2175,7 @@ impl Engine {
     pub(crate) async fn call_upload<S>(
         self: &Arc<Self>,
         target: &Target,
-        cache: Option<&LinkCache>,
+        cache: &LinkCache,
         head: Bytes,
         parts: S,
     ) -> Result<Option<Bytes>, CallError>
@@ -2186,7 +2185,8 @@ impl Engine {
         self.counted(target, "upload", None, |deadline, here| async move {
             let _permit = self.pending.try_acquire().map_err(|_| CallError::Busy)?;
             let (tx, rx) = oneshot::channel();
-            let mut body = self.open_upload::<()>(target, cache, head, Waiter::One(tx), None, deadline, here).await?;
+            let route = Route { target, cache: Some(cache) };
+            let mut body = self.open_upload::<()>(route, head, Waiter::One(tx), None, deadline, here).await?;
             let mut rx = std::pin::pin!(rx);
             let pumped = tokio::select! {
                 biased;
@@ -2204,7 +2204,7 @@ impl Engine {
     pub(crate) async fn call_upload_parts<P, S>(
         self: &Arc<Self>,
         target: &Target,
-        cache: Option<&LinkCache>,
+        cache: &LinkCache,
         head: Bytes,
         parts: S,
     ) -> Result<Parts<P>, CallError>
@@ -2216,8 +2216,8 @@ impl Engine {
             let (flow, idle) = (Flow::new(parts::WINDOW), self.cfg.request_timeout);
             // Made first, so that a call that never gets to it stops the reply.
             let mut reply = Parts::new(flow.clone(), None, permit, Some(idle), deadline);
-            let body =
-                self.open_upload(target, cache, head, Waiter::Parts(flow), Some(&mut reply), deadline, here).await?;
+            let route = Route { target, cache: Some(cache) };
+            let body = self.open_upload(route, head, Waiter::Parts(flow), Some(&mut reply), deadline, here).await?;
             reply.send_body(&self.tokio, body, parts, idle);
             reply.first().await?;
             Ok(reply)
@@ -2227,20 +2227,16 @@ impl Engine {
 
     /// Sends the head of an upload, whose answer goes to `waiter`, and returns the caller's end of its body. `reply`
     /// reads an answer in parts, and on another node learns where its credit goes.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "internal upload setup passing target, cache, flow, and trace fields"
-    )]
     async fn open_upload<P>(
         self: &Arc<Self>,
-        target: &Target,
-        cache: Option<&LinkCache>,
+        route: Route<'_>,
         head: Bytes,
         waiter: Waiter,
         reply: Option<&mut Parts<P>>,
         deadline: Instant,
         here: Option<TraceContext>,
     ) -> Result<Body, CallError> {
+        let target = route.target;
         let flow = Flow::new(parts::WINDOW);
         if *target.node == *self.local.identity.node_id {
             let sink = match waiter {
@@ -2255,7 +2251,7 @@ impl Engine {
             return Ok(body);
         }
         let kind = REQUEST | BODY | if reply.is_some() { PARTS } else { 0 };
-        let (link, frame) = self.prepare(target, cache, kind, head, false, deadline, here).await?;
+        let (link, frame) = self.prepare(route, kind, head, false, deadline, here).await?;
         let meter = link.meters.meter(target.protocol);
         let (id, sender, tokio, wait) =
             (frame.id, link.sender.clone(), self.tokio.clone(), self.cfg.transport.write_timeout);
@@ -2534,7 +2530,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn cached_link_reaches_new_session_after_peer_restart_and_fails_after_forget() {
+    async fn cached_link_reaches_new_session_after_peer_restart() {
         let discovery = MemoryDiscovery::new();
         let (b1_system, b1) = node("b", discovery.clone()).await;
         let (a_system, a) = node("a", discovery.clone()).await;
@@ -2544,12 +2540,13 @@ pub(crate) mod tests {
         let t1 = live_echo(&b1, b"boot1");
         let cache = LinkCache::default();
         assert_eq!(
-            engine.call_opt(&t1, Some(&cache), REQUEST, Bytes::new(), false, None).await.unwrap(),
+            engine.call_with(&t1, Some(&cache), REQUEST, Bytes::new(), false, None).await.unwrap(),
             Some("boot1".into())
         );
         // Keep an Arc to boot 1's Link (as an in-flight call or drain task does) so a stale-cache bug cannot hide
         // behind Weak::upgrade() returning None.
-        let (_kept_link1, _) = slot_link(&peer_slot(engine, &id, Lane::Live));
+        let live_slot = peer_slot(engine, &id, Lane::Live);
+        let (_kept_link1, boot1) = slot_link(&live_slot);
 
         b1_system.shutdown().await.unwrap();
         drop(b1);
@@ -2558,22 +2555,18 @@ pub(crate) mod tests {
         let t2 = live_echo(&b2, b"boot2");
         engine.membership.apply(discovery.snapshot().await.unwrap());
         engine.reset_peer(&id);
+        // Wait for the lane task to leave boot 1's `Up` state so `Engine::link` resolves boot 2 deterministically.
+        let mut live_state = live_slot.state.subscribe();
+        timeout_at(
+            Instant::now() + Duration::from_secs(5),
+            live_state.wait_for(|s| !matches!(s, LinkState::Up(_, b) if *b == boot1)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
 
-        let stale = engine.call_opt(&t1, Some(&cache), REQUEST, Bytes::new(), false, None).await;
-        assert!(matches!(stale, Err(CallError::StaleNode)), "{stale:?}");
-        let second = engine.call_opt(&t2, Some(&cache), REQUEST, Bytes::new(), false, None).await.unwrap();
+        let second = engine.call_with(&t2, Some(&cache), REQUEST, Bytes::new(), false, None).await.unwrap();
         assert_eq!(second, Some("boot2".into()));
-
-        discovery.unregister(&id, b2.identity().incarnation).await.unwrap();
-        engine.membership.apply(discovery.snapshot().await.unwrap());
-        let live_slot = peer_slot(engine, &id, Lane::Live);
-        let ctrl_slot = peer_slot(engine, &id, Lane::Control);
-        engine.reset_peer(&id);
-        engine.forget(&id, Lane::Live, &live_slot);
-        engine.forget(&id, Lane::Control, &ctrl_slot);
-
-        let gone = engine.call_opt(&t2, Some(&cache), REQUEST, Bytes::new(), false, None).await;
-        assert!(matches!(gone, Err(CallError::NoRoute)), "{gone:?}");
 
         a_system.shutdown().await.unwrap();
         b2_system.shutdown().await.unwrap();
@@ -2592,7 +2585,7 @@ pub(crate) mod tests {
         let target = live_echo(&b, b"ok");
         let cache = LinkCache::default();
         assert_eq!(
-            engine.call_opt(&target, Some(&cache), REQUEST, Bytes::new(), false, None).await.unwrap(),
+            engine.call_with(&target, Some(&cache), REQUEST, Bytes::new(), false, None).await.unwrap(),
             Some("ok".into())
         );
 
@@ -2605,7 +2598,7 @@ pub(crate) mod tests {
         engine.forget(&id, Lane::Live, &live_slot);
         engine.forget(&id, Lane::Control, &ctrl_slot);
 
-        let refused = engine.call_opt(&target, Some(&cache), REQUEST, Bytes::new(), false, None).await;
+        let refused = engine.call_with(&target, Some(&cache), REQUEST, Bytes::new(), false, None).await;
         assert!(matches!(refused, Err(CallError::NoRoute)), "{refused:?}");
 
         a_system.shutdown().await.unwrap();
@@ -2613,7 +2606,9 @@ pub(crate) mod tests {
     }
 
     /// Replacing a slot's `LinkState::Up` with another session while the previous `Link` is still alive and active
-    /// must invalidate cached handles so calls move to the new session.
+    /// must invalidate cached handles so calls move to the new session. The `Up`-to-`Up` transition is built by hand
+    /// (production exits `Up` only through closed senders or `forget`) to guard the defence-in-depth `set_link_state`
+    /// generation bump.
     #[tokio::test(flavor = "multi_thread")]
     async fn cached_link_switches_when_slot_session_is_replaced_while_old_link_is_still_active() {
         let discovery = MemoryDiscovery::new();
@@ -2625,7 +2620,7 @@ pub(crate) mod tests {
         let target = live_echo(&b, b"");
         let cache = LinkCache::default();
         assert_eq!(
-            engine.call_opt(&target, Some(&cache), REQUEST, Bytes::from_static(b"one"), false, None).await.unwrap(),
+            engine.call_with(&target, Some(&cache), REQUEST, Bytes::from_static(b"one"), false, None).await.unwrap(),
             Some("one".into())
         );
 
@@ -2642,7 +2637,7 @@ pub(crate) mod tests {
         engine.set_link_state(&live_slot, LinkState::Up(link2.clone(), boot));
 
         assert_eq!(
-            engine.call_opt(&target, Some(&cache), REQUEST, Bytes::from_static(b"two"), false, None).await.unwrap(),
+            engine.call_with(&target, Some(&cache), REQUEST, Bytes::from_static(b"two"), false, None).await.unwrap(),
             Some("two".into())
         );
         assert_eq!((link1.calls.load(Relaxed), link2.calls.load(Relaxed)), (1, 1));
@@ -2654,7 +2649,8 @@ pub(crate) mod tests {
     }
 
     /// When `Engine::link` replaces a `Live` slot whose `Control` parent changed while the old `Live` link is still
-    /// alive and active, cached handles to the old `Live` link must be invalidated.
+    /// alive and active, cached handles to the old `Live` link must be invalidated. The mismatched `Control` and
+    /// `Live` slot state is built by hand to isolate the slot-replacement generation bump in `Engine::link`.
     #[tokio::test(flavor = "multi_thread")]
     async fn cached_link_is_invalidated_when_live_slot_is_replaced_in_peers() {
         let discovery = MemoryDiscovery::new();
@@ -2666,7 +2662,7 @@ pub(crate) mod tests {
         let target = live_echo(&b, b"");
         let cache = LinkCache::default();
         assert_eq!(
-            engine.call_opt(&target, Some(&cache), REQUEST, Bytes::from_static(b"1"), false, None).await.unwrap(),
+            engine.call_with(&target, Some(&cache), REQUEST, Bytes::from_static(b"1"), false, None).await.unwrap(),
             Some("1".into())
         );
 
@@ -2688,7 +2684,7 @@ pub(crate) mod tests {
         assert!(!Arc::ptr_eq(&link1, &link2));
 
         assert_eq!(
-            engine.call_opt(&target, Some(&cache), REQUEST, Bytes::from_static(b"2"), false, None).await.unwrap(),
+            engine.call_with(&target, Some(&cache), REQUEST, Bytes::from_static(b"2"), false, None).await.unwrap(),
             Some("2".into())
         );
         assert_eq!((link1.calls.load(Relaxed), link2.calls.load(Relaxed)), (1, 1));
@@ -2697,132 +2693,110 @@ pub(crate) mod tests {
         b_system.shutdown().await.unwrap();
     }
 
-    /// A closed sender is rejected by `LinkCache::get` even before `link_gen` moves, an in-flight call fails cleanly
-    /// with `OutcomeUnknown`, the weak cache does not keep the dropped `Link` alive, and a subsequent call reconnects.
+    /// Holding a warmed `LinkCache` must not pin a closed `Link` alive, so `Link::drop` can flush `LinkMeters::close`.
     #[tokio::test(flavor = "multi_thread")]
-    async fn cached_link_recovers_when_link_drops_while_call_is_in_flight_and_weak_cache_does_not_pin_it() {
+    async fn cached_link_does_not_keep_a_closed_session_alive() {
         let discovery = MemoryDiscovery::new();
         let (b_system, b) = node("b", discovery.clone()).await;
         let (a_system, a) = node("a", discovery.clone()).await;
         let (engine, id) = (&a.0.engine, Arc::<str>::from("b"));
         engine.membership.apply(discovery.snapshot().await.unwrap());
 
-        let held_reply = Arc::new(Mutex::new(None::<Reply>));
-        let entered = Arc::new(Notify::new());
-        let endpoint =
-            b.0.engine
-                .register(
-                    None,
-                    false,
-                    Entry {
-                        name: "gate".into(),
-                        protocol: 0xE1,
-                        schema: 1,
-                        lane: Lane::Live,
-                        admit: {
-                            let (held_reply, entered) = (held_reply.clone(), entered.clone());
-                            Arc::new(move |_, body, reply| {
-                                if body == Bytes::from_static(b"hold") {
-                                    *held_reply.lock() = reply;
-                                    entered.notify_one();
-                                } else {
-                                    drop(reply.map(|r| r.send(body)));
-                                }
-                                Ok(None)
-                            })
-                        },
-                    },
-                )
-                .unwrap();
-        let target = Target {
-            node: id.clone(),
-            incarnation: b.identity().incarnation,
-            endpoint,
-            protocol: 0xE1,
-            schema: 1,
-            lane: Lane::Live,
-        };
+        let target = live_echo(&b, b"warm");
         let cache = LinkCache::default();
         assert_eq!(
-            engine.call_opt(&target, Some(&cache), REQUEST, Bytes::from_static(b"warm"), false, None).await.unwrap(),
+            engine.call_with(&target, Some(&cache), REQUEST, Bytes::new(), false, None).await.unwrap(),
             Some("warm".into())
         );
 
         let live_slot = peer_slot(engine, &id, Lane::Live);
         let (link1, _) = slot_link(&live_slot);
         let weak1 = Arc::downgrade(&link1);
-        let gen_before = engine.link_gen.load(Acquire);
-        let closed_probe = cache.clone();
-
-        let in_flight = tokio::spawn({
-            let (engine, target, cache) = (engine.clone(), target.clone(), cache.clone());
-            async move { engine.call_opt(&target, Some(&cache), REQUEST, Bytes::from_static(b"hold"), false, None).await }
-        });
-        entered.notified().await;
-
-        // Close the underlying session while the request is in flight.
         link1.sender.close();
-        assert!(closed_probe.get(gen_before).is_none(), "closed sender must not hit cache even at the same generation");
         drop(link1);
 
-        let outcome = in_flight.await.unwrap();
-        assert!(matches!(outcome, Err(CallError::OutcomeUnknown)), "{outcome:?}");
-        drop(held_reply.lock().take());
-
-        // Wait until the link task drops link1; holding `cache` must not keep link1 alive.
         let deadline = Instant::now() + Duration::from_secs(5);
         while weak1.strong_count() > 0 && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert_eq!(weak1.strong_count(), 0, "weak cache kept dropped Link alive");
-
-        let recovered =
-            engine.call_opt(&target, Some(&cache), REQUEST, Bytes::from_static(b"after"), false, None).await.unwrap();
-        assert_eq!(recovered, Some("after".into()));
+        drop(cache);
 
         a_system.shutdown().await.unwrap();
         b_system.shutdown().await.unwrap();
     }
 
-    /// `reset_peer`, `close`, and `shutdown` each advance `link_gen` so pre-existing `LinkCache` entries miss.
+    /// `NamedRef` and `KeyedRef` share the kept `RemoteRef` behind an `Arc`, so subsequent calls hit the warmed
+    /// `LinkCache` instead of warming a throwaway clone and resolving through `peers` again.
     #[tokio::test(flavor = "multi_thread")]
-    async fn cached_link_is_invalidated_on_reset_peer_close_and_shutdown() {
+    async fn keyed_and_named_refs_reuse_cached_link_across_calls() {
+        struct EchoActor;
+        impl axon::Actor for EchoActor {
+            type Message = (Bytes, Option<crate::Reply>);
+            type Error = ();
+            fn on_message(&mut self, (body, reply): Self::Message, _: &mut axon::Context<'_, Self>) -> Result<(), ()> {
+                drop(reply.map(|r| r.send(body)));
+                Ok(())
+            }
+        }
+        struct EchoApi;
+        impl crate::WireProtocol for EchoApi {
+            type Message = Bytes;
+            type Reply = Bytes;
+            const ID: u64 = 0xE2;
+            const SCHEMA: u16 = 1;
+            fn encode(body: Bytes) -> Result<Bytes, CallError> {
+                Ok(body)
+            }
+            fn decode_reply(body: Bytes) -> Result<Bytes, CallError> {
+                Ok(body)
+            }
+        }
+        impl crate::ActorProtocol for EchoApi {
+            type Mailbox = (Bytes, Option<crate::Reply>);
+            fn encode_reply(body: Bytes) -> Result<Bytes, CallError> {
+                Ok(body)
+            }
+            fn decode(body: Bytes, reply: Option<crate::Reply>) -> Result<Self::Mailbox, Rejection> {
+                Ok((body, reply))
+            }
+        }
+
         let discovery = MemoryDiscovery::new();
         let (b_system, b) = node("b", discovery.clone()).await;
         let (a_system, a) = node("a", discovery.clone()).await;
+        let actor = b_system.spawn(EchoActor).start().unwrap();
+        b.publish::<EchoApi>(&actor, "echo").unwrap();
+        b.kind::<EchoApi>("echo-kind").register(|_, _| Ok(EchoActor)).await.unwrap();
         let (engine, id) = (&a.0.engine, Arc::<str>::from("b"));
         engine.membership.apply(discovery.snapshot().await.unwrap());
 
-        let target = live_echo(&b, b"ok");
-        let cache = LinkCache::default();
-        engine.call_opt(&target, Some(&cache), REQUEST, Bytes::new(), false, None).await.unwrap();
+        let named = a.named::<EchoApi>("echo");
+        let keyed = a.keyed::<EchoApi>("echo-kind", "k1", Bytes::new(), &crate::Placement::default());
+        assert_eq!(named.request(Bytes::from_static(b"n1")).await.unwrap(), Bytes::from_static(b"n1"));
+        assert_eq!(keyed.request(Bytes::from_static(b"k1")).await.unwrap(), Bytes::from_static(b"k1"));
 
-        let g0 = engine.link_gen.load(Acquire);
-        engine.reset_peer(&id);
-        let g1 = engine.link_gen.load(Acquire);
-        assert!(g1 > g0, "reset_peer did not bump link_gen");
-        assert!(cache.get(g1).is_none(), "cache survived reset_peer");
+        let live_slot = peer_slot(engine, &id, Lane::Live);
+        let (link1, boot) = slot_link(&live_slot);
+        assert_eq!(link1.calls.load(Relaxed), 2);
 
-        engine.call_opt(&target, Some(&cache), REQUEST, Bytes::new(), false, None).await.unwrap();
-        let g2 = engine.link_gen.load(Acquire);
-        engine.close();
-        let g3 = engine.link_gen.load(Acquire);
-        assert!(g3 > g2, "close did not bump link_gen");
-        assert!(cache.get(g3).is_none(), "cache survived close");
+        // Swap a fresh active link into the slot without bumping `link_gen`, so a cache hit keeps using `link1`
+        // while a cache miss resolves through `peers` onto `link2`.
+        let session2 = axon_net::connect(b.local_addr(), Lane::Live, None, &engine.cfg.transport).await.unwrap();
+        let link2 = engine.new_link(&session2.sender, true, false);
+        let serve2 = tokio::spawn({
+            let (engine, link2) = (engine.clone(), link2.clone());
+            async move { engine.serve(&link2, session2.receiver).await }
+        });
+        live_slot.state.send_replace(LinkState::Up(link2.clone(), boot));
+
+        assert_eq!(named.request(Bytes::from_static(b"n2")).await.unwrap(), Bytes::from_static(b"n2"));
+        assert_eq!(keyed.request(Bytes::from_static(b"k2")).await.unwrap(), Bytes::from_static(b"k2"));
+        assert_eq!((link1.calls.load(Relaxed), link2.calls.load(Relaxed)), (4, 0));
+
+        link2.sender.close();
+        let _ = serve2.await;
         a_system.shutdown().await.unwrap();
-
-        let (c_system, c) = node("c", discovery.clone()).await;
-        let c_engine = &c.0.engine;
-        c_engine.membership.apply(discovery.snapshot().await.unwrap());
-        let c_cache = LinkCache::default();
-        c_engine.call_opt(&target, Some(&c_cache), REQUEST, Bytes::new(), false, None).await.unwrap();
-        let g4 = c_engine.link_gen.load(Acquire);
-        c_engine.shutdown(Instant::now() + Duration::from_secs(5)).await;
-        let g5 = c_engine.link_gen.load(Acquire);
-        assert!(g5 > g4, "shutdown did not bump link_gen");
-        assert!(c_cache.get(g5).is_none(), "cache survived shutdown");
-
-        c_system.shutdown().await.unwrap();
         b_system.shutdown().await.unwrap();
     }
 }

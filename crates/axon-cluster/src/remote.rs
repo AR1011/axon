@@ -65,13 +65,13 @@ impl<P: WireProtocol> RemoteRef<P> {
 
     /// Fire and forget: returns once the local outbox has the message.
     pub async fn tell(&self, message: P::Message) -> Result<(), CallError> {
-        self.engine.call_opt(&self.target, Some(&self.link), TELL, P::encode(message)?, false, None).await.map(drop)
+        self.engine.call_with(&self.target, Some(&self.link), TELL, P::encode(message)?, false, None).await.map(drop)
     }
 
     /// Returns once the destination mailbox admitted the message. A full one refuses it at once with
     /// `Rejected(Full)` rather than waiting, which would hold back every later call to that node.
     pub async fn send(&self, message: P::Message) -> Result<(), CallError> {
-        self.engine.call_opt(&self.target, Some(&self.link), SEND, P::encode(message)?, false, None).await.map(drop)
+        self.engine.call_with(&self.target, Some(&self.link), SEND, P::encode(message)?, false, None).await.map(drop)
     }
 
     pub async fn request(&self, message: P::Message) -> Result<P::Reply, CallError> {
@@ -108,13 +108,13 @@ impl<P: WireProtocol> RemoteRef<P> {
     /// [`request`](Self::request) gives. Each wait for a part is bounded by `request_timeout`, after which the reader
     /// gets `Timeout` and the far side is stopped. The handler answers with [`Reply::send_parts`](crate::Reply::send_parts).
     pub async fn request_parts(&self, message: P::Message) -> Result<Parts<P>, CallError> {
-        self.engine.call_parts(&self.target, Some(&self.link), P::encode(message)?, None).await
+        self.engine.call_parts(&self.target, &self.link, P::encode(message)?, None).await
     }
 
     /// [`request_parts`](Self::request_parts) with the whole reply bounded by `within`, which travels as
     /// [`request_within`](Self::request_within)'s does.
     pub async fn request_parts_within(&self, message: P::Message, within: Duration) -> Result<Parts<P>, CallError> {
-        self.engine.call_parts(&self.target, Some(&self.link), P::encode(message)?, Some(within)).await
+        self.engine.call_parts(&self.target, &self.link, P::encode(message)?, Some(within)).await
     }
 
     /// A request larger than a frame: `message` as for [`request`](Self::request), then its body, the `parts` stream
@@ -130,7 +130,7 @@ impl<P: WireProtocol> RemoteRef<P> {
     where
         S: axon::Stream<Item = Result<Bytes, CallError>>,
     {
-        let body = self.engine.call_upload(&self.target, Some(&self.link), P::encode(message)?, parts).await?;
+        let body = self.engine.call_upload(&self.target, &self.link, P::encode(message)?, parts).await?;
         P::decode_reply(body.ok_or(CallError::NoReply)?)
     }
 
@@ -142,12 +142,12 @@ impl<P: WireProtocol> RemoteRef<P> {
     where
         S: axon::Stream<Item = Result<Bytes, CallError>> + Send + 'static,
     {
-        self.engine.call_upload_parts(&self.target, Some(&self.link), P::encode(message)?, parts).await
+        self.engine.call_upload_parts(&self.target, &self.link, P::encode(message)?, parts).await
     }
 
     async fn request_by(&self, message: P::Message, within: Option<Duration>) -> Result<P::Reply, CallError> {
         let body =
-            self.engine.call_opt(&self.target, Some(&self.link), REQUEST, P::encode(message)?, false, within).await?;
+            self.engine.call_with(&self.target, Some(&self.link), REQUEST, P::encode(message)?, false, within).await?;
         P::decode_reply(body.ok_or(CallError::NoReply)?)
     }
 }
@@ -255,7 +255,9 @@ pub struct NamedRef<P>(Arc<Follow<P>>);
 struct Follow<P> {
     cluster: WeakCluster,
     lookup: Lookup,
-    current: Mutex<Option<RemoteRef<P>>>,
+    /// Shared behind an `Arc` so callers warm and reuse the kept [`RemoteRef`]'s link cache instead of warming a
+    /// throwaway clone on every call.
+    current: Mutex<Option<Arc<RemoteRef<P>>>>,
 }
 
 enum Lookup {
@@ -280,7 +282,7 @@ impl<P: WireProtocol> KeyedRef<P> {
 
     /// The epoch of the reference it keeps, when keyed actors are strictly owned.
     pub fn epoch(&self) -> Option<u64> {
-        self.0.current.lock().as_ref().and_then(RemoteRef::epoch)
+        self.0.current.lock().as_ref().and_then(|r| r.epoch())
     }
 }
 
@@ -303,7 +305,7 @@ impl<P: WireProtocol> Follow<P> {
         Arc::new(Self { cluster, lookup, current: Mutex::new(None) })
     }
 
-    async fn remote(&self) -> Result<RemoteRef<P>, ClusterError> {
+    async fn remote(&self) -> Result<Arc<RemoteRef<P>>, ClusterError> {
         if let Some(remote) = self.current.lock().clone() {
             return Ok(remote);
         }
@@ -318,12 +320,13 @@ impl<P: WireProtocol> Follow<P> {
             }
             Lookup::Name(name, among) => cluster.resolve_among(name, among).await,
         }?;
+        let remote = Arc::new(remote);
         *self.current.lock() = Some(remote.clone());
         Ok(remote)
     }
 
     /// The reference, found by `deadline`, and what is left of it; else `NotSent(Deadline)`.
-    async fn remote_by(&self, deadline: Instant) -> Result<(RemoteRef<P>, Duration), ClusterError> {
+    async fn remote_by(&self, deadline: Instant) -> Result<(Arc<RemoteRef<P>>, Duration), ClusterError> {
         let remote = timeout_at(deadline, self.remote())
             .await
             .map_err(|_| ClusterError::Call(CallError::NotSent(SubmitReason::Deadline)))??;

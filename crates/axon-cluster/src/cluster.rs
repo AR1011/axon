@@ -884,7 +884,7 @@ impl Cluster {
 
     pub async fn control(&self, node: &str, service: &str, body: Bytes) -> Result<Bytes, ClusterError> {
         let target = self.0.route_on(&node.into(), service, CONTROL_PROTOCOL, SYSTEM_SCHEMA).await?;
-        let reply = self.0.engine.call_with(&target, REQUEST, body, self.0.compress_control, None).await?;
+        let reply = self.0.engine.call_with(&target, None, REQUEST, body, self.0.compress_control, None).await?;
         let reply = reply.ok_or(crate::CallError::NoReply)?;
         decode_result(reply).map_err(|(_, message)| ClusterError::Control(message))
     }

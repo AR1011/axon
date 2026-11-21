@@ -319,6 +319,19 @@ async fn shutdown_flushes_then_the_peer_sees_a_clean_close() {
 }
 
 #[tokio::test]
+async fn sender_is_accepting_turns_false_on_close_and_shutdown() {
+    let (a, _b) = connected(&config("a"), &config("b")).await;
+    assert!(a.sender.is_accepting());
+    a.sender.close();
+    assert!(!a.sender.is_accepting());
+
+    let (c, _d) = connected(&config("c"), &config("d")).await;
+    assert!(c.sender.is_accepting());
+    c.sender.shutdown(Instant::now() + SECOND).await.unwrap();
+    assert!(!c.sender.is_accepting());
+}
+
+#[tokio::test]
 async fn dropping_the_receiver_closes_both_directions() {
     let (a, b) = connected(&config("a"), &config("b")).await;
     drop(a.receiver);

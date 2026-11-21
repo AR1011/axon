@@ -411,6 +411,12 @@ impl Sender {
         self.shared.status.borrow().is_none()
     }
 
+    /// Whether this sender still admits new frames: turns false as soon as `shutdown` or `close` starts, with a
+    /// single atomic load and no lock.
+    pub fn is_accepting(&self) -> bool {
+        self.shared.accepting.load(Relaxed)
+    }
+
     /// The shortest of the last four keepalive round trips; zero until the first pong. A pong held up behind a paused
     /// peer or a backlog lengthens a sample, not the shortest of four, which still follows a way that grows within
     /// four keepalives.
