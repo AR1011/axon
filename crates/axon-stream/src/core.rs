@@ -474,6 +474,9 @@ struct Feed {
     generation: u64,
     /// The path each live link's parent last gave, by the link's epoch.
     paths: BTreeMap<u32, Vec<Arc<str>>>,
+    /// The last path a parent gave from the stream's source, origin first. A path from a node on it past the source,
+    /// as a relay that lost its own parent gives, does not replace it.
+    source: Vec<Arc<str>>,
     /// The upstream path the children were last told.
     told: Vec<Arc<str>>,
     /// Something on this node waits for the state: each new branch asks for it until one arrives.
@@ -1527,6 +1530,9 @@ impl<A: Authorizer> RelayCore<A> {
         feed.refused.remove(parent);
         let live = |e: &u32| feed.current.iter().chain(&feed.joining).any(|l| l.epoch == *e);
         if live(&epoch) {
+            if !feed.source.iter().skip(1).any(|n| path.first() == Some(n)) {
+                feed.source.clone_from(&path);
+            }
             feed.paths.insert(epoch, path);
         }
         feed.paths.retain(|e, _| live(e));
@@ -2331,10 +2337,20 @@ impl<A: Authorizer> RelayCore<A> {
                         // can answer before the origin, which holds the history, is back in view. A source that does not
                         // relay lacks the key between a close and an open in the same generation: it is waited for from
                         // when it first left this node so at this position, which its retries and a change in the view
-                        // do not move.
-                        let lacking = candidates
-                            .iter()
-                            .any(|p| feed.refused.get(p).is_some_and(|r| r.status == Status::UnknownStream));
+                        // do not move. A source in view that refuses the position as past what it holds has the key
+                        // open, so no parent that lacks the key is waited for.
+                        let source = feed.source.first();
+                        let open = candidates.iter().any(|p| {
+                            Some(&p.node) == source
+                                && feed
+                                    .refused
+                                    .get(p)
+                                    .is_some_and(|r| r.until > now && r.status == Status::HistoryUnavailable)
+                        });
+                        let lacking = !open
+                            && candidates
+                                .iter()
+                                .any(|p| feed.refused.get(p).is_some_and(|r| r.status == Status::UnknownStream));
                         let lacked = lacking.then(|| {
                             let at = self.hub.cursor(key).ok().flatten();
                             match feed.lacked {

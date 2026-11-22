@@ -1805,6 +1805,48 @@ fn a_candidate_answering_unknown_stream_does_not_block_a_history_reset() {
     }
 }
 
+/// The wait before a node gives a position up is for a source that opens the key again in the generation the node
+/// holds. A source in view that refuses the position as past its ring has the key open in that generation, so a parent
+/// that lacks the key is not waited for: the node resets once both have refused, where before it waited
+/// `upstream_timeout` more for the other.
+#[test]
+fn a_source_that_holds_the_key_past_the_position_is_not_waited_for() {
+    let mut now = Instant::now();
+    // o resets a child that stops reading as slow after two batches, and keeps only its last 4 records.
+    let small = CoreConfig {
+        rings: short_ring(),
+        max_push_items: 2,
+        branch: BranchLimits { max_events: 2, ..BranchLimits::default() },
+        ..Default::default()
+    };
+    let s = RelayCore::new(&PeerId::new("s", 1), AllowAll, CoreConfig { relay: false, ..Default::default() }).unwrap();
+    let mut cores =
+        Cores::from([("o", origin(AllowAll, small)), ("s", (1, s)), ("l", node("l", CoreConfig::default()))]);
+    let id = start(&mut cores, "l", StartPosition::Live);
+    let up: Tree = &[("l", &["o", "s"])];
+    drive(&mut cores, up, &mut now, 6);
+    publish(&mut cores, 3);
+    drive(&mut cores, up, &mut now, 4);
+    assert_eq!(batches(&mut cores.get_mut("l").unwrap().1, id), ["1 1..3"]);
+
+    // l stops reading, with o and s still its parents, while o rolls past its ring in generation 1.
+    for _ in 0..5 {
+        publish(&mut cores, 2);
+        now += Duration::from_millis(500);
+    }
+    let mut rounds = 0;
+    while cores["l"].1.stats().local_resets == 0 {
+        rounds += 1;
+        assert!(rounds <= 20, "l never reset");
+        drive(&mut cores, up, &mut now, 1);
+    }
+    let stats = cores["l"].1.stats();
+    assert!(stats.refusals[Status::HistoryUnavailable as usize] >= 1, "{:?}", stats.refusals);
+    assert!(stats.refusals[Status::UnknownStream as usize] >= 1, "{:?}", stats.refusals);
+    // Within upstream_timeout of l coming back: 3 s would be 6 rounds.
+    assert!(rounds <= 4, "l reset after {rounds} rounds");
+}
+
 /// The local resets of a node with `cfg` that holds a position, 1..3 from its origin, once its parents become `p1` and
 /// `p2` and answer every ask with these statuses for 20 s, well past `upstream_timeout` and a few backoffs.
 fn resets_when_parents_answer(cfg: CoreConfig, statuses: [Status; 2]) -> u64 {
@@ -1860,6 +1902,12 @@ fn a_parent_that_lacks_the_key_and_is_asked_often_does_not_hold_a_reset_off() {
 /// the relay's `HistoryUnavailable` beside the source's `UnknownStream` reset it at once.
 #[test]
 fn a_node_behind_its_relay_waits_for_a_source_that_opens_its_key_again_in_the_same_generation() {
+    behind_its_relay(false);
+    // The relay tells the node it lost its own parent, a path of the relay alone: the node still waits for the source.
+    behind_its_relay(true);
+}
+
+fn behind_its_relay(told: bool) {
     let mut now = Instant::now();
     // l falls behind r without leaving its parents: a branch of two batches resets it as a slow child.
     let small = CoreConfig {
@@ -1889,6 +1937,9 @@ fn a_node_behind_its_relay_waits_for_a_source_that_opens_its_key_again_in_the_sa
     }
     // The source closes the key; r, cut from it, never hears of the close and keeps its ring.
     cores.get_mut("o").unwrap().1.close_stream(&key()).unwrap();
+    if told {
+        drive(&mut cores, &[("r", &[])], &mut now, 1);
+    }
     let back: Tree = &[("l", &["r", "o"])];
     for round in 0.. {
         assert!(round < 10, "l never asked the source");
@@ -1907,13 +1958,13 @@ fn a_node_behind_its_relay_waits_for_a_source_that_opens_its_key_again_in_the_sa
     drive(&mut cores, all, &mut now, 4);
 
     let followed = drain(&mut cores.get_mut("l").unwrap().1, id);
-    assert!(!followed.iter().any(|e| e.starts_with("ResetRequired")), "{followed:?}");
+    assert!(!followed.iter().any(|e| e.starts_with("ResetRequired")), "told {told}: {followed:?}");
     let mut next = 4;
     for batch in followed.iter().filter(|e| e.starts_with("1 ")) {
         let (first, last) = batch[2..].split_once("..").expect("a batch");
         assert_eq!(first.parse::<u64>().unwrap(), next, "{followed:?}");
         next = last.parse::<u64>().unwrap() + 1;
     }
-    assert_eq!(next, 16, "every record once, in order: {followed:?}");
-    assert_eq!(cores["l"].1.stats().local_resets, 0);
+    assert_eq!(next, 16, "told {told}, every record once, in order: {followed:?}");
+    assert_eq!(cores["l"].1.stats().local_resets, 0, "told {told}");
 }

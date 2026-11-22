@@ -268,10 +268,13 @@ event as a message; see the sources section of the actors guide.
   a `Live` one a new `Ready` when the stream comes back in a newer generation and `ResetRequired(HistoryUnavailable)`
   when it comes back in the same one, past what the node lost. The wait is for a heal, after which a relay that
   restarted and took the stream up live can answer before the origin, which holds the history, is back in view, and for
-  a source that does not relay, which lacks the stream between a close and an open in the same generation. The node
-  goes on from its position if it asks the source again, at its backoff, within the wait and finds the key open; a
-  backoff that runs past the wait still resets it. A parent that lacks the stream, asked again more than 32 times
-  `retry_refused` after its last refusal ran out, starts its backoff afresh.
+  a source that does not relay, which lacks the stream between a close and an open in the same generation. A source in
+  view that refuses the position as `HistoryUnavailable` has the stream open and cannot give that position, so the node
+  waits for no parent that lacks the stream. The source is a best guess: the head of the last path a parent gave, not a
+  relay on it that lost its own parent and gives a path of itself alone. The node goes on from its position if it asks
+  the source again, at its backoff, within the wait and finds the key open; a backoff that runs past the wait still
+  resets it. A parent that lacks the stream, asked again more than 32 times `retry_refused` after its last refusal ran
+  out, starts its backoff afresh.
 - **A relay that loses its own upstream** for `upstream_timeout` (3 s) ends its downstream branches with
   `UpstreamLost`, so children fail over instead of waiting on a silent link.
 - **Timings per namespace.** `upstream_timeout` and `hold_down` are a key's, in `core.timings` (`RelayTimings`).
