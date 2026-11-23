@@ -1264,14 +1264,14 @@ noted, at a 1-minute load of 0.0 to 1.3 as each run began. The cells, each `scri
 delivery delay in ms, p50 / p99, the median of three runs (the p99's range in brackets), and the origin's pushes a
 second:
 
-| Cell | Nagle's rule | pushes/s | `no_delay_rtt` | pushes/s | `no_delay_rtt` and `illinois` |
-|---|---|---|---|---|---|
-| 219 ms, no loss | 241.6 / 546.9 (544.8 to 550.7) | 4.2 | 109.5 / 282.4 (282.1 to 282.7) | 191.6 | |
-| 92 ms, 0.5 % | 94.8 / 228.3 (215.0 to 283.1) | 10.3 | 46.0 / 148.7 (145.7 to 153.4) | 196.6 | 46.0 / 143.2 (138.1 to 143.8) |
-| 219 ms, 0.5 % | 259.9 / 585.0 (557.4 to 1117.0) | 4.0 | 109.5 / 413.0 (333.7 to 419.8) | 161.3 | 109.5 / 413.4 (328.6 to 456.6) |
-| 219 ms, 2 % | 318.2 / 1046.3 (706.8 to 1199.5) | 3.6 | 180.3 / 488.6 (428.3 to 1160.1) | 138.3 | 178.2 / 457.5 (426.0 to 515.1) |
-| 219 ms, 0.5 %, on `Bulk` † | | | | | 109.5 / 447.8 (333.7 to 452.9), 167.8 pushes/s |
-| 219 ms, 2 %, on `Bulk` † | | | | | 183.5 / 451.7 (396.7 to 528.9), 142.8 pushes/s |
+| Cell | Nagle's rule | pushes/s | `no_delay_rtt` | pushes/s | `no_delay_rtt` and `illinois` | pushes/s |
+|---|---|---|---|---|---|---|
+| 219 ms, no loss | 241.6 / 546.9 (544.8 to 550.7) | 4.2 | 109.5 / 282.4 (282.1 to 282.7) | 191.6 | | |
+| 92 ms, 0.5 % | 94.8 / 228.3 (215.0 to 283.1) | 10.3 | 46.0 / 148.7 (145.7 to 153.4) | 196.6 | 46.0 / 143.2 (138.1 to 143.8) | 196.6 |
+| 219 ms, 0.5 % | 259.9 / 585.0 (557.4 to 1117.0) | 4.0 | 109.5 / 413.0 (333.7 to 419.8) | 161.3 | 109.5 / 413.4 (328.6 to 456.6) | 163.2 |
+| 219 ms, 2 % | 318.2 / 1046.3 (706.8 to 1199.5) | 3.6 | 180.3 / 488.6 (428.3 to 1160.1) | 138.3 | 178.2 / 457.5 (426.0 to 515.1) | 136.6 |
+| 219 ms, 0.5 %, on `Bulk` † | | | | | 109.5 / 447.8 (333.7 to 452.9) | 167.8 |
+| 219 ms, 2 %, on `Bulk` † | | | | | 183.5 / 451.7 (396.7 to 528.9) | 142.8 |
 
 Under the rule a record waits for the answer to the push ahead of it, about a round trip, on top of the link's own
 half: the p50 at 219 ms is 242 ms with no loss, against 110 ms without the rule. `no_delay_rtt` cuts the p50 by 43 to

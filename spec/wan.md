@@ -521,7 +521,7 @@ What axon does, and does not:
   where they dial and where they accept. On an outside workload over real long lossy links, loss-based
   `illinois` was seen to deliver thin streams (ones the application, not the network, limits) sooner than BBRv1,
   whose rate estimate falls while such a stream sends little. This repo's `netem` bench does not reproduce that: at
-  92 and 219 ms with 0.5 and 2 % loss, `illinois` read what BBR with `fq` reads, and better only than BBR without
+  92 ms with 0.5 % loss and at 219 ms with 0.5 and 2 %, `illinois` read what BBR with `fq` reads, and better only than BBR without
   `fq` ([benchmarks](../crates/axon/guide/benchmarks.md#thin-streams)). A socket switched after its handshake keeps
   the pacing its first algorithm turned on; in the two cells run it read within the spread of one that started on
   `illinois`. Where a link
