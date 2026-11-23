@@ -1248,6 +1248,50 @@ What this does not establish: a real WAN, a shallow queue, or BBRv2 and later. T
 renewal in 6 of 123 earlier runs at 1 % across the builds tried, and not in the 18 here; the cause is not known. A
 cell's `rate` field (`219:0:1:axon1x64:50mbit`) sets the link.
 
+#### Thin streams
+
+The harness's `t` cells: the origin publishes one 64 B record every 5 ms (200 a second) on one stream, each stamped
+with the wall clock, and the child times each one's delivery. Both namespaces share the box's clock, so a delay is one
+way: half the round trip at best. `n` sets [`core.no_delay_rtt`](../../../spec/push-window.md#24-the-window) to 20 ms on
+both nodes; `_illinois` names `illinois` as the `Live` lane's `LaneConfig::congestion`, so the stream's connection runs
+it from just after its handshake while the namespace's default stays BBR. The branch perf/relay-push-pipeline at
+738a0df with its review fixes, on build-1 on 2026-11-23, §8's settings with `fq` unless noted, at a load of 0.1 to 2.3.
+The child's delivery delay in ms, p50 / p99, the median of three runs (the p99's range in brackets), and the origin's
+pushes a second:
+
+| Cell | Nagle's rule | pushes/s | `no_delay_rtt` | pushes/s | `no_delay_rtt` and `illinois` |
+|---|---|---|---|---|---|
+| 219 ms, no loss | 241.6 / 546.9 (544.8 to 550.7) | 4.2 | 109.5 / 282.4 (282.1 to 282.7) | 191.6 | |
+| 92 ms, 0.5 % | 94.8 / 228.3 (215.0 to 283.1) | 10.3 | 46.0 / 148.7 (145.7 to 153.4) | 196.6 | 46.0 / 143.2 (138.1 to 143.8) |
+| 219 ms, 0.5 % | 259.9 / 585.0 (557.4 to 1117.0) | 4.0 | 109.5 / 413.0 (333.7 to 419.8) | 161.3 | 109.5 / 413.4 (328.6 to 456.6) |
+| 219 ms, 2 % | 318.2 / 1046.3 (706.8 to 1199.5) | 3.6 | 180.3 / 488.6 (428.3 to 1160.1) | 138.3 | 178.2 / 457.5 (426.0 to 515.1) |
+
+Under the rule a record waits for the answer to the push ahead of it, about a round trip, on top of the link's own
+half: the p50 at 219 ms is 242 ms with no loss, against 110 ms without the rule. `no_delay_rtt` halves the p50 in every
+cell and cuts the p99 by 30 to 53 %, at 19 to 45 times the calls: one push per record, not one per round trip.
+`illinois` alone, with the rule kept, read 96.6 / 245.8 at 92 ms and 257.9 / 614.7 at 219 ms, 0.5 %: no change. With
+`no_delay_rtt` it changed nothing beyond the runs' spread either. In every cell resets and gaps were 0.
+
+Without `fq` (tuned 2 and 3 of the script, `pfifo_fast` on each node's `eth0`), the same thin stream with `no_delay_rtt`:
+
+| Cell | BBR, no `fq` | BBR, no `fq`, the lane on `illinois` | `illinois` the namespace's default, no `fq` |
+|---|---|---|---|
+| 219 ms, 0.5 % | 109.5 / 457.8 (380.1 to 474.0) | 109.5 / 338.8 (323.4 to 368.5) | 109.5 / 328.6 (323.6 to 394.3) |
+| 219 ms, 2 % | 182.1 / 839.6 (531.5 to 1108.0) | | 185.7 / 487.8 (443.1 to 503.0) |
+
+BBR without `fq` had the longest tail. `illinois` without `fq` reads what BBR
+with `fq` does. A socket switched to `illinois` after its handshake keeps the pacing BBR turned on: `bpftrace` on
+`tcp_sendmsg` saw `sk_pacing_status` 1 (TCP's own pacing) on every send of the switched sockets, 0 (none) where
+`illinois` was the namespace's default, and 2 (`fq`) with `fq`. The delays of the two were the same within the runs'
+spread, so the lane's setting needs no `fq` of its own. `ss -tin` showed `illinois` on the `Live` sockets only, `bbr`
+on the others.
+
+What this establishes: on this box's `netem`, Nagle's rule costs a thin stream about a round trip of delay, and
+`no_delay_rtt` takes it away, for one push per record. It does not show `illinois` doing better than BBR with `fq`, the
+host default of [wan.md § 8](../../../spec/wan.md#8-host-tcp-settings). On an outside workload over real long lossy
+links, `illinois` was seen to deliver such streams sooner than BBRv1; that is not reproduced here, where `netem`'s loss
+is random and its queue deep. These runs are in `target/pp-wan/` of the tree that ran them.
+
 ### History on disk
 
 Keeping an origin's history on disk ([streams § History on disk](streams.md#history-on-disk)) split the hub's publish

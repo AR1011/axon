@@ -3,8 +3,11 @@
 //! streams, one or many, as fast as its branches drain; each node probes a plain request to the other and times its
 //! lease renewals meanwhile. `tcp-recv` and `tcp-send` measure one TCP connection's ceiling between the same
 //! namespaces. `scripts/relay-wan.sh` sets up the namespaces and runs the matrix; one process by hand:
-//! `relay_wan node <w1|w2> <secs> <max_frame MiB> <streams> <dir> [shipped] [bulk]`, `relay_wan tcp-recv <addr> <secs>`,
-//! `relay_wan tcp-send <addr> <secs>`. Each prints one line of `name=value` pairs.
+//! `relay_wan node <w1|w2> <secs> <max_frame MiB> <streams> <dir> [shipped] [bulk] [thin] [nodelay] [cc=<name>]`,
+//! `relay_wan tcp-recv <addr> <secs>`, `relay_wan tcp-send <addr> <secs>`. Each prints one line of `name=value` pairs.
+//! `thin`: instead of a backlog, the origin publishes one small record every `THIN_EVERY`, each stamped with the wall
+//! clock, and the leaf times each one's delivery (`delay_ms_*`): a stream the application, not the network, limits.
+//! `nodelay`: `core.no_delay_rtt` at `NO_DELAY_RTT`. `cc=<name>`: the namespace's lane runs that congestion control.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -39,6 +42,11 @@ const WARM: Duration = Duration::from_secs(3);
 /// How long the origin publishes past its window, so the leaf's, which starts later, has a backlog to its end.
 const TAIL: Duration = Duration::from_secs(3);
 const PROBE_EVERY: Duration = Duration::from_millis(50);
+/// A thin stream: 200 records a second, 64 bytes each.
+const THIN_EVERY: Duration = Duration::from_millis(5);
+const THIN_RECORD: usize = 64;
+/// Below every netem round trip the matrix runs but 0: each far child skips Nagle's rule.
+const NO_DELAY_RTT: Duration = Duration::from_millis(20);
 const SAMPLE_EVERY: Duration = Duration::from_millis(50);
 
 fn addr(id: &str, port: u16) -> std::net::SocketAddr {
@@ -53,12 +61,28 @@ struct Seen {
     resets: u64,
     last: u64,
     reasons: BTreeMap<String, u64>,
+    /// Of a thin stream: when each record arrived, and how long after its stamp, in ms.
+    delays: Vec<(Instant, f64)>,
+}
+
+/// What a node runs besides its role, from the command line's flags.
+struct Flags {
+    shipped: bool,
+    bulk: bool,
+    thin: bool,
+    no_delay: bool,
+    congestion: Option<String>,
 }
 
 impl Seen {
     fn take(&mut self, event: Option<StreamEvent>) {
         match event {
             Some(StreamEvent::Batch(batch)) => {
+                let (at, now) = (Instant::now(), axon::trace::unix_micros());
+                for record in batch.records().iter().filter(|r| r.len() == THIN_RECORD) {
+                    let sent = u64::from_be_bytes(record[..8].try_into().expect("8 bytes"));
+                    self.delays.push((at, now.saturating_sub(sent) as f64 / 1e3));
+                }
                 self.gaps += u64::from(self.last != 0 && batch.first() != self.last + 1);
                 self.last = batch.last();
                 self.records += batch.len() as u64;
@@ -80,6 +104,7 @@ impl Seen {
             sum.records += s.records;
             sum.gaps += s.gaps;
             sum.resets += s.resets;
+            sum.delays.extend_from_slice(&s.delays);
             for (reason, n) in &s.reasons {
                 *sum.reasons.entry(reason.clone()).or_default() += n;
             }
@@ -287,11 +312,13 @@ fn held(s: &RelayStats, streams: usize) -> Option<usize> {
         .then(|| d.iter().map(|d| d.queued_bytes + d.inflight_bytes).sum())
 }
 
-async fn node(id: &'static str, secs: u64, frame_mib: usize, streams: usize, dir: &str, shipped: bool, bulk: bool) {
+async fn node(id: &'static str, secs: u64, frame_mib: usize, streams: usize, dir: &str, flags: Flags) {
+    let Flags { shipped, bulk, thin, no_delay, congestion } = flags;
     let (window, origin) = (Duration::from_secs(secs), id == "w1");
     let lane = if bulk { Lane::Bulk } else { Lane::Live };
     let mut transport = axon_net::Config::new(id, SharedSecret::new(*b"relay-wan-secret-0123").unwrap());
     transport.allow_plaintext = true;
+    transport.lanes.get_mut(lane).congestion = congestion;
     if frame_mib > 1 {
         // Interests on Control keep within its frame.
         let limits = &mut transport.lanes.get_mut(lane).limits;
@@ -327,6 +354,8 @@ async fn node(id: &'static str, secs: u64, frame_mib: usize, streams: usize, dir
         StreamNodeConfig::new(if origin { vec![] } else { vec![BTreeMap::from([("node".into(), "w1".into())])] })
             .lane("wan", lane);
     scfg.core.max_push_bytes = (frame_mib << 20) - 64; // the default at 1
+    // A choice under test, below the matrix's round trips.
+    scfg.core.no_delay_rtt = no_delay.then_some(NO_DELAY_RTT);
     // Publish while the child's branches hold under three quarters of their bounds, and under half the hub's total:
     // a branch over its bound resets its child.
     let high = (streams * scfg.core.branch.max_bytes * 3 / 4).min(scfg.core.hub.max_queued_bytes / 2);
@@ -409,7 +438,7 @@ async fn node(id: &'static str, secs: u64, frame_mib: usize, streams: usize, dir
     let (mut published, mut refused) = (0u64, 0u64);
     let (at_from, at_until) = if origin {
         let payload = Bytes::from_static(&PAYLOAD);
-        let (mut at_from, mut at_until) = (None, None);
+        let (mut at_from, mut at_until, mut next) = (None, None, Instant::now());
         loop {
             let now = Instant::now();
             if at_from.is_none() && now >= from {
@@ -420,6 +449,18 @@ async fn node(id: &'static str, secs: u64, frame_mib: usize, streams: usize, dir
             }
             if now >= until + TAIL {
                 break;
+            }
+            if thin {
+                sleep_until(next).await;
+                next += THIN_EVERY;
+                let mut record = [0u8; THIN_RECORD];
+                record[..8].copy_from_slice(&axon::trace::unix_micros().to_be_bytes());
+                let key = &keys[published as usize % streams];
+                match stream.publish(key, vec![Bytes::copy_from_slice(&record)]) {
+                    Ok(_) => published += 1,
+                    Err(_) => refused += 1,
+                }
+                continue;
             }
             if published % (8 * BATCH as u64) == 0 && held(&stream.stats(), streams).is_none_or(|h| h > high) {
                 sleep(Duration::from_millis(1)).await;
@@ -467,6 +508,10 @@ async fn node(id: &'static str, secs: u64, frame_mib: usize, streams: usize, dir
         s.push_capped,
         cpu / window.as_secs_f64(),
     );
+    if !origin && thin {
+        let window = seen.delays.iter().filter(|(at, _)| *at >= from && *at < until);
+        spread(&mut out, "delay_ms", window.map(|(_, ms)| *ms).collect());
+    }
     let (ms, failed) = probing.await.unwrap();
     spread(&mut out, &format!("req_to_{peer}"), ms);
     let _ = write!(out, " req_failed={failed}");
@@ -550,13 +595,21 @@ async fn main() {
             let frame_mib = arg(3).parse().ok().filter(|&m| m > 0).expect("max_frame in MiB, 1 or more");
             let streams = arg(4).parse().ok().filter(|&n| n > 0).expect("streams, 1 or more");
             let flag = |f: &str| args.iter().skip(6).any(|a| a == f);
-            node(id, secs(2), frame_mib, streams, arg(5), flag("shipped"), flag("bulk")).await;
+            let congestion = args.iter().skip(6).find_map(|a| a.strip_prefix("cc=")).map(str::to_owned);
+            let flags = Flags {
+                shipped: flag("shipped"),
+                bulk: flag("bulk"),
+                thin: flag("thin"),
+                no_delay: flag("nodelay"),
+                congestion,
+            };
+            node(id, secs(2), frame_mib, streams, arg(5), flags).await;
         }
         "tcp-recv" => tcp_recv(arg(1), secs(2)).await,
         "tcp-send" => tcp_send(arg(1), secs(2)).await,
         _ => eprintln!(
-            "relay_wan node <w1|w2> <secs> <max_frame MiB> <streams> <dir> [shipped] [bulk] | tcp-recv <addr> <secs> \
-             | tcp-send <addr> <secs>"
+            "relay_wan node <w1|w2> <secs> <max_frame MiB> <streams> <dir> [shipped] [bulk] [thin] [nodelay] \
+             [cc=<name>] | tcp-recv <addr> <secs> | tcp-send <addr> <secs>"
         ),
     }
 }

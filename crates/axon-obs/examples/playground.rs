@@ -10,6 +10,8 @@
 //! `-us-` and `-ap-`), `session` 30 % (`sess-000123`), and `device` 10 % (`dev-tokyo-000123`, `dev-reykjavik-…`),
 //! registered on the nodes with a region and placed by it. It raises the limits on actors, spawns and leases to fit n,
 //! starts 256 at a time and prints its progress.
+//! `AXON_CONGESTION=illinois` names the `Bulk` lane's `LaneConfig::congestion` on every node; a name the host refuses
+//! (`no_such`) shows as the event `tcp_congestion_refused`.
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -129,6 +131,7 @@ async fn start(name: &str, discovery: &Arc<dyn Discovery>, acceptors: &[String],
     transport.timing_sample_every = 8;
     // Under the transfers below, so the console shows a Bulk connection that waits for its cap.
     transport.lanes.bulk.max_bytes_per_sec = Some(256 << 10);
+    transport.lanes.bulk.congestion = std::env::var("AXON_CONGESTION").ok();
     let mut cfg = ClusterConfig::new("127.0.0.1:0".parse().unwrap(), transport, MemoryDiscovery::new());
     cfg.discovery = discovery.clone();
     if let Ok(url) = std::env::var("AXON_CONSUL") {

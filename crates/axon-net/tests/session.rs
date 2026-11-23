@@ -1014,16 +1014,19 @@ async fn tcp_notsent_lowat_is_set_on_dialled_and_accepted_sockets() {
 #[tokio::test]
 async fn a_lanes_congestion_control_is_set_on_both_ends_and_one_refused_keeps_the_hosts() {
     let host = axon_net::host_tcp().expect("a Linux host").congestion;
-    // reno is built into every kernel and allowed to every process; the host default must differ for the set to show.
-    let named = if host == "reno" { "cubic" } else { "reno" };
+    // One this process may set, other than the host's, so the set shows.
+    let allowed = std::fs::read_to_string("/proc/sys/net/ipv4/tcp_allowed_congestion_control").unwrap();
+    let Some(named) = allowed.split_whitespace().find(|n| *n != host) else {
+        return eprintln!("skipped: no congestion control other than {host} is allowed here");
+    };
     let (mut server, mut client) = (config("server"), config("client"));
     for cfg in [&mut server, &mut client] {
-        (cfg.lanes.live.congestion, cfg.lanes.bulk.congestion) = (Some(named.into()), Some("no-such".into()));
+        (cfg.lanes.live.congestion, cfg.lanes.bulk.congestion) = (Some(named.into()), Some("no_such".into()));
     }
     let any = "127.0.0.1:0".parse().unwrap();
     let mut listener = Listener::bind(any, None, server, AcceptLimits::default()).await.unwrap();
     for (lane, runs, refused) in
-        [(Lane::Control, host.as_str(), None), (Lane::Live, named, None), (Lane::Bulk, host.as_str(), Some("no-such"))]
+        [(Lane::Control, host.as_str(), None), (Lane::Live, named, None), (Lane::Bulk, host.as_str(), Some("no_such"))]
     {
         let client = connect(listener.local_addr(), lane, None, &client).await.expect("a refused one still connects");
         let server = listener.accept().await.unwrap();
@@ -1038,7 +1041,15 @@ async fn a_lanes_congestion_control_is_set_on_both_ends_and_one_refused_keeps_th
 
 #[test]
 fn a_congestion_control_name_the_kernel_could_not_hold_is_refused_by_validate() {
-    for (name, ok) in [("illinois", true), ("", false), ("a-name-of-16-byt", false), ("bb r", false)] {
+    for (name, ok) in [
+        ("illinois", true),
+        ("a_name_of_15_by", true),
+        ("", false),
+        ("a_name_of_16_byt", false),
+        ("bb r", false),
+        ("Illinois", false),
+        ("../x", false),
+    ] {
         let mut cfg = config("a");
         cfg.lanes.bulk.congestion = Some(name.into());
         assert_eq!(cfg.validate(false).is_ok(), ok, "{name:?}");

@@ -17,9 +17,11 @@
 # 1 MiB writes), axon<frame>[s][x<streams>][b]
 # or prof<frame>.. (that once, perf on w1 and w2): <frame> the pushes' max_frame and max_push_bytes in MiB (1 shipped),
 # s the child's subscribers at the shipped limits (else each holds at least four pushes), x<streams> the streams (1),
-# b the namespace on Lane::Bulk (Live).
+# b the namespace on Lane::Bulk (Live), t a thin stream timed per record instead of a backlog, n core.no_delay_rtt
+# set, _<name> the lane's LaneConfig::congestion (such as axon1tn_illinois).
 # tuned 0 is Linux's default TCP settings, 1 those of spec/wan.md § 8 (with fq on each node's eth0, as
-# net.core.default_qdisc is the host's), both set inside the namespaces only. netem sits on the bridge side of each
+# net.core.default_qdisc is the host's), 2 the same with bbr but no fq (pfifo_fast), 3 the same with illinois and no
+# fq, all set inside the namespaces only. netem sits on the bridge side of each
 # veth: half the round trip and the 1 Gbit/s rate each way; a loss applies to both directions, with TSO and GSO off so
 # that netem drops wire-sized packets. Node i runs on cores 4i-2..4i+1.
 set -euo pipefail
@@ -64,7 +66,7 @@ if [[ ${1:-} != box ]]; then   # the laptop
     runs=${1:-3}
     (( $# > 1 )) && cells=("${@:2}")
     for cell in "${cells[@]}"; do   # they run as root
-        [[ $cell =~ ^[0-9]+:[0-9.]+:[01]:[a-z0-9]+(:[0-9]+[mg]bit)?$ ]] || { echo "not a cell: $cell" >&2; exit 2; }
+        [[ $cell =~ ^[0-9]+:[0-9.]+:[0-3]:[a-z0-9_]+(:[0-9]+[mg]bit)?$ ]] || { echo "not a cell: $cell" >&2; exit 2; }
     done
     [[ ${LOCK:-} =~ ^[A-Za-z0-9/._-]*$ ]] || { echo "not a lock path: $LOCK" >&2; exit 2; }
     sudo_box=${SUDO_BOX:?set SUDO_BOX=user@host, a user with sudo on the box} dir=${BOX_DIR:-relay-wan}
@@ -125,6 +127,7 @@ for n in "${ns[@]}"; do [[ ! -e /run/netns/$n ]] || { echo "namespace $n exists:
 ! ip link show wan0 >/dev/null 2>&1 || { echo "bridge wan0 exists" >&2; exit 2; }
 
 bbr_loaded=$(lsmod | grep -c '^tcp_bbr ' || true)
+illinois_loaded=$(lsmod | grep -c '^tcp_illinois ' || true)
 pids=()
 teardown() {
     for p in "${pids[@]}"; do kill "$p" 2>/dev/null || true; done
@@ -137,6 +140,12 @@ teardown() {
             modprobe -r tcp_bbr 2>/dev/null || sleep 1
         done
         ! lsmod | grep -q '^tcp_bbr ' || echo "tcp_bbr is still loaded: modprobe -r tcp_bbr" >&2
+    fi
+    if (( illinois_loaded == 0 )); then
+        for i in $(seq 180); do
+            lsmod | grep -q '^tcp_illinois ' || break
+            modprobe -r tcp_illinois 2>/dev/null || sleep 1
+        done
     fi
 }
 trap teardown EXIT
@@ -163,14 +172,16 @@ netem() {   # <rtt_ms> <loss_pct> <rate>
         tc qdisc replace dev wan-w$i root netem limit 1000000 delay $(( $1 * 500 ))us rate "$3" loss "$2"%
     done
 }
-tune() {   # <0|1>
-    local n
-    (( $1 == 0 )) || modprobe tcp_bbr
+tune() {   # <0|1|2|3>
+    local n cc=bbr qdisc=fq
+    (( $1 != 2 )) || qdisc=pfifo_fast
+    (( $1 != 3 )) || { cc=illinois qdisc=pfifo_fast; }
+    (( $1 == 0 )) || modprobe tcp_$cc
     for n in "${ns[@]}"; do
         if (( $1 )); then
             inns "$n" sysctl -qw net.ipv4.tcp_wmem="4096 16384 67108864" net.ipv4.tcp_rmem="4096 131072 134217728" \
-                net.ipv4.tcp_congestion_control=bbr net.ipv4.tcp_slow_start_after_idle=0
-            inns "$n" tc qdisc replace dev eth0 root fq
+                net.ipv4.tcp_congestion_control=$cc net.ipv4.tcp_slow_start_after_idle=0
+            inns "$n" tc qdisc replace dev eth0 root $qdisc
         else
             inns "$n" sysctl -qw net.ipv4.tcp_wmem="4096 16384 4194304" net.ipv4.tcp_rmem="4096 131072 6291456" \
                 net.ipv4.tcp_congestion_control=cubic net.ipv4.tcp_slow_start_after_idle=1
@@ -201,10 +212,14 @@ for cell in "${cells[@]}"; do
     [[ $what != prof* ]] || n=1
     args=()
     if [[ $what != tcp ]]; then
-        [[ $what =~ ^(axon|prof)([0-9]+)(s?)(x([0-9]+))?(b?)$ ]] || { echo "cell $cell: what is $what?" >&2; exit 2; }
+        [[ $what =~ ^(axon|prof)([0-9]+)(s?)(x([0-9]+))?(b?)(t?)(n?)(_([a-z0-9_]+))?$ ]] ||
+            { echo "cell $cell: what is $what?" >&2; exit 2; }
         args=("${BASH_REMATCH[2]}" "${BASH_REMATCH[5]:-1}")
         [[ -z ${BASH_REMATCH[3]} ]] || args+=(shipped)
         [[ -z ${BASH_REMATCH[6]} ]] || args+=(bulk)
+        [[ -z ${BASH_REMATCH[7]} ]] || args+=(thin)
+        [[ -z ${BASH_REMATCH[8]} ]] || args+=(nodelay)
+        [[ -z ${BASH_REMATCH[10]} ]] || { modprobe "tcp_${BASH_REMATCH[10]}" 2>/dev/null || true; args+=("cc=${BASH_REMATCH[10]}"); }
     fi
     for run in $(seq "$n"); do
         d=$out/$cell-$run

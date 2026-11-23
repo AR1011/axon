@@ -721,7 +721,46 @@ fn a_channel_past_no_delay_rtt_sends_each_publish_while_pushes_are_in_flight() {
     origin.next_push("c", Lane::Live, now, Some(NEAR)).expect("the first push in flight always goes");
     origin.publish(&key(0), vec![Bytes::from_static(b"x")]).expect("publishes");
     assert!(origin.next_push("c", Lane::Live, now, Some(NEAR)).is_none(), "a near child waits for the answer");
+    assert!(origin.next_push("c", Lane::Live, now, None).is_none(), "and so does one whose round trip is not known");
     assert!(origin.next_push("c", Lane::Live, now, Some(FAR)).is_some(), "a far one does not");
+}
+
+#[test]
+fn pushes_past_no_delay_rtt_stay_under_the_node_cap() {
+    let (mut cfg, now) = (scaled(), Instant::now());
+    // The cap at its least, one window: 32 children with 128 KiB windows would hold 4 MiB past their first pushes.
+    (cfg.relay, cfg.no_delay_rtt, cfg.max_push_inflight) =
+        (false, Some(Duration::from_millis(100)), cfg.max_push_window);
+    let mut origin = origin(&cfg, 1, 0);
+    let children: Vec<_> = (0..32).map(|n| PeerId::new(format!("c{n}").as_str(), 1)).collect();
+    for c in &children {
+        follow(&mut origin, c, 1, now);
+    }
+    let send = |origin: &mut RelayCore| -> usize {
+        let mut sent = 0;
+        for c in &children {
+            while origin.next_push(&c.node, Lane::Live, now, Some(FAR)).is_some() {
+                sent += 1;
+            }
+        }
+        sent
+    };
+    // Each one record of 12 KiB: a push under half of one, so without `no_delay_rtt` one in flight per child.
+    let mut peak = 0;
+    for _ in 0..16 {
+        origin.publish(&key(0), vec![Bytes::from(vec![7u8; 12 << 10])]).expect("publishes");
+        send(&mut origin);
+        let past: usize = origin.channels().map(|(_, _, c)| c.past_first().0).sum();
+        assert!(past <= cfg.max_push_inflight, "{past} bytes past each channel's first push");
+        peak = peak.max(past);
+    }
+    // Each holds about its share less a push: past one push each, and the cap is what stopped them.
+    println!("at most {peak} bytes past the first pushes");
+    assert!(peak >= cfg.max_push_inflight / 2, "the cap was never reached: {peak}");
+    let capped = origin.stats().push_capped;
+    assert!(capped > 0);
+    assert_eq!(send(&mut origin), 0, "nothing frees room");
+    assert_eq!(origin.stats().push_capped, capped, "a channel asked again while it waits counts the same wait");
 }
 
 #[test]
@@ -766,8 +805,8 @@ fn pushes_past_no_delay_rtt_go_again_in_order_after_a_lost_answer() {
     }
     assert_eq!(sent.len(), 4, "four pushes in flight");
     let first = sent[0].0.seq;
-    // The child applies the first, whose answer is lost; the second call fails before it arrives; the third and fourth
-    // come after a gap.
+    // The child applies the first, whose answer is lost, and the parent goes back (a failure of the second, sent before
+    // that, changes nothing); the third and fourth come after a gap.
     assert_eq!(hand(&mut child, &sent[0].1, now), applied(first));
     origin.push_failed(&c, Lane::Live, sent[0].0, now);
     origin.push_failed(&c, Lane::Live, sent[1].0, now);

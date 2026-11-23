@@ -910,7 +910,8 @@ impl Cluster {
     }
 
     /// This node's timeline: keyed actors acquired, lost, handed off and restarted eagerly; streams losing their parent;
-    /// a `Live` or `Bulk` session lost and back while `Control` stays up (`lane_down`, `lane_up`).
+    /// a `Live` or `Bulk` session lost and back while `Control` stays up (`lane_down`, `lane_up`); a lane's congestion
+    /// control its sockets refused (`tcp_congestion_refused`, once a lane).
     pub fn events(&self) -> &Arc<axon::EventLog> {
         &self.0.events
     }

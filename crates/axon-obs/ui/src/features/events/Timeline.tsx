@@ -24,13 +24,13 @@ const KINDS = [
   "acquired", "lease_lost", "handed_off", "handoff_failed", "eager_restart", "actor_restarted", "gave_up",
   "parent_lost", "reset", "orphaned", "parent_restored", "disk_failing", "disk_recovered",
   "isolated", "isolation_ended", "acceptor_warming", "acceptor_warm", "quota_mismatch", "tls_rotated", "authorizer_changed",
-  "lane_down", "lane_up", "host_tcp_limits", "seed_timings",
+  "lane_down", "lane_up", "host_tcp_limits", "tcp_congestion_refused", "seed_timings",
   "login", "login_failed", "login_limited", "logout", "signed_out_everyone", "console_tls_rotated",
 ];
 
 /** Trouble is amber, a departure is grey, and only an arrival or a recovery is green; `replaced` is what a store kept from before it was `restarted`. */
 const tone = (kind: string): Mark["tone"] =>
-  /fail|limited|unavailable|unreachable|gap|lost|resync|restart|reset|orphan|gave_up|^isolated|warming|mismatch|lane_down|tcp_limits|timings/.test(kind) ? "warning" : /left|leaving|replaced|removed|down|logout|signed_out|handed_off|rotated|changed/.test(kind) ? "muted" : "success";
+  /fail|limited|unavailable|unreachable|gap|lost|resync|restart|reset|orphan|gave_up|^isolated|warming|mismatch|lane_down|tcp_limits|refused|timings/.test(kind) ? "warning" : /left|leaving|replaced|removed|down|logout|signed_out|handed_off|rotated|changed/.test(kind) ? "muted" : "success";
 
 /** Each node a lane, each event a mark on it; clicking one filters the table to its node and kind. */
 function EventLanes({ events, domain, onPick }: { events: ClusterEvent[]; domain: [number, number]; onPick: (node: string, kind: string) => void }) {

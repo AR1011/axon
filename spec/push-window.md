@@ -177,12 +177,17 @@ window  = clamp(3 × rate × rtt, floor, max_push_window)
 - No delay past `core.no_delay_rtt`. A channel whose round trip (`rtt` above) is at least `no_delay_rtt` skips
   Nagle's rule: what is published goes at once in a push of its own while earlier ones are in flight, under the same
   bounds as a backlog: the window, the node cap and 64 pushes. `None`, the default, keeps the rule on every channel.
-  Under the rule a thin stream (records that each fill a small part of a push) moves one push per round trip. On a
-  long link with loss that costs more than a round trip: the sender is limited by the application, not the network,
-  so after a lost packet the congestion control's rate estimate falls and the records published meanwhile wait
-  behind it. At 90 to 220 ms and 0.5 % loss, a measured comparison with the rule off cut the 99th percentile of
-  delivery delay from 5.3 s to 0.19 s and from 9.8 s to 0.49 s on two such links, with no gap, duplicate or extra
-  byte. The cost is the one the rule saves: a call per publish while pushes are in flight. Set it on nodes whose
+  The round trip is the one the window uses, the Control session's shortest of its last 4 pings, so the child's own
+  pong timing steers this setting as it steers the window. `Some(Duration::ZERO)` lifts the rule for every channel
+  whose round trip is known; a channel with none yet keeps it.
+  Under the rule a thin stream (records that each fill a small part of a push) moves one push per round trip, so a
+  record waits about a round trip for the answer to the push ahead of it. On `scripts/relay-wan.sh`'s thin cells (200
+  records of 64 B a second to one child, [benchmarks](../crates/axon/guide/benchmarks.md#thin-streams)) the setting
+  cut the median delivery delay from 260 to 110 ms at 219 ms and 0.5 % loss (p99 585 to 413 ms), and from 318 to
+  180 ms at 2 % (p99 1046 to 489 ms), with no gap or reset. The cost is the one the rule saves: a call per publish
+  while pushes are in flight, 4 pushes a second becoming 140 to 190 there. `scale-streams` with `no_delay_rtt` at
+  zero, so that every child over loopback is far, went from 3.90 to 4.59 cores and from 23.6 k to 67.2 k pushes a
+  second (medians of 5 runs, base 3.85 cores). Set it on nodes whose
   children are far away and whose streams are thin, to a value above the near round trips and below the far ones
   (for example 50 ms: the near ones then keep the rule), and pair it with a congestion control that suits such a
   stream ([wan.md §8](wan.md#8-host-tcp-settings)). Tests (`src/core/tests.rs`):

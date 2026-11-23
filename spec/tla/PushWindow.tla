@@ -15,7 +15,8 @@
      node cap: one parent has one child here, so the cap's bytes, the floor and the fair share
      (the_node_cap_is_shared_fairly_between_busy_channels) are the core tests' (§10). A bug in
      the rate estimate, in the cap's byte counting, or a charge right in items and wrong in bytes
-     would not show here.
+     would not show here. Nor is Nagle's rule (§2.4), which only holds a push back: `Send` may go
+     at any time within the window, so the model covers the rule and `no_delay_rtt` alike.
    - A branch at the parent has its position `pos` and `q` items queued, records pos-q+1..pos. A
      branch behind the origin reads from the store up to its charge's bound in the same step that
      opens it or lowers its charge (Filled: a replay, which a full branch holds back; read at

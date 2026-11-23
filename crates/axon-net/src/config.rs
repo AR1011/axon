@@ -151,9 +151,10 @@ pub struct LaneConfig {
     /// waits in the bounded outbox. `None` leaves the kernel's default.
     pub notsent_lowat: Option<u32>,
     /// `TCP_CONGESTION` on the lane's sockets, on Linux, such as `illinois`: the congestion control they run instead of
-    /// the host's `tcp_congestion_control`. One the kernel refuses (not loaded, or not in
-    /// `net.ipv4.tcp_allowed_congestion_control`) leaves the host's, and the session still comes up:
-    /// [`Peer::congestion_refused`](crate::Peer::congestion_refused) names it. `None` leaves the host's.
+    /// the host's `tcp_congestion_control`, on every session of the lane, its calls too. One the kernel refuses (not
+    /// loaded, not in `net.ipv4.tcp_allowed_congestion_control`, or not Linux) leaves the host's, and the session still
+    /// comes up: [`Peer::congestion_refused`](crate::Peer::congestion_refused) names it. A session with no socket of its
+    /// own (a simulation's) sets nothing and refuses nothing. `None` leaves the host's.
     pub congestion: Option<String>,
 }
 
@@ -287,9 +288,10 @@ impl Config {
             check(lane.notsent_lowat != Some(0), "notsent_lowat must be non-zero")?;
             check(
                 lane.congestion.as_deref().is_none_or(|n| {
-                    (1..crate::tcp::CA_NAME).contains(&n.len()) && n.bytes().all(|b| b.is_ascii_graphic())
+                    (1..crate::tcp::CA_NAME).contains(&n.len())
+                        && n.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
                 }),
-                "congestion must be 1..=15 printable ASCII bytes",
+                "congestion must be 1..=15 bytes of a-z, 0-9 and _, as the kernel's names",
             )?;
         }
         check(!self.handshake_timeout.is_zero() && !self.write_timeout.is_zero(), "timeouts must be non-zero")?;

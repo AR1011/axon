@@ -102,6 +102,8 @@ fn transport(base: &Config, idle: Duration, server: bool) -> Config {
     for lane in Lane::ALL {
         let lane = cfg.lanes.get_mut(lane);
         (lane.compression, lane.limits) = (Compression::None, limits.clone());
+        // The host's congestion control: a refusal on a seed link would reach no event.
+        lane.congestion = None;
     }
     cfg
 }

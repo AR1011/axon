@@ -9,6 +9,7 @@
 //! `AXON_SEEDS=3` puts `nodes` on that many seed servers of this process instead of the in-memory discovery.
 //! `AXON_PAXOS=3` gives `nodes` Paxos leases, the first that many nodes serving as acceptors.
 //! `AXON_TIMINGS=64` turns actor timings on, one message in 64 (and each actor's first).
+//! `AXON_NO_DELAY_RTT_MS=0` sets `streams`' `core.no_delay_rtt` to that many ms: at 0 every child over loopback is far.
 #![expect(clippy::disallowed_methods, reason = "a benchmark measures real time")]
 use std::future::Future;
 use std::sync::Arc;
@@ -565,6 +566,8 @@ async fn site(id: &str, role: &str, discovery: &MemoryDiscovery, streams: usize,
     (hub.max_queued_bytes, hub.max_queued_records) = (4 << 30, 64_000_000);
     cfg.core.store.max_streams = streams + 16;
     cfg.core.rings = vec![RingLimits { namespace: "md".into(), max_records: 64, max_bytes: 16 << 10 }];
+    let no_delay = std::env::var("AXON_NO_DELAY_RTT_MS").ok().and_then(|ms| ms.parse().ok());
+    cfg.core.no_delay_rtt = no_delay.map(Duration::from_millis); // what no push delay costs, when the env asks
     let stream = StreamNode::start(&cluster, cfg).await.unwrap();
     Site { stream, cluster, _system: system }
 }
@@ -689,14 +692,18 @@ async fn streams(count: usize, relays: usize, leaves: usize, rate: usize, one_in
         let (each, rest) = (sent / count as u64, (sent % count as u64) as usize);
         tasks.keys().map(|(_, k)| each + (*k < rest) as u64).sum::<u64>()
     };
+    let pushes = || origin.stream.stats().pushes_out + sum(&mut below(), |s| s.pushes_out);
+    let pushed = pushes();
     let (sent, took, cores) = busy(publish(10)).await;
+    let pushed = pushes() - pushed;
     let expected = expect(&tasks, sent);
     let late = until("deliveries", || delivered.load(Relaxed) >= expected || resets.load(Relaxed) > 0).await;
     println!(
-        "published {:.0} records/s over {count} streams for {took:.1?} at {cores:.2} cores: {} of {expected} delivered, last {late:.2?} after, {} resets",
+        "published {:.0} records/s over {count} streams for {took:.1?} at {cores:.2} cores: {} of {expected} delivered, last {late:.2?} after, {} resets, {:.0} pushes/s",
         sent as f64 / took.as_secs_f64(),
         delivered.load(Relaxed),
-        resets.load(Relaxed)
+        resets.load(Relaxed),
+        pushed as f64 / took.as_secs_f64()
     );
 
     let before = (sum(&mut below(), |s| s.interests_sent), sum(&mut below(), |s| s.interest_keys));

@@ -15,7 +15,7 @@
 #   scripts/ctl.sh [-p port] logs [lines=50]              the tail of the run's log
 #   scripts/ctl.sh [-p port] down | down all              stop what ctl started; evidence stays in target/ctl/evidence
 #
-# api, doctor and shot sign in as that user. -p is needed only when more than one run is up. Output is JSON unless it is a log. AXON_CONSUL, AXON_PAXOS, AXON_KEYS and AXON_CLICKHOUSE
+# api, doctor and shot sign in as that user. -p is needed only when more than one run is up. Output is JSON unless it is a log. AXON_CONSUL, AXON_PAXOS, AXON_KEYS, AXON_CONGESTION and AXON_CLICKHOUSE
 # (with _USER, _PASSWORD) pass through to the playground; see crates/axon/guide/dashboard.md.
 set -euo pipefail
 cd "$(dirname "$0")/.."

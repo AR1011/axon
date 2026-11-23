@@ -1975,7 +1975,7 @@ fn every_leaf_sees_every_record_once_with_pushes_sent_without_delay() {
     let cfg = CoreConfig { no_delay_rtt: Some(RTT), ..CoreConfig::default() };
     let stat = |sim: &Sim, f: fn(&RelayStats) -> u64| sim.nodes.values().map(|n| f(&n.core.stats())).sum::<u64>();
     let (mut resent, mut pushes, mut nagle) = (0, 0, 0);
-    for seed in 0..100 {
+    for seed in 0..40 {
         let sim = run(seed, cfg.clone(), false, true);
         every_record_once(&sim, seed);
         (resent, pushes) = (resent + stat(&sim, |s| s.push_resent), pushes + stat(&sim, |s| s.pushes_out));

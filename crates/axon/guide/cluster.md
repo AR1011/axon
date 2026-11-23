@@ -2177,14 +2177,21 @@ when the maxima are smaller than its push window needs ([telemetry](telemetry.md
 
 BBR with `fq` stays the host default, for links that carry bulk. For thin streams on long lossy links, records that
 each fill a small part of a push, it is not the best choice: such a sender is limited by the application, BBR's rate
-estimate falls, and a lost packet can hold records for seconds. In a measured comparison at 90 to 220 ms and 0.5 %
-loss, loss-based `illinois` beat BBRv1 for these streams. Name it for the lane their namespace uses (`Live` unless
-`StreamNodeConfig::lane` moves it; every session of the lane runs it, to near peers too), and let far children skip
-the push delay that suits near ones:
+estimate falls, and a lost packet can hold records for seconds. That was seen on an outside workload over real long
+lossy links, where loss-based `illinois` delivered these streams sooner than BBRv1. On this repo's `netem` bench
+`illinois` read what BBR with `fq` reads, while `no_delay_rtt` below halved the delay
+([benchmarks](benchmarks.md#thin-streams)). Where a link shows the difference, name it for the lane their namespace uses (`Live` unless
+`StreamNodeConfig::lane` moves it). Every session of that lane runs it, to every peer, near ones too, and on `Live`
+that is every call as well: each protocol that names no lane, `cluster.serve` and telemetry. So give the thin
+namespace a lane of its own and name the congestion control there only: `StreamNodeConfig::lane` puts its pushes on
+`Bulk`, and `Live` keeps the host's default. `Bulk` also carries what protocols and other namespaces put on it
+(uploads, large replies, bulk streams), which then run it too, so this suits a node whose `Bulk` carries little else.
+Let far children skip the push delay that suits near ones:
 
 ```rust,ignore
-cluster_cfg.transport.lanes.live.congestion = Some("illinois".into()); // TCP_CONGESTION on the lane's sockets
-stream_cfg.core.no_delay_rtt = Some(Duration::from_millis(50)); // children at 50 ms or more get each publish at once
+cfg.transport.lanes.bulk.congestion = Some("illinois".into()); // TCP_CONGESTION on Bulk's sockets only
+let mut streams = streams.lane("quotes", Lane::Bulk); // the thin namespace's pushes go on Bulk
+streams.core.no_delay_rtt = Some(Duration::from_millis(50)); // children at 50 ms or more get each publish at once
 ```
 
 The host must allow it: `modprobe tcp_illinois`, and `illinois` in `net.ipv4.tcp_allowed_congestion_control`

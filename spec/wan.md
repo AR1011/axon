@@ -518,11 +518,17 @@ What axon does, and does not:
   [lanes.md §4.4](lanes.md#44-tcp_notsent_lowat)'s, `TCP_CONGESTION` the next item's).
 - **`TCP_CONGESTION` per lane, unset by default.** BBR with the `fq` qdisc it needs stays the host's default, for
   links that carry bulk. `transport.lanes.<lane>.congestion` names another for that lane's sockets, at both ends,
-  where they dial and where they accept. In a measured comparison on long lossy links (90 to 220 ms, 0.5 % loss),
-  loss-based `illinois` beat BBRv1 for thin streams that the application, not the network, limits: BBR's rate
-  estimate falls while such a stream sends little, and recovery after a loss then takes seconds. For such streams,
-  name `illinois` on the lane their namespace uses, together with
-  [`core.no_delay_rtt`](push-window.md#24-the-window). The host must allow it: the `tcp_illinois` module loaded,
+  where they dial and where they accept. On an outside workload over real long lossy links, loss-based
+  `illinois` was seen to deliver thin streams (ones the application, not the network, limits) sooner than BBRv1,
+  whose rate estimate falls while such a stream sends little. This repo's `netem` bench does not reproduce that: at
+  92 and 219 ms with 0.5 and 2 % loss, `illinois` read what BBR with `fq` reads, and better only than BBR without
+  `fq` ([benchmarks](../crates/axon/guide/benchmarks.md#thin-streams)). A socket switched after its handshake keeps
+  the pacing its first algorithm turned on, and read the same as one that started on `illinois`. Where a link
+  shows the difference, name `illinois` on the lane their namespace uses, together with
+  [`core.no_delay_rtt`](push-window.md#24-the-window). Every session of the lane runs it, to every peer, and on
+  `Live` that is every call too (each protocol that names no lane, `cluster.serve`, telemetry). The narrow setup puts
+  the thin namespace on `Bulk` with `StreamNodeConfig::lane` and names the algorithm on `Bulk` only; what else goes on
+  `Bulk` (uploads, large replies, bulk streams) then runs it too. The host must allow it: the `tcp_illinois` module loaded,
   and the name in `net.ipv4.tcp_allowed_congestion_control` (unless the process has `CAP_NET_ADMIN`). A socket that
   refuses the name keeps the host's default and the session still comes up; `Peer::congestion_refused` names it, the
   cluster records the event `tcp_congestion_refused` once per lane, and `TcpHealth::congestion` reads back
