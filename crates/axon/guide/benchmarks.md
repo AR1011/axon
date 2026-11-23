@@ -1254,10 +1254,15 @@ The harness's `t` cells: the origin publishes one 64 B record every 5 ms (200 a 
 with the wall clock, and the child times each one's delivery. Both namespaces share the box's clock, so a delay is one
 way: half the round trip at best. `n` sets [`core.no_delay_rtt`](../../../spec/push-window.md#24-the-window) to 20 ms on
 both nodes; `_illinois` names `illinois` as the `Live` lane's `LaneConfig::congestion`, so the stream's connection runs
-it from just after its handshake while the namespace's default stays BBR. The branch perf/relay-push-pipeline at
-738a0df with its review fixes, on build-1 on 2026-11-23, §8's settings with `fq` unless noted, at a load of 0.1 to 2.3.
-The child's delivery delay in ms, p50 / p99, the median of three runs (the p99's range in brackets), and the origin's
-pushes a second:
+it from just after its handshake while the namespace's default stays BBR; `b` puts the namespace on `Bulk`, so the
+lane named is `Bulk`'s. The harness of 3e6e7e7 (the cells marked † ran at 3e6e7e7 itself, the others from its tree
+before the commit), on build-1 (Ryzen 9 9900X, governor `performance`) on 2026-11-23, §8's settings with `fq` unless
+noted, at a 1-minute load of 0.0 to 1.3 as each run began. The cells, each `scripts/relay-wan.sh box <bin> <out> 3 <cell..>` as root:
+`219:0:1:axon1t`, `219:0:1:axon1tn`, and for 92 ms at 0.5 % and 219 ms at 0.5 and 2 % `axon1t`, `axon1tn`,
+`axon1t_illinois` (0.5 % only) and `axon1tn_illinois`; without `fq`, `219:<loss>:2:axon1tn`,
+`219:<loss>:2:axon1tn_illinois` and `219:<loss>:3:axon1tn`; on `Bulk`, `219:<loss>:1:axon1btn_illinois`. The child's
+delivery delay in ms, p50 / p99, the median of three runs (the p99's range in brackets), and the origin's pushes a
+second:
 
 | Cell | Nagle's rule | pushes/s | `no_delay_rtt` | pushes/s | `no_delay_rtt` and `illinois` |
 |---|---|---|---|---|---|
@@ -1265,32 +1270,37 @@ pushes a second:
 | 92 ms, 0.5 % | 94.8 / 228.3 (215.0 to 283.1) | 10.3 | 46.0 / 148.7 (145.7 to 153.4) | 196.6 | 46.0 / 143.2 (138.1 to 143.8) |
 | 219 ms, 0.5 % | 259.9 / 585.0 (557.4 to 1117.0) | 4.0 | 109.5 / 413.0 (333.7 to 419.8) | 161.3 | 109.5 / 413.4 (328.6 to 456.6) |
 | 219 ms, 2 % | 318.2 / 1046.3 (706.8 to 1199.5) | 3.6 | 180.3 / 488.6 (428.3 to 1160.1) | 138.3 | 178.2 / 457.5 (426.0 to 515.1) |
+| 219 ms, 0.5 %, on `Bulk` † | | | | | 109.5 / 447.8 (333.7 to 452.9), 167.8 pushes/s |
+| 219 ms, 2 %, on `Bulk` † | | | | | 183.5 / 451.7 (396.7 to 528.9), 142.8 pushes/s |
 
 Under the rule a record waits for the answer to the push ahead of it, about a round trip, on top of the link's own
-half: the p50 at 219 ms is 242 ms with no loss, against 110 ms without the rule. `no_delay_rtt` halves the p50 in every
-cell and cuts the p99 by 30 to 53 %, at 19 to 45 times the calls: one push per record, not one per round trip.
+half: the p50 at 219 ms is 242 ms with no loss, against 110 ms without the rule. `no_delay_rtt` cuts the p50 by 43 to
+58 % and the p99 by 29 to 53 %, at 19 to 46 times the calls: one push per record, not one per round trip.
 `illinois` alone, with the rule kept, read 96.6 / 245.8 at 92 ms and 257.9 / 614.7 at 219 ms, 0.5 %: no change. With
-`no_delay_rtt` it changed nothing beyond the runs' spread either. In every cell resets and gaps were 0.
+`no_delay_rtt` it changed nothing beyond the runs' spread either, on `Live` or on `Bulk`: the narrow setup of the
+[cluster guide](cluster.md) reads what the stream's lane alone does. In every cell resets and gaps were 0.
 
 Without `fq` (tuned 2 and 3 of the script, `pfifo_fast` on each node's `eth0`), the same thin stream with `no_delay_rtt`:
 
 | Cell | BBR, no `fq` | BBR, no `fq`, the lane on `illinois` | `illinois` the namespace's default, no `fq` |
 |---|---|---|---|
 | 219 ms, 0.5 % | 109.5 / 457.8 (380.1 to 474.0) | 109.5 / 338.8 (323.4 to 368.5) | 109.5 / 328.6 (323.6 to 394.3) |
-| 219 ms, 2 % | 182.1 / 839.6 (531.5 to 1108.0) | | 185.7 / 487.8 (443.1 to 503.0) |
+| 219 ms, 2 % | 182.1 / 839.6 (531.5 to 1108.0) | 193.0 / 554.0 (439.9 to 624.0) † | 185.7 / 487.8 (443.1 to 503.0) |
 
 BBR without `fq` had the longest tail. `illinois` without `fq` reads what BBR
 with `fq` does. A socket switched to `illinois` after its handshake keeps the pacing BBR turned on: `bpftrace` on
 `tcp_sendmsg` saw `sk_pacing_status` 1 (TCP's own pacing) on every send of the switched sockets, 0 (none) where
-`illinois` was the namespace's default, and 2 (`fq`) with `fq`. The delays of the two were the same within the runs'
-spread, so the lane's setting needs no `fq` of its own. `ss -tin` showed `illinois` on the `Live` sockets only, `bbr`
-on the others.
+`illinois` was the namespace's default, and 2 (`fq`) with `fq` (the 0.5 % cells only). In the two cells run, the
+switched socket's p99 was 338.8 against 328.6 and 554.0 against 487.8, with the ranges overlapping: no difference
+shows beyond the spread of three runs, which two cells cannot rule out. `ss -tin` showed `illinois` on the `Live`
+sockets only, `bbr` on the others.
 
 What this establishes: on this box's `netem`, Nagle's rule costs a thin stream about a round trip of delay, and
 `no_delay_rtt` takes it away, for one push per record. It does not show `illinois` doing better than BBR with `fq`, the
 host default of [wan.md § 8](../../../spec/wan.md#8-host-tcp-settings). On an outside workload over real long lossy
 links, `illinois` was seen to deliver such streams sooner than BBRv1; that is not reproduced here, where `netem`'s loss
-is random and its queue deep. These runs are in `target/pp-wan/` of the tree that ran them.
+is random and its queue deep. These runs are in `target/pp-wan/` of the tree that ran them (`f1`, `loss2`, `pace-*`,
+and `extra` for †).
 
 ### History on disk
 
@@ -2482,6 +2492,26 @@ A keyed actor is named `kind/key` now, which costs each keyed start a string and
 table. `scale keyed 100000` (one node, `MemoryLeases`, 1 ms lease) on the EPYC 4484PX, three runs each against
 fa66963, load under 1.5: 54.4–55.2 k/s before, 53.4–55.0 k/s now. What it establishes: the name is lost in the
 run-to-run spread of a keyed start. What it does not: calls to a running key, which never reach the name.
+
+### No push delay at scale
+
+What [`core.no_delay_rtt`](../../../spec/push-window.md#24-the-window) costs when every child is far:
+`AXON_NO_DELAY_RTT_MS=0 taskset -c 0-15 scale streams 50000`, so every channel with a known round trip skips Nagle's
+rule over loopback. On build-1 (Ryzen 9 9900X) on 2026-11-23, five rounds of base, head and head at zero in turn, at
+a 1-minute load of 1.1 to 2.3. Base is b6c874a with head's `scale.rs` less its two `no_delay_rtt` lines, so it prints
+pushes too; head is the tree committed as 3e6e7e7, run before the commit. The publishing phase, 200 k records/s over
+50 k streams, the median of five with the range:
+
+| `scale streams 50000` | cores | pushes/s |
+|---|---|---|
+| base | 3.85 (3.81 to 3.99) | 22.3 k (22.0 k to 24.6 k) |
+| head, `no_delay_rtt` `None` | 3.90 (3.75 to 3.96) | 23.6 k (21.0 k to 23.9 k) |
+| head, `no_delay_rtt` zero | 4.59 (4.47 to 4.79) | 67.2 k (63.1 k to 71.3 k) |
+
+With the setting off, head and base overlap in both columns; in round 4 head read 3.75 cores and 21.0 k pushes against
+base's 3.99 and 24.6 k, so the gap in the medians is the spread, as the push count follows how soon answers come. At
+zero, against base: 19 % more cores and 3 times the pushes. Every record was delivered in each run, with no reset. The
+logs are in `target/pp-wan/scale/` of the tree that ran them.
 
 ## Whole-cluster simulation (`axon-testkit`)
 

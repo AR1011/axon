@@ -273,7 +273,9 @@ pub struct CoreConfig {
     /// A channel whose round trip is at least this long sends what is published at once, up to its window, even while
     /// a push that took all there was is in flight. Below it, or with `None` (the default), what is published then
     /// waits for that push's answer and goes in one push (Nagle's rule, spec/push-window.md §2.4): fewer calls, but at
-    /// most one push per round trip, so on a long link with loss a record can wait several round trips.
+    /// most one push per round trip, so on a long link with loss a record can wait several round trips. Past it, a call
+    /// per publish while pushes are in flight: `scale streams 50000` with every child far took 4.59 cores against 3.85
+    /// and 67 k pushes a second against 22 k (crates/axon/guide/benchmarks.md, No push delay at scale).
     pub no_delay_rtt: Option<Duration>,
     /// The lane each namespace's pushes go on, `Live` for a namespace not named: a channel, its window and its pushes
     /// are per child and lane, and a push carries the namespaces of one lane only.

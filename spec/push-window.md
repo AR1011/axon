@@ -185,12 +185,13 @@ window  = clamp(3 × rate × rtt, floor, max_push_window)
   records of 64 B a second to one child, [benchmarks](../crates/axon/guide/benchmarks.md#thin-streams)) the setting
   cut the median delivery delay from 260 to 110 ms at 219 ms and 0.5 % loss (p99 585 to 413 ms), and from 318 to
   180 ms at 2 % (p99 1046 to 489 ms), with no gap or reset. The cost is the one the rule saves: a call per publish
-  while pushes are in flight, 4 pushes a second becoming 140 to 190 there. `scale-streams` with `no_delay_rtt` at
-  zero, so that every child over loopback is far, went from 3.90 to 4.59 cores and from 23.6 k to 67.2 k pushes a
-  second (medians of 5 runs, base 3.85 cores). Set it on nodes whose
-  children are far away and whose streams are thin, to a value above the near round trips and below the far ones
-  (for example 50 ms: the near ones then keep the rule), and pair it with a congestion control that suits such a
-  stream ([wan.md §8](wan.md#8-host-tcp-settings)). Tests (`src/core/tests.rs`):
+  while pushes are in flight, about 4 pushes a second at 219 ms becoming 137 to 192 there. `scale-streams` with `no_delay_rtt` at
+  zero, so that every child over loopback is far, went from 3.85 to 4.59 cores and from 22.3 k to 67.2 k pushes a
+  second against base, medians of 5 runs
+  ([benchmarks](../crates/axon/guide/benchmarks.md#no-push-delay-at-scale)). Set it on nodes whose children are far
+  away and whose streams are thin, to a value above the near round trips and below the far ones (for example 50 ms:
+  the near ones then keep the rule). The host's congestion control can stay: on the same cells `illinois` read what
+  BBR with `fq` reads ([wan.md §8](wan.md#8-host-tcp-settings)). Tests (`src/core/tests.rs`):
   `a_channel_past_no_delay_rtt_sends_each_publish_while_pushes_are_in_flight`,
   `pushes_past_no_delay_rtt_stop_at_the_most_pushes_and_bytes_a_channel_holds_in_flight`,
   `pushes_past_no_delay_rtt_go_again_in_order_after_a_lost_answer`; under faults

@@ -151,7 +151,8 @@ pub struct LaneConfig {
     /// waits in the bounded outbox. `None` leaves the kernel's default.
     pub notsent_lowat: Option<u32>,
     /// `TCP_CONGESTION` on the lane's sockets, on Linux, such as `illinois`: the congestion control they run instead of
-    /// the host's `tcp_congestion_control`, on every session of the lane, its calls too. One the kernel refuses (not
+    /// the host's `tcp_congestion_control`, on every session of the lane, its calls too, except a seed server's and its
+    /// discovery's, which keep the host's. One the kernel refuses (not
     /// loaded, not in `net.ipv4.tcp_allowed_congestion_control`, or not Linux) leaves the host's, and the session still
     /// comes up: [`Peer::congestion_refused`](crate::Peer::congestion_refused) names it. A session with no socket of its
     /// own (a simulation's) sets nothing and refuses nothing. `None` leaves the host's.

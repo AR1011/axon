@@ -2176,11 +2176,10 @@ when the maxima are smaller than its push window needs ([telemetry](telemetry.md
 `net.core.wmem_max` or `rmem_max`.
 
 BBR with `fq` stays the host default, for links that carry bulk. For thin streams on long lossy links, records that
-each fill a small part of a push, it is not the best choice: such a sender is limited by the application, BBR's rate
-estimate falls, and a lost packet can hold records for seconds. That was seen on an outside workload over real long
-lossy links, where loss-based `illinois` delivered these streams sooner than BBRv1. On this repo's `netem` bench
-`illinois` read what BBR with `fq` reads, while `no_delay_rtt` below halved the delay
-([benchmarks](benchmarks.md#thin-streams)). Where a link shows the difference, name it for the lane their namespace uses (`Live` unless
+each fill a small part of a push, this repo's `netem` bench ([benchmarks](benchmarks.md#thin-streams)) found two
+things. `no_delay_rtt` below took away about a round trip of delay. A lane on loss-based `illinois` read what BBR with
+`fq` reads, and better only than BBR without `fq`. On an outside workload over real long lossy links, not measured
+here, `illinois` was seen to deliver such streams sooner than BBRv1. Where a link shows that, name it for the lane their namespace uses (`Live` unless
 `StreamNodeConfig::lane` moves it). Every session of that lane runs it, to every peer, near ones too, and on `Live`
 that is every call as well: each protocol that names no lane, `cluster.serve` and telemetry. So give the thin
 namespace a lane of its own and name the congestion control there only: `StreamNodeConfig::lane` puts its pushes on
@@ -2190,9 +2189,13 @@ Let far children skip the push delay that suits near ones:
 
 ```rust,ignore
 cfg.transport.lanes.bulk.congestion = Some("illinois".into()); // TCP_CONGESTION on Bulk's sockets only
-let mut streams = streams.lane("quotes", Lane::Bulk); // the thin namespace's pushes go on Bulk
+let mut streams = streams.lane("status", Lane::Bulk); // the thin namespace's pushes go on Bulk
 streams.core.no_delay_rtt = Some(Duration::from_millis(50)); // children at 50 ms or more get each publish at once
 ```
+
+The cost is a call per publish to a far child while pushes are in flight. On the thin cells at 219 ms about 4 pushes a
+second became 137 to 192; with every child far, `scale-streams` went from 3.85 to 4.59 cores and from 22.3 k to 67.2 k pushes a
+second ([benchmarks](benchmarks.md#no-push-delay-at-scale)).
 
 The host must allow it: `modprobe tcp_illinois`, and `illinois` in `net.ipv4.tcp_allowed_congestion_control`
 (unless the process has `CAP_NET_ADMIN`). A socket that refuses the name runs the host's default and the session still

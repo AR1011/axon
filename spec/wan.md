@@ -523,7 +523,8 @@ What axon does, and does not:
   whose rate estimate falls while such a stream sends little. This repo's `netem` bench does not reproduce that: at
   92 and 219 ms with 0.5 and 2 % loss, `illinois` read what BBR with `fq` reads, and better only than BBR without
   `fq` ([benchmarks](../crates/axon/guide/benchmarks.md#thin-streams)). A socket switched after its handshake keeps
-  the pacing its first algorithm turned on, and read the same as one that started on `illinois`. Where a link
+  the pacing its first algorithm turned on; in the two cells run it read within the spread of one that started on
+  `illinois`. Where a link
   shows the difference, name `illinois` on the lane their namespace uses, together with
   [`core.no_delay_rtt`](push-window.md#24-the-window). Every session of the lane runs it, to every peer, and on
   `Live` that is every call too (each protocol that names no lane, `cluster.serve`, telemetry). The narrow setup puts
