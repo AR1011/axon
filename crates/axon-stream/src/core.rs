@@ -270,6 +270,11 @@ pub struct CoreConfig {
     /// The most bytes in flight to every child together, past each one's first push, shared fairly between the busy
     /// ones. At least `max_push_window`.
     pub max_push_inflight: usize,
+    /// A channel whose round trip is at least this long sends what is published at once, up to its window, even while
+    /// a push that took all there was is in flight. Below it, or with `None` (the default), what is published then
+    /// waits for that push's answer and goes in one push (Nagle's rule, spec/push-window.md §2.4): fewer calls, but at
+    /// most one push per round trip, so on a long link with loss a record can wait several round trips.
+    pub no_delay_rtt: Option<Duration>,
     /// The lane each namespace's pushes go on, `Live` for a namespace not named: a channel, its window and its pushes
     /// are per child and lane, and a push carries the namespaces of one lane only.
     pub lanes: BTreeMap<String, Lane>,
@@ -299,6 +304,7 @@ impl Default for CoreConfig {
             max_push_items: 1024,
             max_push_window: 64 << 20,
             max_push_inflight: 256 << 20,
+            no_delay_rtt: None,
             lanes: BTreeMap::new(),
             max_interest_bytes: usize::MAX,
         }
@@ -1627,23 +1633,25 @@ impl<A: Authorizer> RelayCore<A> {
             return Some((id, push.bytes.clone()));
         }
         // The first push in flight always goes, so a channel is never slower than one push per round trip. Another
-        // goes while at least half a push fits the window and the node-wide cap, and the last one was not `drained`: a
-        // smaller one would cost a call for little.
+        // goes while at least half a push fits the window and the node-wide cap, and the last one was not `drained`
+        // (unless the round trip is `no_delay_rtt` or longer): a smaller one would cost a call for little.
         let (mut budget, least) = (self.cfg.max_push_bytes, self.cfg.max_push_bytes / 2);
         if !entry.unacked.is_empty() {
             entry.window = entry.window(&self.cfg, now);
             budget = budget.min(entry.window.saturating_sub(entry.inflight));
-            if entry.drained == Some(self.hub.terminals())
+            let no_delay = rtt.zip(self.cfg.no_delay_rtt).is_some_and(|(rtt, at)| rtt >= at);
+            let waits = !entry.ready.is_empty() || !entry.paths.is_empty();
+            if !waits
+                || (!no_delay && entry.drained == Some(self.hub.terminals()))
                 || entry.unacked.len() >= MAX_PUSHES_IN_FLIGHT
                 || budget < least
             {
                 return None;
             }
-            let waits = !entry.ready.is_empty() || !entry.paths.is_empty();
             let (room, slots) = self.cap_room(node, lane);
             if slots == 0 || room < least {
                 // Once a wait: a channel asked again before the cap frees room still waits the same wait.
-                if waits && self.capped.insert((self.downstream[node].peer.node.clone(), lane)) {
+                if self.capped.insert((self.downstream[node].peer.node.clone(), lane)) {
                     self.stats.push_capped += 1;
                 }
                 return None;

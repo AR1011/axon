@@ -979,10 +979,10 @@ async fn a_capped_session_still_answers_pings_on_time() {
 
 /// What the session's first TCP sample read back.
 #[cfg(target_os = "linux")]
-async fn lowat(s: &Session) -> Option<u32> {
+async fn tcp(s: &Session) -> TcpHealth {
     for _ in 0..100 {
         if let Some(tcp) = s.sender.stats().tcp {
-            return tcp.notsent_lowat;
+            return tcp;
         }
         tokio::time::sleep(10 * MS).await;
     }
@@ -1005,6 +1005,42 @@ async fn tcp_notsent_lowat_is_set_on_dialled_and_accepted_sockets() {
     ] {
         let client = connect(listener.local_addr(), lane, None, &config("client")).await.unwrap();
         let server = listener.accept().await.unwrap();
-        assert_eq!((lowat(&client).await, lowat(&server).await), (dialled, accepted), "{lane:?}");
+        let (dialled_now, accepted_now) = (tcp(&client).await.notsent_lowat, tcp(&server).await.notsent_lowat);
+        assert_eq!((dialled_now, accepted_now), (dialled, accepted), "{lane:?}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_lanes_congestion_control_is_set_on_both_ends_and_one_refused_keeps_the_hosts() {
+    let host = axon_net::host_tcp().expect("a Linux host").congestion;
+    // reno is built into every kernel and allowed to every process; the host default must differ for the set to show.
+    let named = if host == "reno" { "cubic" } else { "reno" };
+    let (mut server, mut client) = (config("server"), config("client"));
+    for cfg in [&mut server, &mut client] {
+        (cfg.lanes.live.congestion, cfg.lanes.bulk.congestion) = (Some(named.into()), Some("no-such".into()));
+    }
+    let any = "127.0.0.1:0".parse().unwrap();
+    let mut listener = Listener::bind(any, None, server, AcceptLimits::default()).await.unwrap();
+    for (lane, runs, refused) in
+        [(Lane::Control, host.as_str(), None), (Lane::Live, named, None), (Lane::Bulk, host.as_str(), Some("no-such"))]
+    {
+        let client = connect(listener.local_addr(), lane, None, &client).await.expect("a refused one still connects");
+        let server = listener.accept().await.unwrap();
+        for (side, s) in [("dialled", &client), ("accepted", &server)] {
+            assert_eq!(tcp(s).await.congestion.as_deref(), Some(runs), "{lane:?} {side}");
+            assert_eq!(s.peer().congestion_refused.as_deref(), refused, "{lane:?} {side}");
+        }
+        client.sender.submit(frame(0, vec![7; 16]), None).await.unwrap();
+        assert!(read_in_order(server, 1).await.is_ok(), "{lane:?} carries frames");
+    }
+}
+
+#[test]
+fn a_congestion_control_name_the_kernel_could_not_hold_is_refused_by_validate() {
+    for (name, ok) in [("illinois", true), ("", false), ("a-name-of-16-byt", false), ("bb r", false)] {
+        let mut cfg = config("a");
+        cfg.lanes.bulk.congestion = Some(name.into());
+        assert_eq!(cfg.validate(false).is_ok(), ok, "{name:?}");
     }
 }

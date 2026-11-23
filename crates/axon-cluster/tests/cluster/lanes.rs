@@ -340,3 +340,33 @@ async fn a_tell_to_an_endpoint_that_has_gone_counts_under_its_protocol() {
     assert_eq!((at(&at_b, "sent", &counter), at(&at_b, "received", &zero)), (Some(1), Some(1)), "{at_b:?}");
     settled(&b).await;
 }
+
+/// A congestion control a lane names that the sockets refuse leaves the host's: the calls still go, and each node tells
+/// it once a lane, however many sessions of the lane refuse it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_congestion_control_the_sockets_refuse_is_told_once_and_the_lane_still_carries_calls() {
+    let refused = |cfg: &mut ClusterConfig| {
+        cfg.transport.lanes.live.congestion = Some("no-such".into());
+        // Closed after 300 ms unused rather than the shipped 5 min, so a second session opens soon.
+        cfg.idle_link_timeout = Duration::from_millis(300);
+    };
+    let discovery = MemoryDiscovery::new();
+    let (a, b) = (node_with("a", discovery.clone(), refused).await, node_with("b", discovery, refused).await);
+    sees(&b, 2).await;
+    a.cluster.endpoint("echo", 7, 1).serve(echo).unwrap();
+    for session in 0..2 {
+        b.cluster.request("a", "echo", 7, 1, Bytes::from_static(b"x")).await.expect("a call on the Live lane");
+        eventually("the idle links are closed", async || {
+            b.cluster.stats().engine.peers.is_empty() && a.cluster.stats().engine.peers.is_empty()
+        })
+        .await;
+        assert_eq!(b.cluster.stats().engine.connects, 2 * (session + 1), "Control and Live, each time");
+    }
+    let detail = "Live: the socket refused it and runs the host's default".to_owned();
+    let once = [("tcp_congestion_refused", "no-such".to_owned(), detail)];
+    for (name, node) in [("a", &a), ("b", &b)] {
+        let told: Vec<_> = told(&node.cluster).into_iter().filter(|e| e.0 == "tcp_congestion_refused").collect();
+        assert_eq!(told, once, "{name}");
+    }
+    settled(&b).await;
+}

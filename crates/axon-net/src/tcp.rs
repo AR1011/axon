@@ -23,6 +23,8 @@ pub struct TcpHealth {
     /// `TCP_NOTSENT_LOWAT`: at most this much unsent in the send buffer. `None` where it is the kernel's default or
     /// the platform does not report it.
     pub notsent_lowat: Option<u32>,
+    /// `TCP_CONGESTION`: the congestion control the socket runs, on Linux.
+    pub congestion: Option<String>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
@@ -54,6 +56,11 @@ pub(crate) fn sample(fd: i32) -> Option<TcpHealth> {
         notsent_lowat: info::<libc::c_int>(fd, libc::TCP_NOTSENT_LOWAT)
             .and_then(|n| u32::try_from(n).ok())
             .filter(|&n| n != 0),
+        #[cfg(target_os = "linux")]
+        congestion: info::<[u8; CA_NAME]>(fd, libc::TCP_CONGESTION).and_then(|name| {
+            let name = &name[..name.iter().position(|&b| b == 0).unwrap_or(CA_NAME)];
+            std::str::from_utf8(name).ok().filter(|n| !n.is_empty()).map(str::to_owned)
+        }),
         ..Default::default()
     })
 }
@@ -61,18 +68,39 @@ pub(crate) fn sample(fd: i32) -> Option<TcpHealth> {
 /// The caller must own the socket behind `fd` for the duration of the call.
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code, reason = "setsockopt has no safe wrapper; the SAFETY note below carries the argument")]
+fn set(fd: i32, option: libc::c_int, value: &[u8]) -> std::io::Result<()> {
+    let len = value.len() as libc::socklen_t;
+    // SAFETY: the kernel reads `len` bytes from a live slice of that length.
+    let done = unsafe { libc::setsockopt(fd, libc::IPPROTO_TCP, option, value.as_ptr().cast(), len) };
+    if done == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+}
+
+/// The caller must own the socket behind `fd` for the duration of the call.
+#[cfg(target_os = "linux")]
 pub(crate) fn set_notsent_lowat(fd: i32, bytes: u32) -> std::io::Result<()> {
     let value = libc::c_int::try_from(bytes).unwrap_or(libc::c_int::MAX);
-    let len = size_of::<libc::c_int>() as libc::socklen_t;
-    // SAFETY: the kernel reads `len` bytes from a live c_int.
-    let done =
-        unsafe { libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_NOTSENT_LOWAT, (&raw const value).cast(), len) };
-    if done == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+    set(fd, libc::TCP_NOTSENT_LOWAT, &value.to_ne_bytes())
 }
 
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn set_notsent_lowat(_: i32, _: u32) -> std::io::Result<()> {
     Ok(())
+}
+
+/// The longest congestion control name the kernel takes, with its closing zero (`TCP_CA_NAME_MAX`).
+pub(crate) const CA_NAME: usize = 16;
+
+/// The caller must own the socket behind `fd` for the duration of the call. Refused where the algorithm is not loaded,
+/// or this process may not use it (`net.ipv4.tcp_allowed_congestion_control`, unless it has `CAP_NET_ADMIN`).
+#[cfg(target_os = "linux")]
+pub(crate) fn set_congestion(fd: i32, name: &str) -> std::io::Result<()> {
+    set(fd, libc::TCP_CONGESTION, name.as_bytes())
+}
+
+/// Only Linux has `TCP_CONGESTION`: elsewhere every name is refused, and the session keeps the host's default.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn set_congestion(_: i32, _: &str) -> std::io::Result<()> {
+    Err(std::io::ErrorKind::Unsupported.into())
 }
 
 #[cfg(target_vendor = "apple")]

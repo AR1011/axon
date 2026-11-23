@@ -150,11 +150,22 @@ pub struct LaneConfig {
     /// `TCP_NOTSENT_LOWAT` on the lane's sockets, on Linux: the kernel holds at most this much unsent, so the rest
     /// waits in the bounded outbox. `None` leaves the kernel's default.
     pub notsent_lowat: Option<u32>,
+    /// `TCP_CONGESTION` on the lane's sockets, on Linux, such as `illinois`: the congestion control they run instead of
+    /// the host's `tcp_congestion_control`. One the kernel refuses (not loaded, or not in
+    /// `net.ipv4.tcp_allowed_congestion_control`) leaves the host's, and the session still comes up:
+    /// [`Peer::congestion_refused`](crate::Peer::congestion_refused) names it. `None` leaves the host's.
+    pub congestion: Option<String>,
 }
 
 impl LaneConfig {
     fn new(limits: Limits) -> Self {
-        Self { limits, compression: Compression::None, max_bytes_per_sec: None, notsent_lowat: Some(128 << 10) }
+        Self {
+            limits,
+            compression: Compression::None,
+            max_bytes_per_sec: None,
+            notsent_lowat: Some(128 << 10),
+            congestion: None,
+        }
     }
 }
 
@@ -274,6 +285,12 @@ impl Config {
             check(permits.contains(&l.inbound_bytes), "inbound_bytes must hold one maximal frame")?;
             check(lane.max_bytes_per_sec != Some(0), "max_bytes_per_sec must be non-zero")?;
             check(lane.notsent_lowat != Some(0), "notsent_lowat must be non-zero")?;
+            check(
+                lane.congestion.as_deref().is_none_or(|n| {
+                    (1..crate::tcp::CA_NAME).contains(&n.len()) && n.bytes().all(|b| b.is_ascii_graphic())
+                }),
+                "congestion must be 1..=15 printable ASCII bytes",
+            )?;
         }
         check(!self.handshake_timeout.is_zero() && !self.write_timeout.is_zero(), "timeouts must be non-zero")?;
         LinkTimings::of(self).validate(self)

@@ -676,6 +676,124 @@ fn a_backlog_of_small_records_read_back_from_the_ring_fills_the_window() {
     assert!(origin.next_push("c", Lane::Live, now, None).is_some(), "the rest of the backlog with a push in flight");
 }
 
+/// A parent whose channels 100 ms or more away send without delay, with one stream of no records, and a child `c` that
+/// follows it through subscription `id`: (parent, child, id).
+fn without_delay(cfg: CoreConfig, now: Instant) -> (RelayCore, RelayCore, u64) {
+    // The threshold under test, between the near and far round trips below.
+    let cfg = CoreConfig { relay: false, no_delay_rtt: Some(Duration::from_millis(100)), ..cfg };
+    let mut origin = origin(&cfg, 1, 0);
+    let (o, c) = (PeerId::new("o", 1), PeerId::new("c", 1));
+    let mut child = RelayCore::new(&c, AllowAll, CoreConfig::default()).expect("a valid config");
+    let id = child.subscribe(&key(0), SubscribeOptions { start: StartPosition::First, ..Default::default() });
+    ask(&mut origin, &o, &mut child, &c, now);
+    deliver(&mut origin, &o, &mut child, &c, now);
+    (origin, child, id.expect("subscribes"))
+}
+
+const NEAR: Duration = Duration::from_millis(20);
+const FAR: Duration = Duration::from_millis(200);
+
+fn hand(child: &mut RelayCore, body: &Bytes, now: Instant) -> PushAnswer {
+    let (channel, seq, push) = wire::decode_push(&mut body.slice(1..)).expect("a push decodes");
+    child.handle_push(&PeerId::new("o", 1), Lane::Live, 1, channel, seq, push, now)
+}
+
+#[test]
+fn a_channel_past_no_delay_rtt_sends_each_publish_while_pushes_are_in_flight() {
+    let (c, now) = (PeerId::new("c", 1), Instant::now());
+    let (mut origin, mut child, id) = without_delay(CoreConfig::default(), now);
+    let mut sent = Vec::new();
+    for n in 1..=4u8 {
+        origin.publish(&key(0), vec![Bytes::from(vec![n])]).expect("publishes");
+        sent.push(origin.next_push("c", Lane::Live, now, Some(FAR)).expect("a push for each record, unanswered"));
+    }
+    let first = sent[0].0.seq;
+    let seqs: Vec<u64> = sent.iter().map(|(id, _)| id.seq - first).collect();
+    assert_eq!(seqs, [0, 1, 2, 3], "four in flight, in order");
+    for (push, body) in sent {
+        let answer = hand(&mut child, &body, now);
+        origin.push_answered(&c, Lane::Live, push, answer, now);
+    }
+    assert_eq!(records(&mut child, id), [1, 2, 3, 4]);
+
+    // Nearer than `no_delay_rtt`, Nagle's rule holds on the same channel.
+    origin.publish(&key(0), vec![Bytes::from_static(b"x")]).expect("publishes");
+    origin.next_push("c", Lane::Live, now, Some(NEAR)).expect("the first push in flight always goes");
+    origin.publish(&key(0), vec![Bytes::from_static(b"x")]).expect("publishes");
+    assert!(origin.next_push("c", Lane::Live, now, Some(NEAR)).is_none(), "a near child waits for the answer");
+    assert!(origin.next_push("c", Lane::Live, now, Some(FAR)).is_some(), "a far one does not");
+}
+
+#[test]
+fn pushes_past_no_delay_rtt_stop_at_the_most_pushes_and_bytes_a_channel_holds_in_flight() {
+    let (c, now) = (PeerId::new("c", 1), Instant::now());
+    let (mut origin, _, _) = without_delay(CoreConfig::default(), now);
+    let mut pushes = Vec::new();
+    for _ in 0..100 {
+        origin.publish(&key(0), vec![Bytes::from_static(b"x")]).expect("publishes");
+        pushes.extend(origin.next_push("c", Lane::Live, now, Some(FAR)));
+    }
+    assert_eq!(pushes.len(), MAX_PUSHES_IN_FLIGHT, "one push of one record each, up to the most in flight");
+    // An answer frees one push, which takes the 36 records that waited.
+    origin.push_answered(&c, Lane::Live, pushes[0].0, applied(pushes[0].0.seq), now);
+    let (_, body) = origin.next_push("c", Lane::Live, now, Some(FAR)).expect("one push frees one");
+    let (_, _, push) = wire::decode_push(&mut body.slice(1..)).expect("a push decodes");
+    let batched = |item: &Item| if let Item::Batch(batch) = item { batch.len() } else { 0 };
+    assert_eq!(push.items.iter().map(|(_, _, item)| batched(item)).sum::<usize>(), 36);
+    assert!(origin.next_push("c", Lane::Live, now, Some(FAR)).is_none());
+
+    // Pushes of 12 KiB records in a 128 KiB window: the eighth leaves under half a 64 KiB push of room (8 x 12 KiB is
+    // 96 KiB without the headers), so it is the last.
+    let (mut origin, _, _) = without_delay(scaled(), now);
+    let mut pushes = 0;
+    for _ in 0..16 {
+        origin.publish(&key(0), vec![Bytes::from(vec![7u8; 12 << 10])]).expect("publishes");
+        pushes += usize::from(origin.next_push("c", Lane::Live, now, Some(FAR)).is_some());
+    }
+    let (_, _, channel) = origin.channels().next().expect("a channel");
+    assert_eq!((pushes, channel.window), (8, 128 << 10));
+    assert!(channel.inflight <= channel.window, "{} bytes in flight", channel.inflight);
+}
+
+#[test]
+fn pushes_past_no_delay_rtt_go_again_in_order_after_a_lost_answer() {
+    let (c, now) = (PeerId::new("c", 1), Instant::now());
+    let (mut origin, mut child, id) = without_delay(CoreConfig::default(), now);
+    let mut sent = Vec::new();
+    for n in 1..=4u8 {
+        origin.publish(&key(0), vec![Bytes::from(vec![n])]).expect("publishes");
+        sent.extend(origin.next_push("c", Lane::Live, now, Some(FAR)));
+    }
+    assert_eq!(sent.len(), 4, "four pushes in flight");
+    let first = sent[0].0.seq;
+    // The child applies the first, whose answer is lost; the second call fails before it arrives; the third and fourth
+    // come after a gap.
+    assert_eq!(hand(&mut child, &sent[0].1, now), applied(first));
+    origin.push_failed(&c, Lane::Live, sent[0].0, now);
+    origin.push_failed(&c, Lane::Live, sent[1].0, now);
+    for (push, body) in &sent[2..] {
+        let answer = hand(&mut child, body, now);
+        assert_eq!(answer, PushAnswer::Skipped { applied: first });
+        origin.push_answered(&c, Lane::Live, *push, answer, now);
+    }
+    // The three the child lacks go again in order, as the same bytes, and a record published since after them.
+    origin.publish(&key(0), vec![Bytes::from_static(&[5])]).expect("publishes");
+    let mut again = Vec::new();
+    while let Some(push) = origin.next_push("c", Lane::Live, now, Some(FAR)) {
+        again.push(push);
+    }
+    assert_eq!(again.iter().map(|(id, _)| id.seq - first).collect::<Vec<_>>(), [1, 2, 3, 4]);
+    assert!(again[..3].iter().zip(&sent[1..]).all(|(a, s)| a.1 == s.1), "the same bytes");
+    for (push, body) in again {
+        let answer = hand(&mut child, &body, now);
+        assert_eq!(answer, applied(push.seq));
+        origin.push_answered(&c, Lane::Live, push, answer, now);
+    }
+    assert_eq!(records(&mut child, id), [1, 2, 3, 4, 5], "each once, in order");
+    assert_eq!((origin.stats().push_resent, child.stats().push_skipped[GAP]), (3, 2));
+    assert_eq!(origin.stats().hub.queued_records, 0);
+}
+
 #[test]
 fn a_default_subscriber_holds_the_pushes_of_a_round_trip_applied_back_to_back() {
     let (o, c, now, rtt) = (PeerId::new("o", 1), PeerId::new("c", 1), Instant::now(), Duration::from_millis(200));

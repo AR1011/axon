@@ -1968,3 +1968,20 @@ fn behind_its_relay(told: bool) {
     assert_eq!(next, 16, "told {told}, every record once, in order: {followed:?}");
     assert_eq!(cores["l"].1.stats().local_resets, 0, "told {told}");
 }
+
+#[test]
+fn every_leaf_sees_every_record_once_with_pushes_sent_without_delay() {
+    // Each channel's round trip, `RTT`, reaches `no_delay_rtt`: no channel holds what is published for an answer.
+    let cfg = CoreConfig { no_delay_rtt: Some(RTT), ..CoreConfig::default() };
+    let stat = |sim: &Sim, f: fn(&RelayStats) -> u64| sim.nodes.values().map(|n| f(&n.core.stats())).sum::<u64>();
+    let (mut resent, mut pushes, mut nagle) = (0, 0, 0);
+    for seed in 0..100 {
+        let sim = run(seed, cfg.clone(), false, true);
+        every_record_once(&sim, seed);
+        (resent, pushes) = (resent + stat(&sim, |s| s.push_resent), pushes + stat(&sim, |s| s.pushes_out));
+        nagle += stat(&run(seed, CoreConfig::default(), false, true), |s| s.pushes_out);
+    }
+    println!("{pushes} pushes without delay, {nagle} under Nagle's rule, {resent} sent again");
+    assert!(resent > 0, "no push was sent again");
+    assert!(pushes > nagle, "{pushes} pushes without delay, no more than the {nagle} under Nagle's rule");
+}

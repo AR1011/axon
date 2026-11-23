@@ -836,7 +836,8 @@ pub(crate) struct EngineConfig {
     pub max_endpoints: usize,
     pub tracer: Arc<Tracer>,
     pub dead: Arc<DeadLetters>,
-    /// Where a lane lost and got back while `Control` stays up is told: `lane_down`, `lane_up`.
+    /// Where a lane lost and got back while `Control` stays up is told: `lane_down`, `lane_up`; and, once a lane, a
+    /// `LaneConfig::congestion` a socket refused: `tcp_congestion_refused`.
     pub events: Arc<axon::EventLog>,
 }
 
@@ -864,6 +865,8 @@ pub(crate) struct Engine {
     counters: Counters,
     /// What every link has carried, by the peer's region and lane, for the node's life.
     pub meters: Arc<Meters>,
+    /// By lane, whether a socket refused its congestion control: told once.
+    congestion_refused: [AtomicBool; 3],
 }
 
 impl Engine {
@@ -887,6 +890,7 @@ impl Engine {
             max_frame: usize::MAX,
             version: *cfg.transport.versions.end(),
             lane: Lane::Control,
+            congestion_refused: None,
         };
         let engine = Arc::new(Self {
             local,
@@ -894,6 +898,7 @@ impl Engine {
             open: AtomicBool::new(true),
             stale_routes: AtomicU64::new(0),
             meters: Arc::default(),
+            congestion_refused: Default::default(),
             registry: RwLock::new(Registry { authorizer, ..Registry::default() }),
             next_endpoint: AtomicU64::new(FIRST_DYNAMIC),
             peers: Mutex::default(),
@@ -1255,6 +1260,14 @@ impl Engine {
 
     /// A link on `sender`'s session, metered under the peer's `region` label.
     fn new_link(&self, sender: &Sender, outgoing: bool, near: bool) -> Arc<Link> {
+        let peer = sender.peer();
+        // A lane's name is this node's config, the same for each of its sessions.
+        if let Some(name) = &peer.congestion_refused
+            && !self.congestion_refused[peer.lane as usize].swap(true, Relaxed)
+        {
+            let detail = format!("{:?}: the socket refused it and runs the host's default", peer.lane);
+            self.cfg.events.record("tcp_congestion_refused", name.as_str(), detail);
+        }
         Link::new(sender.clone(), outgoing, near, self.meters.open(sender, &self.membership))
     }
 

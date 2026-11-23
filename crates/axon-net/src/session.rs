@@ -41,6 +41,9 @@ pub struct Peer {
     pub version: u16,
     /// The lane the initiator named. Each end runs it with its own [`Config::lanes`] entry.
     pub lane: Lane,
+    /// The lane's [`LaneConfig::congestion`](crate::LaneConfig::congestion) where this end's socket refused it, and
+    /// runs the host's default instead.
+    pub congestion_refused: Option<String>,
 }
 
 const RECENT_RTTS: usize = 4;
@@ -526,6 +529,10 @@ where
         // the option still carries it. `TcpHealth::notsent_lowat` shows what took.
         drop(crate::tcp::set_notsent_lowat(fd, bytes));
     }
+    let congestion_refused = match (link.fd, &lc.congestion) {
+        (Some(fd), Some(name)) => crate::tcp::set_congestion(fd, name).is_err().then(|| name.clone()),
+        _ => None,
+    };
     let peer = Peer {
         identity: hello.identity,
         remote: link.remote,
@@ -534,6 +541,7 @@ where
         max_frame: limits.max_frame.min(hello.max_frame),
         version,
         lane,
+        congestion_refused,
     };
     let encoder = Encoder::new(
         peer.compression,

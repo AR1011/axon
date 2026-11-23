@@ -2173,7 +2173,24 @@ catch up after a cut. The maxima hold for every socket on the host, so a node th
 connection hold that much kernel memory; `net.ipv4.tcp_mem` bounds the total. A stream node records the event `host_tcp_limits` at start
 when the maxima are smaller than its push window needs ([telemetry](telemetry.md)). axon sets no `SO_SNDBUF` or
 `SO_RCVBUF`, as on Linux either one turns off the kernel's autotuning for that socket and caps it at
-`net.core.wmem_max` or `rmem_max`, and no `TCP_CONGESTION`: that is the host's choice, with the `fq` qdisc BBR needs.
+`net.core.wmem_max` or `rmem_max`.
+
+BBR with `fq` stays the host default, for links that carry bulk. For thin streams on long lossy links, records that
+each fill a small part of a push, it is not the best choice: such a sender is limited by the application, BBR's rate
+estimate falls, and a lost packet can hold records for seconds. In a measured comparison at 90 to 220 ms and 0.5 %
+loss, loss-based `illinois` beat BBRv1 for these streams. Name it for the lane their namespace uses (`Live` unless
+`StreamNodeConfig::lane` moves it; every session of the lane runs it, to near peers too), and let far children skip
+the push delay that suits near ones:
+
+```rust,ignore
+cluster_cfg.transport.lanes.live.congestion = Some("illinois".into()); // TCP_CONGESTION on the lane's sockets
+stream_cfg.core.no_delay_rtt = Some(Duration::from_millis(50)); // children at 50 ms or more get each publish at once
+```
+
+The host must allow it: `modprobe tcp_illinois`, and `illinois` in `net.ipv4.tcp_allowed_congestion_control`
+(unless the process has `CAP_NET_ADMIN`). A socket that refuses the name runs the host's default and the session still
+comes up; the node records the event `tcp_congestion_refused` once per lane, and `TcpHealth::congestion`
+shows what each socket runs.
 
 Put the acceptors in three regions, one in each. Every renew then crosses at least the shortest link between two
 acceptor regions: with eu-a, sin and us, every majority holds one outside Europe, so the Europe nodes renew through us

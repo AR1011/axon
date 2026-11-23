@@ -514,9 +514,19 @@ What axon does, and does not:
 
 - **No `SO_SNDBUF` or `SO_RCVBUF`.** Should axon set them where it helps? On Linux it never
   helps: setting either turns off the kernel's autotuning for that socket and caps it at `net.core.wmem_max` or
-  `rmem_max` (about 208 KiB by default). axon sets neither today (checked: no `SO_SNDBUF`, `SO_RCVBUF`,
-  `TCP_CONGESTION` or `TCP_NOTSENT_LOWAT` in the tree; [lanes.md §4.4](lanes.md#44-tcp_notsent_lowat) owns it).
-- **No `TCP_CONGESTION`.** BBR is the host's choice, with the `fq` qdisc it needs.
+  `rmem_max` (about 208 KiB by default). axon sets neither (`TCP_NOTSENT_LOWAT` is
+  [lanes.md §4.4](lanes.md#44-tcp_notsent_lowat)'s, `TCP_CONGESTION` the next item's).
+- **`TCP_CONGESTION` per lane, unset by default.** BBR with the `fq` qdisc it needs stays the host's default, for
+  links that carry bulk. `transport.lanes.<lane>.congestion` names another for that lane's sockets, at both ends,
+  where they dial and where they accept. In a measured comparison on long lossy links (90 to 220 ms, 0.5 % loss),
+  loss-based `illinois` beat BBRv1 for thin streams that the application, not the network, limits: BBR's rate
+  estimate falls while such a stream sends little, and recovery after a loss then takes seconds. For such streams,
+  name `illinois` on the lane their namespace uses, together with
+  [`core.no_delay_rtt`](push-window.md#24-the-window). The host must allow it: the `tcp_illinois` module loaded,
+  and the name in `net.ipv4.tcp_allowed_congestion_control` (unless the process has `CAP_NET_ADMIN`). A socket that
+  refuses the name keeps the host's default and the session still comes up; `Peer::congestion_refused` names it, the
+  cluster records the event `tcp_congestion_refused` once per lane, and `TcpHealth::congestion` reads back
+  what each socket runs.
 - **One event at start.** New `axon_net::host_tcp() -> Option<HostTcp>` in `crates/axon-net/src/tcp.rs`, beside
   `TcpHealth`. It reads `/proc/sys/net/ipv4/tcp_wmem`, `tcp_rmem`, `tcp_congestion_control` and
   `tcp_slow_start_after_idle` on Linux, and is `None` elsewhere. `StreamNode::start` records one event,
@@ -841,7 +851,7 @@ Chosen not to add:
   leaves it out.
 - Timings that adapt to the measured RTT: every bound here is a sum the operator can read; an adaptive one is not.
 - A seed keepalive or seed connect setting: neither changes with the RTT (§4, §5).
-- `SO_SNDBUF`, `SO_RCVBUF`, `TCP_CONGESTION`: §8.
+- `SO_SNDBUF`, `SO_RCVBUF`: §8. `TCP_CONGESTION` is per lane, not per peer: a lane's sockets to near peers run it too.
 - A doctor check in `scripts/ctl.sh`: it runs on a Mac.
 - `Isolation.tla`: §7.
 - `drops_after` for Consul: its removal is its TTL, outside axon (settled).

@@ -174,6 +174,22 @@ window  = clamp(3 × rate × rtt, floor, max_push_window)
   the push has more, so it does not leave the channel drained. Tests (`src/core/tests.rs`):
   `records_published_while_a_push_that_took_all_there_was_is_in_flight_wait_for_its_answer`,
   `a_backlog_of_small_records_read_back_from_the_ring_fills_the_window`.
+- No delay past `core.no_delay_rtt`. A channel whose round trip (`rtt` above) is at least `no_delay_rtt` skips
+  Nagle's rule: what is published goes at once in a push of its own while earlier ones are in flight, under the same
+  bounds as a backlog: the window, the node cap and 64 pushes. `None`, the default, keeps the rule on every channel.
+  Under the rule a thin stream (records that each fill a small part of a push) moves one push per round trip. On a
+  long link with loss that costs more than a round trip: the sender is limited by the application, not the network,
+  so after a lost packet the congestion control's rate estimate falls and the records published meanwhile wait
+  behind it. At 90 to 220 ms and 0.5 % loss, a measured comparison with the rule off cut the 99th percentile of
+  delivery delay from 5.3 s to 0.19 s and from 9.8 s to 0.49 s on two such links, with no gap, duplicate or extra
+  byte. The cost is the one the rule saves: a call per publish while pushes are in flight. Set it on nodes whose
+  children are far away and whose streams are thin, to a value above the near round trips and below the far ones
+  (for example 50 ms: the near ones then keep the rule), and pair it with a congestion control that suits such a
+  stream ([wan.md §8](wan.md#8-host-tcp-settings)). Tests (`src/core/tests.rs`):
+  `a_channel_past_no_delay_rtt_sends_each_publish_while_pushes_are_in_flight`,
+  `pushes_past_no_delay_rtt_stop_at_the_most_pushes_and_bytes_a_channel_holds_in_flight`,
+  `pushes_past_no_delay_rtt_go_again_in_order_after_a_lost_answer`; under faults
+  (`tests/sim.rs`) `every_leaf_sees_every_record_once_with_pushes_sent_without_delay`.
 
 Where a channel's bytes in flight are: in its lane's outbox (8 MiB on Live, 32 MiB on Bulk,
 [lanes.md §4.2](lanes.md#42-limits-per-lane); `start_request_to` waits while it is full), in the socket (unsent at most
@@ -331,12 +347,13 @@ ones. Naming the boot would change the interest wire and the PushWindow model fo
 
 ## 3. API
 
-The stream config gains two fields. Nothing else in the public API of axon-stream changes.
+The stream config gains three fields. Nothing else in the public API of axon-stream changes.
 
 ```text
 axon-stream
   StreamNodeConfig .core.max_push_window   bytes in flight to one child on one lane, at most (default 64 MiB) ; at least max_push_bytes
   StreamNodeConfig .core.max_push_inflight bytes in flight to every child together (default 256 MiB), past each one's first push ; at least max_push_window
+  StreamNodeConfig .core.no_delay_rtt      Option<Duration>, default None: a channel whose round trip is at least this sends each publish at once, within the window, instead of waiting for an answer (Nagle's rule, §2.4)
     a child gets a push window from min(2 × max_push_bytes, max_push_window) up to max_push_window: three times its delivery rate times the round trip ; a stream's records in flight count against its branch (core.branch) until applied, and it takes a new push while they are under half of it ; a failed push and those after it are sent again, in order
   node.stats().relay.downstream[i] .channel .window_bytes .inflight_bytes .inflight_pushes .round_trip_us .delivery_rate .resent
 

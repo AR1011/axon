@@ -128,8 +128,8 @@ axon
 
 axon-net
   Config::lanes: Lanes { control, live, bulk } ; cfg.lanes.get(lane) -> &LaneConfig
-    LaneConfig { limits: Limits, compression, max_bytes_per_sec: Option<u64>, notsent_lowat: Option<u32> }
-      Control: max_frame 1 MiB, 2 MiB out and in ; Live: 1 MiB, 8 MiB ; Bulk: 8 MiB, 32 MiB ; no compression ; no cap ; lowat 128 KiB
+    LaneConfig { limits: Limits, compression, max_bytes_per_sec: Option<u64>, notsent_lowat: Option<u32>, congestion: Option<String> }
+      Control: max_frame 1 MiB, 2 MiB out and in ; Live: 1 MiB, 8 MiB ; Bulk: 8 MiB, 32 MiB ; no compression ; no cap ; lowat 128 KiB ; congestion None, the host's ([wan.md §8](wan.md#8-host-tcp-settings))
       a peer with every lane up both ways holds at most 168 MiB of frames at these limits (32 MiB on one session each way before)
       max_bytes_per_sec: a cap on what one session of the lane writes, pings and pongs apart ; None: none
   connect(addr, lane, tls, cfg) ; establish(io, Role::Initiator(lane) | Role::Responder, cfg) ; Peer::lane
