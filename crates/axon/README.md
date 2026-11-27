@@ -194,7 +194,8 @@ axon-stream (feature cluster)
     Err(Disk(DiskError::Full | Failed)) while the last write failed, Err(Disk(Behind)) past max_unwritten_bytes ; node.stats().disk -> Option<DiskStats> { failing, refused, truncated, .. } ; axon::files::Files for another store
   cfg.on_demand(namespace, linger)   this node opens the namespace's keys when wanted: a want for a key not open waits for the open, not UnknownStream ; the open gives each waiting follower Ready, the state, the history after its start, then live
     let (wanted, mut feed) = node.demand(namespace)?   the keys wanted now and a DemandFeed (an axon::Stream) of Demand::Wanted(key) | Demand::Unwanted(key), the latter a linger after the last want, cancelled by a want inside it ; open on Wanted, close on Unwanted ; a key closed while wanted is told Wanted again ; one feed per namespace (AlreadyExists), InvalidOptions where not on demand
-    .claim(namespace, |key| bool)   the keys this node opens ; false answers UnknownStream as without on_demand ; runs under the node's lock ; start refuses it for a namespace not on demand
+    .claim(namespace, |key| bool)   the keys this node opens ; false answers UnknownStream as without on_demand ; asked before each Wanted and again at each membership change ; runs under the node's lock ; start refuses it for a namespace not on demand
+    node.reclaim()   asks the claims again: a waiting key no longer this node's is let go (Unwanted, its children ask elsewhere), a pulled key now its own is pulled no more and told Wanted ; an open key stays open
 
 axon-testkit   (dev-dependency; virtual time, same seed = same trace)
   Simulator::new(SimConfig { seed, jitter, drop_every, duplicate_every, ordered, .. }) ; net.add_node(name)?

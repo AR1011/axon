@@ -1448,9 +1448,20 @@ fn job(n: usize) -> StreamKey {
 
 /// A node that opens the keys of `jobs` when they are wanted, and is told `LINGER` after nothing wants one.
 fn on_demand(id: &PeerId) -> RelayCore {
-    let mut cfg = CoreConfig { relay: false, ..scaled() };
+    owner(id, false)
+}
+
+/// [`on_demand`], which pulls from a parent the keys its claim does not take when `relay`.
+fn owner(id: &PeerId, relay: bool) -> RelayCore {
+    let mut cfg = CoreConfig { relay, ..scaled() };
     cfg.on_demand.insert("jobs".into(), LINGER);
     RelayCore::new(id, AllowAll, cfg).expect("a valid config")
+}
+
+/// A claim that takes every key while `mine` holds, which a test turns as ownership moves.
+fn claim_while(mine: &Arc<std::sync::atomic::AtomicBool>) -> Claim {
+    let mine = mine.clone();
+    Arc::new(move |_: &StreamKey| mine.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 fn relay(id: &PeerId) -> RelayCore {
@@ -1668,4 +1679,91 @@ fn a_key_closed_while_wanted_is_told_wanted_again_and_its_followers_wait_for_the
     }
     deliver(&mut origin, &o, &mut child, &c, at);
     assert_eq!(seen(&mut child, follower), vec!["2 1..1"]);
+}
+
+/// A key waiting for its open that its claim gives up at a reclaim, as after a membership change, is let go: the
+/// application is told it is unwanted, its placeholder is gone, and the child's branch ends, so the child asks again and
+/// is refused, as it would be by any node that does not own the key. Before, the placeholder stayed while the child
+/// wanted it, and the child, answered `Ok`, never asked another parent.
+#[test]
+fn a_waiting_key_its_claim_gives_up_at_a_reclaim_sends_its_children_to_another_parent() {
+    let now = Instant::now();
+    let (o, c) = (PeerId::new("o", 1), PeerId::new("c", 1));
+    let mine = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let mut origin = on_demand(&o);
+    origin.set_claim("jobs", claim_while(&mine));
+    let mut child = relay(&c);
+    child.subscribe(&job(0), SubscribeOptions::default()).expect("follows");
+    ask(&mut origin, &o, &mut child, &c, now);
+    assert_eq!(told(&mut origin, now), vec![Demand::Wanted(job(0))]);
+    origin.reclaim();
+    assert_eq!(told(&mut origin, now), vec![], "the claim still takes it");
+    mine.store(false, std::sync::atomic::Ordering::Relaxed);
+    origin.reclaim();
+    assert_eq!(told(&mut origin, now), vec![Demand::Unwanted(job(0))]);
+    assert_eq!(origin.stats().hub.streams, 0, "the placeholder is gone");
+    let at = now + Duration::from_secs(60);
+    deliver(&mut origin, &o, &mut child, &c, at);
+    ask(&mut origin, &o, &mut child, &c, at);
+    assert_eq!(child.stats().refusals[Status::UnknownStream as usize], 1);
+    assert_eq!(told(&mut origin, at), vec![]);
+}
+
+/// A key pulled from its owner that its claim takes at a reclaim, as after a membership change, is pulled no more: the
+/// parent is told so, the application is told the key is wanted, and its open reaches the follower that waited. Before,
+/// the key went on being pulled from a parent that no longer owned it, and the application was never told.
+#[test]
+fn a_pulled_key_its_claim_takes_at_a_reclaim_is_dropped_upstream_and_told_wanted() {
+    let now = Instant::now();
+    let (p, n) = (PeerId::new("p", 1), PeerId::new("n", 1));
+    let mut parent = on_demand(&p);
+    let mine = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut node = owner(&n, true);
+    node.set_claim("jobs", claim_while(&mine));
+    let follower = node.subscribe(&job(0), SubscribeOptions::default()).expect("pulls it");
+    ask(&mut parent, &p, &mut node, &n, now);
+    assert_eq!(told(&mut parent, now), vec![Demand::Wanted(job(0))]);
+    parent.open_stream(&job(0), 1, DeliveryPolicy::ReplayRequired).expect("opens");
+    parent.publish(&job(0), vec![Bytes::from_static(b"x")]).expect("publishes");
+    deliver(&mut parent, &p, &mut node, &n, now);
+    assert_eq!(records(&mut node, follower), vec![1]);
+    assert_eq!(node.take_demand("jobs"), vec![], "a pulled key is not told");
+    mine.store(true, std::sync::atomic::Ordering::Relaxed);
+    node.reclaim();
+    let asked = node.reconcile(std::slice::from_ref(&p), now);
+    assert!(asked.iter().any(|(_, interest)| interest.drops.contains(&job(0))), "the parent is told: {asked:?}");
+    assert_eq!(node.take_demand("jobs"), vec![Demand::Wanted(job(0))]);
+    assert_eq!(node.parent_of(&job(0)), None);
+    node.open_stream(&job(0), 2, DeliveryPolicy::ReplayRequired).expect("opens the key it pulled");
+    node.publish(&job(0), vec![Bytes::from_static(b"x")]).expect("publishes");
+    assert_eq!(seen(&mut node, follower), vec!["2 1..1"]);
+}
+
+/// A key the application closes once its claim no longer takes it, a finished one, while it is still wanted, here and
+/// on a child, is not told wanted again, and the child's want is refused. Before, it was told `Wanted` at the next
+/// reconcile, so an application that opens each key it is told opened and closed it in a loop.
+#[test]
+fn a_key_closed_once_its_claim_gives_it_up_is_not_told_wanted_again() {
+    let now = Instant::now();
+    let (o, c) = (PeerId::new("o", 1), PeerId::new("c", 1));
+    let mine = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let mut origin = on_demand(&o);
+    origin.set_claim("jobs", claim_while(&mine));
+    let mut child = relay(&c);
+    child.subscribe(&job(0), SubscribeOptions::default()).expect("follows");
+    origin.subscribe(&job(0), SubscribeOptions::default()).expect("follows");
+    ask(&mut origin, &o, &mut child, &c, now);
+    assert_eq!(told(&mut origin, now), vec![Demand::Wanted(job(0))]);
+    origin.open_stream(&job(0), 1, DeliveryPolicy::ReplayRequired).expect("opens");
+    mine.store(false, std::sync::atomic::Ordering::Relaxed);
+    origin.close_stream(&job(0)).expect("closes");
+    let (mut at, mut changes) = (now, Vec::new());
+    for _ in 0..4 {
+        deliver(&mut origin, &o, &mut child, &c, at);
+        ask(&mut origin, &o, &mut child, &c, at);
+        changes.extend(told(&mut origin, at));
+        at += Duration::from_secs(60);
+    }
+    assert_eq!(changes, vec![]);
+    assert!(child.stats().refusals[Status::UnknownStream as usize] > 0, "the child's want is refused");
 }

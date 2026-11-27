@@ -312,19 +312,28 @@ were wanted; it had to open them all or guess.
   the linger cancels it. Changes are coalesced per key, so a change undone before the feed takes it is not told, and
   `Wake::Demand(namespace)` is pushed only when the namespace had nothing pending. `take_demand` hands them over;
   `wanted` lists the keys wanted now, those in their linger among them.
-- A key unwanted and not open is let go: its placeholder is removed. A close of a key of the namespace does not pull
+- A key unwanted and not open is let go: its placeholder is removed. A close of a key the claim takes does not pull
   it from a parent (`end_stream` without `repull`); one still wanted is told `Wanted` again, so the application can
-  open it again, and its followers and its children's wait for that open.
-- `Claim`: an optional function per namespace, asked when a key would be parked. `false` answers the want
-  `UnknownStream`, as before this section, and with upstream tiers the key is pulled as any other.
+  open it again, and its followers and its children's wait for that open. A close of a key the claim refuses pulls
+  it for its followers, as on a node without the namespace on demand.
+- `Claim`: an optional function per namespace (`RelayCore::claimed`). `false` answers the want `UnknownStream`, as
+  before this section, and with upstream tiers the key is pulled as any other. It is asked when a key would be
+  parked, before each `Wanted` (`settle_demand`), so a key the application finished with and closed is not told
+  again, and at `RelayCore::reclaim`, which `membership_changed` runs and `StreamNode::reclaim` exposes: a parked or
+  wanted key not open here that the claim refuses is disowned (`disown`: told `Unwanted` if it was told `Wanted`,
+  its placeholder closed with `end_stream` and pulled again, so its children's branches end and they ask their other
+  parents), and a pulled key the claim takes is pulled no more (`end_stream` without `repull`, `unfeed`) and crossed,
+  so it is told `Wanted` while wanted. A key open here is left to the application. Before, the claim was asked only
+  when no stream of the key was here, so a membership change that moved a key left the old owner's placeholder and
+  the new owner's pull in place, and nothing told the new owner.
 - `StreamNode`: `StreamNodeConfig::on_demand(namespace, linger)`, `StreamNodeConfig::claim(namespace, fn)` (refused
   at `start` for a namespace not on demand), and `StreamNode::demand(namespace)`, which returns the keys wanted now
   and a `DemandFeed` (`axon::Stream` of `Demand`). One feed per namespace: `AlreadyExists` while one is held,
   `InvalidOptions` for a namespace not on demand. The node's lock order is the core, then the feeds.
 
 **Wire.** None: a child's `Want` and the origin's answers are the frames of §1 to §3. **API.** `CoreConfig::on_demand`,
-`Demand`, `Claim`, `Wake::Demand`, `RelayCore::{set_claim, take_demand, wanted}`, `StreamNodeConfig::{on_demand,
-claim}`, `StreamNode::demand`, `DemandFeed`.
+`Demand`, `Claim`, `Wake::Demand`, `RelayCore::{set_claim, take_demand, wanted, reclaim}`,
+`StreamNodeConfig::{on_demand, claim}`, `StreamNode::{demand, reclaim}`, `DemandFeed`.
 
 **Tests.**
 
@@ -332,14 +341,19 @@ claim}`, `StreamNode::demand`, `DemandFeed`.
   `Unwanted` a linger after the last want, and a want inside it cancels it; a key the claim refuses is
   `UnknownStream`; a lost child drops its demand; a restarted origin is told again what its children want; a
   compacted key gives its waiting followers the state; a key closed while wanted is told `Wanted` again and its
-  followers wait for the next open.
+  followers wait for the next open; a waiting key its claim gives up at a reclaim sends its children to another
+  parent; a pulled key its claim takes at a reclaim is dropped upstream and told `Wanted`; a key closed once its
+  claim gives it up is not told `Wanted` again.
 - `crates/axon-stream/src/node/tests.rs`: a compacted key opened from disk gives waiting followers, local and on a
   child, the kept state; a start waiting behind an open from disk replays from the disk, local and on a child.
 - `crates/axon-stream/tests/world_on_demand.rs`, 32 seeds each: leaves want a key, one leaves and one crashes, and
   the application is told `Unwanted` within one tick past the linger after the last want went; an origin that crashes
   and restarts is told `Wanted` again and the leaf's follower goes on in the new generation; a leaf paused or cut
   off, over a slow link that loses chunks, for less than the linger keeps the key open, and for longer has it told
-  `Unwanted`, closed and opened again in a new generation, with no reset either way.
+  `Unwanted`, closed and opened again in a new generation, with no reset either way; three origins, each the owner
+  of every key while it is the last origin in its view, where the owner crashes, the next one is told `Wanted` at
+  the reconcile that sees the change and opens the key, and when the first comes back the second closes it and its
+  follower is pulled from the first.
 
 **Not built.** A cap on parked keys apart from `HubLimits::max_streams`, which they count in. A bounded feed with a
 resync: changes coalesce per key, so the feed holds at most one change per wanted key. A count of parked keys in

@@ -738,19 +738,27 @@ origin of the namespace's keys whether they are open or not:
   `SnapshotThenLive` start on a [compacted](#compacted-streams) stream, the records after its own start where the
   open is past it and its history holds them, then every record after. `Wanted` comes for a key already open too:
   the application keeps it open.
-- A key closed while it is wanted is told `Wanted` again, and its followers wait for the next open. The node never
-  asks a parent for it, so its children and their followers stay where they are.
+- A key closed while it is wanted is told `Wanted` again while the claim (below) takes it, and its followers wait for
+  the next open: the node does not ask a parent for it, so its children and their followers stay where they are. To
+  end a key for good, a finished one, have the claim refuse it before the close: it is not told again, a child that
+  asks for it is refused, and with upstream tiers its followers here pull it from a parent.
 - `StreamNodeConfig::claim(namespace, fn)` decides which keys of the namespace this node opens. A key the claim
   refuses is answered `UnknownStream`, as a node without the namespace on demand answers, and with upstream tiers it
-  is pulled from a parent as any key. The claim runs under the node's lock: it decides at once and calls nothing on
-  the node. `start` refuses a claim for a namespace not on demand.
+  is pulled from a parent as any key; the application is told nothing of it. The claim is asked when a key not open
+  here is wanted, again before each `Wanted`, and again for the keys that wait here or are pulled at each membership
+  change and at `node.reclaim()`, which the application calls when what its claim reads changes otherwise. A key
+  that waits and that the claim gives up is let go: it is told `Unwanted` if it was told `Wanted`, and its children
+  ask their other parents. A pulled key that the claim takes is pulled no more and told `Wanted`. A key open here
+  stays open when it moves away: the application closes it. The claim runs under the node's lock: it decides at once
+  and calls nothing on the node. `start` refuses a claim for a namespace not on demand.
 - The linger must outlast a child that reconnects, after a parent restart or a lost link. A child that comes back
   within it costs nothing; one that does not is let go. An origin that restarts is told `Wanted` again by every child
   that still follows a key, so the application opens what it opened before, in a new generation unless the key is
   kept on disk.
 
-Only the origin is configured: relays and leaves follow the key as any other. `tests/world_on_demand.rs` runs it with
-leaves that leave, crash, pause and are cut off, and an origin that restarts.
+Only the origins are configured: relays and leaves follow the key as any other. `tests/world_on_demand.rs` runs it
+with leaves that leave, crash, pause and are cut off, an origin that restarts, and a key that moves between origins
+with the membership.
 
 ```rust
 use std::time::Duration;

@@ -226,8 +226,9 @@ pub enum Demand {
 }
 
 /// Whether a key of an on-demand namespace is this node's to open: `false` answers a want for it `UnknownStream` while
-/// it is not open here, as a node without the namespace on demand would. It runs under the node's lock, so it decides
-/// at once and calls nothing on the node.
+/// it is not open here, as a node without the namespace on demand would, and tells the application nothing of it. Asked
+/// again before each [`Demand::Wanted`] and at [`RelayCore::reclaim`], so its answer may change. It runs under the
+/// node's lock, so it decides at once and calls nothing on the node.
 pub type Claim = Arc<dyn Fn(&StreamKey) -> bool + Send + Sync>;
 
 /// How long a pulled key waits on its parents. Per key, so per namespace: a namespace whose origins are far away waits
@@ -975,8 +976,9 @@ impl<A: Authorizer> RelayCore<A> {
         self.history.insert(namespace.into(), source);
     }
 
-    /// Which keys of an on-demand namespace are this node's: asked once for a key wanted while no stream of it is here.
-    /// Without one, every key of the namespace is.
+    /// Which keys of an on-demand namespace are this node's: asked when a key not open here is wanted, before it is told
+    /// [`Demand::Wanted`], and again for the keys waiting here or pulled at [`reclaim`](Self::reclaim). Without one,
+    /// every key of the namespace is.
     pub fn set_claim(&mut self, namespace: impl Into<String>, claim: Claim) {
         self.claims.insert(namespace.into(), claim);
     }
@@ -1212,12 +1214,12 @@ impl<A: Authorizer> RelayCore<A> {
         if !self.originated.remove(key) {
             return Err(StreamError::UnknownStream);
         }
-        // A key of an on-demand namespace is this node's to open again: its followers wait for that, not a parent.
-        let on_demand = self.cfg.on_demand.contains_key(key.namespace());
-        self.end_stream(key, !on_demand)?;
-        if on_demand {
-            // Told afresh: a key still wanted is told `Wanted` again, for the application to open it again.
-            self.wanted.remove(key);
+        // A key this node opens is its to open again: its followers wait for that, not a parent.
+        self.end_stream(key, !self.claimed(key))?;
+        if self.cfg.on_demand.contains_key(key.namespace()) {
+            // Told afresh: a key still wanted is told `Wanted` again, while the claim takes it, for the application to
+            // open it again.
+            self.unwant(key);
             self.told.remove(key);
             self.crossed.insert(key.clone());
             self.wakes.push(Wake::Reconcile);
@@ -1484,8 +1486,7 @@ impl<A: Authorizer> RelayCore<A> {
             self.touch(key);
             return Ok(());
         }
-        let ns = key.namespace();
-        if self.cfg.on_demand.contains_key(ns) && self.claims.get(ns).is_none_or(|claim| claim(key)) {
+        if self.claimed(key) {
             // No parent: it waits for this node to open it, however long that takes.
             self.hub.open_relay_stream(&self.local, key, DeliveryPolicy::ReplayRequired)?;
             self.parked.insert(key.clone());
@@ -1513,14 +1514,21 @@ impl<A: Authorizer> RelayCore<A> {
             self.crossed.extend(self.lingers.pop_first().map(|(_, key)| key));
         }
         for key in std::mem::take(&mut self.crossed) {
-            // A key pulled from a parent is another node's.
-            let Some(&linger) = self.cfg.on_demand.get(key.namespace()).filter(|_| !self.feeds.contains_key(&key))
-            else {
-                continue;
-            };
+            let Some(&linger) = self.cfg.on_demand.get(key.namespace()) else { continue };
             if self.hub.demand_count(&key) > 0 {
-                if self.wanted.insert(key.clone(), None).is_none() {
-                    self.tell(&key, true);
+                match self.wanted.get(&key).copied() {
+                    Some(None) => {}
+                    // Wanted again within its linger.
+                    Some(Some(since)) => {
+                        self.wanted.insert(key.clone(), None);
+                        self.lingers.remove(&(since + linger, key));
+                    }
+                    // Asked again, so a key the application has finished with, or another node opens now, is not told.
+                    None if self.claimed(&key) => {
+                        self.wanted.insert(key.clone(), None);
+                        self.tell(&key, true);
+                    }
+                    None => self.disown(&key),
                 }
                 continue;
             }
@@ -1536,6 +1544,59 @@ impl<A: Authorizer> RelayCore<A> {
             }
             if self.parked.remove(&key) {
                 let _ = self.hub.close_stream(&self.local, &key, EndReason::StreamClosed);
+            }
+        }
+    }
+
+    /// Whether this node opens the key: one of an on-demand namespace that its claim, if any, takes.
+    fn claimed(&self, key: &StreamKey) -> bool {
+        let ns = key.namespace();
+        self.cfg.on_demand.contains_key(ns) && self.claims.get(ns).is_none_or(|claim| claim(key))
+    }
+
+    /// Forgets that the key is wanted, and its linger: whether it was.
+    fn unwant(&mut self, key: &StreamKey) -> bool {
+        let Some(since) = self.wanted.remove(key) else { return false };
+        if let (Some(since), Some(linger)) = (since, self.cfg.on_demand.get(key.namespace())) {
+            self.lingers.remove(&(since + *linger, key.clone()));
+        }
+        true
+    }
+
+    /// A key not open here that this node no longer opens: told [`Demand::Unwanted`] if it was told wanted, and its
+    /// followers, its children's among them, ask a parent instead, as after a close.
+    fn disown(&mut self, key: &StreamKey) {
+        if self.unwant(key) {
+            self.tell(key, false);
+        }
+        if self.parked.remove(key) {
+            let _ = self.end_stream(key, true);
+        } else if !self.hub.has_stream(key) {
+            self.repull(key, None);
+        }
+    }
+
+    /// Asks the claims again, as each membership change does; call it when what a claim reads changes otherwise. A key
+    /// waiting here for its open that the claim no longer takes is let go, and its followers and children ask a parent
+    /// instead. A key pulled from a parent that the claim takes now is pulled no more: its followers wait for this
+    /// node's open, and it is told [`Demand::Wanted`] while it is wanted. A key open here stays open: the application
+    /// closes it.
+    pub fn reclaim(&mut self) {
+        let claims = &self.claims;
+        let asked = |key: &&StreamKey| claims.contains_key(key.namespace());
+        let pulled: Vec<StreamKey> = self.feeds.keys().filter(asked).cloned().collect();
+        let waiting: BTreeSet<StreamKey> =
+            self.parked.iter().chain(self.wanted.keys()).filter(asked).cloned().collect();
+        for key in pulled {
+            if self.claimed(&key) {
+                let _ = self.end_stream(&key, false);
+                self.unfeed(&key);
+                self.crossed.insert(key);
+            }
+        }
+        for key in waiting {
+            if !self.originated.contains(&key) && !self.claimed(&key) {
+                self.disown(&key);
             }
         }
     }
@@ -2689,7 +2750,7 @@ impl<A: Authorizer> RelayCore<A> {
 
     /// The membership changed, which may have mended a parent's refusal for a lost upstream or an unknown key: such a
     /// parent is asked again at the next `reconcile`, its backoff started over, and so is one that refuses so within
-    /// `retry_refused`.
+    /// `retry_refused`. It may have moved keys to or from this node too: the claims are asked again.
     #[cfg(feature = "cluster")]
     pub(crate) fn membership_changed(&mut self, now: Instant) {
         for (key, feed) in &mut self.feeds {
@@ -2700,6 +2761,7 @@ impl<A: Authorizer> RelayCore<A> {
                 self.dirty.insert(key.clone());
             }
         }
+        self.reclaim();
     }
 
     /// Nodes that left the view since the last [`reconcile`](Self::reconcile), and may be back in it already, which

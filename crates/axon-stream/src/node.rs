@@ -120,11 +120,12 @@ impl StreamNodeConfig {
         self
     }
 
-    /// Of an on-demand namespace's keys, the ones this node opens: asked once for a key wanted while it is neither
-    /// open nor waited for here. A key it is not is refused `UnknownStream`, so the child asks its other parents, or,
-    /// with upstream tiers, pulled from a parent as any key this node does not originate. It runs under the node's
-    /// lock: it decides at once, from what it holds, and calls nothing on the node. `start` refuses a claim for a
-    /// namespace not on demand.
+    /// Of an on-demand namespace's keys, the ones this node opens: asked when a key not open here is wanted, before the
+    /// application is told [`Demand::Wanted`], and again at each membership change and [`StreamNode::reclaim`]. A key
+    /// it is not is refused `UnknownStream`, so the child asks its other parents, or, with upstream tiers, pulled from
+    /// a parent as any key this node does not originate; the application is told nothing of it. It runs under the
+    /// node's lock: it decides at once, from what it holds, and calls nothing on the node. `start` refuses a claim for
+    /// a namespace not on demand.
     pub fn claim(
         mut self,
         namespace: impl Into<String>,
@@ -912,6 +913,15 @@ impl StreamNode {
             Ok(wanted)
         })?;
         Ok((wanted, DemandFeed { node: self.0.clone(), namespace: namespace.to_owned(), taken: VecDeque::new() }))
+    }
+
+    /// Asks the claims ([`StreamNodeConfig::claim`]) again, as each membership change does: call it when what a claim
+    /// reads changes otherwise. A key waiting here for its open that is no longer this node's is let go, told
+    /// [`Demand::Unwanted`] if it was told wanted, and its followers and children ask a parent instead. A key pulled
+    /// from a parent that is this node's now is pulled no more, and is told `Wanted`. A key open here stays open: the
+    /// application closes the keys it no longer owns.
+    pub fn reclaim(&self) {
+        self.0.with(RelayCore::reclaim);
     }
 
     pub fn parent_of(&self, key: &StreamKey) -> Option<String> {

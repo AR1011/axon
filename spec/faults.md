@@ -903,8 +903,8 @@ fault into that feature.
 
 | Fault | Covered by |
 |---|---|
-| crash | `crates/axon-stream/tests/world_on_demand.rs::a_key_is_opened_when_leaves_want_it_and_closed_a_linger_after_they_are_gone`, `crates/axon-stream/tests/world_on_demand.rs::a_restarted_origin_is_told_again_of_the_keys_leaves_want` |
-| restart | `crates/axon-stream/tests/world_on_demand.rs::a_restarted_origin_is_told_again_of_the_keys_leaves_want`, `crates/axon-stream/src/core/tests.rs::a_restarted_origin_is_told_again_what_its_children_want` |
+| crash | `crates/axon-stream/tests/world_on_demand.rs::a_key_is_opened_when_leaves_want_it_and_closed_a_linger_after_they_are_gone`, `crates/axon-stream/tests/world_on_demand.rs::a_restarted_origin_is_told_again_of_the_keys_leaves_want`, `crates/axon-stream/tests/world_on_demand.rs::a_key_moves_to_the_owner_the_membership_names_and_back` |
+| restart | `crates/axon-stream/tests/world_on_demand.rs::a_restarted_origin_is_told_again_of_the_keys_leaves_want`, `crates/axon-stream/src/core/tests.rs::a_restarted_origin_is_told_again_what_its_children_want`, `crates/axon-stream/tests/world_on_demand.rs::a_key_moves_to_the_owner_the_membership_names_and_back` |
 | pause | `crates/axon-stream/tests/world_on_demand.rs::a_leaf_gone_for_less_than_the_linger_keeps_its_key_open_and_one_gone_longer_has_it_opened_again` |
 | partition | `crates/axon-stream/tests/world_on_demand.rs::a_leaf_gone_for_less_than_the_linger_keeps_its_key_open_and_one_gone_longer_has_it_opened_again` |
 | one-way cut | gap |
