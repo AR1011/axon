@@ -290,10 +290,10 @@ position first in each seed is not pinned by reading; the fix below does not dep
 
 ## 5. Origins on demand
 
-**Problem.** An application with many keys, each cheap to start, opens a key only while something follows it. Before
-this, a want for a key not open at its origin was refused `UnknownStream` (`RelayCore::ensure_stream`), so the child
-retried its parents on `retry_refused` and a local `subscribe` failed. The application had no way to learn which keys
-were wanted; it had to open them all or guess.
+**Problem.** An application with many keys, each cheap to start, opens a key only while something follows it. In a
+namespace not on demand, a want for a key not open at its origin is refused `UnknownStream`
+(`RelayCore::ensure_stream`), so the child retries its parents on `retry_refused` and a local `subscribe` fails. The
+application has no way to learn which keys are wanted; it has to open them all or guess.
 
 **Design.**
 
@@ -318,12 +318,12 @@ were wanted; it had to open them all or guess.
   through the linger; a want inside the linger parks it again. `NamespaceLimits::parked_keys` (1024 when `None`) caps
   each namespace's placeholders on the node, counted with a range over `parked`: a want for one more is refused
   `LimitExceeded` (`ensure_stream`), so wants for many keys the claim takes cannot fill the hub, nor one namespace's
-  the cap of another. Before, a placeholder held its slot through the linger and nothing capped them. A close of a key the claim takes does not pull
-  it from a parent (`end_stream` without `repull`); one still wanted is told `Wanted` again, so the application can
-  open it again, and its followers and its children's wait for that open. A close of a key the claim refuses pulls
-  it for its followers, as on a node without the namespace on demand.
+  the cap of another. A close of a key the claim takes does not pull it from a parent (`end_stream` without
+  `repull`); one still wanted is told `Wanted` again, so the application can open it again, and its followers and its
+  children's wait for that open. A close of a key the claim refuses pulls it for its followers, as on a node without
+  the namespace on demand.
 - `Claim`: an optional function per namespace (`RelayCore::claimed`). `false` answers the want `UnknownStream`, as
-  before this section, and with upstream tiers the key is pulled as any other. It is asked when a key would be
+  in a namespace not on demand, and with upstream tiers the key is pulled as any other. It is asked when a key would be
   parked, before each `Wanted` (`settle_demand`), so a key the application finished with and closed is not told
   again, and at `RelayCore::reclaim`, which `membership_changed` runs and `StreamNode::reclaim` exposes: a parked or
   wanted key not open here that the claim refuses is disowned (`disown`: told `Unwanted` if it was told `Wanted`,
@@ -334,17 +334,16 @@ were wanted; it had to open them all or guess.
   without `relay`. A key open here is left to the application. So is a disown that lands between `disk_read` and
   `open_read`: `StreamNode`'s open reads the disk without the core's lock, and `open_read` does not ask the claim, so
   the open finishes on a node that no longer owns the key. It converges: the disown queued `Unwanted`, which the
-  application takes, and closes the key on, once its open returns. Before, the claim was asked only
-  when no stream of the key was here, so a membership change that moved a key left the old owner's placeholder and
-  the new owner's pull in place, and nothing told the new owner.
+  application takes, and closes the key on, once its open returns.
 - `StreamNode`: `StreamNodeConfig::on_demand(namespace, linger)`, `StreamNodeConfig::claim(namespace, fn)` (refused
   at `start` for a namespace not on demand), and `StreamNode::demand(namespace)`, which returns the keys wanted now
   and a `DemandFeed` (`axon::Stream` of `Demand`). One feed per namespace: `AlreadyExists` while one is held,
   `InvalidOptions` for a namespace not on demand. The node's lock order is the core, then the feeds.
 
-**Wire.** None: a child's `Want` and the origin's answers are the frames of §1 to §3. **API.** `CoreConfig::on_demand`, `NamespaceLimits::parked_keys`,
-`Demand`, `Claim`, `Wake::Demand`, `RelayCore::{set_claim, take_demand, wanted, reclaim}`,
-`StreamNodeConfig::{on_demand, claim}`, `StreamNode::{demand, reclaim}`, `DemandFeed`.
+**Wire.** None: a child's `Want` and the origin's answers are the frames of §1 to §3. **API.**
+`CoreConfig::on_demand`, `NamespaceLimits::parked_keys`, `Demand`, `Claim`, `Wake::Demand`,
+`RelayCore::{set_claim, take_demand, wanted, reclaim}`, `StreamNodeConfig::{on_demand, claim}`,
+`StreamNode::{demand, reclaim}`, `DemandFeed`.
 
 **Tests.**
 
