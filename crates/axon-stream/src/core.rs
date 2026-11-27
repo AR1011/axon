@@ -1588,14 +1588,23 @@ impl<A: Authorizer> RelayCore<A> {
     /// Asks the claims again, as each membership change does; call it when what a claim reads changes otherwise. A key
     /// waiting here for its open that the claim no longer takes is let go, and its followers and children ask a parent
     /// instead. A key pulled from a parent that the claim takes now is pulled no more: its followers wait for this
-    /// node's open, and it is told [`Demand::Wanted`] while it is wanted. A key open here stays open: the application
-    /// closes it.
+    /// node's open, and it is told [`Demand::Wanted`] while it is wanted. So is a wanted key with no stream here, whose
+    /// followers wait with nothing to pull from: let go, or closed, while the claim refused it. A key open here stays
+    /// open: the application closes it.
     pub fn reclaim(&mut self) {
         let claims = &self.claims;
         let asked = |key: &&StreamKey| claims.contains_key(key.namespace());
         let pulled: Vec<StreamKey> = self.feeds.keys().filter(asked).cloned().collect();
         let waiting: BTreeSet<StreamKey> =
             self.parked.iter().chain(self.wanted.keys()).filter(asked).cloned().collect();
+        let unheld: Vec<StreamKey> =
+            self.hub.demanded().filter(asked).filter(|key| !self.hub.has_stream(key)).cloned().collect();
+        for key in unheld {
+            if self.claimed(&key) {
+                self.crossed.insert(key);
+                self.wakes.push(Wake::Reconcile);
+            }
+        }
         for key in pulled {
             if self.claimed(&key) {
                 let _ = self.end_stream(&key, false);

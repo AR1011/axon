@@ -328,7 +328,9 @@ were wanted; it had to open them all or guess.
   wanted key not open here that the claim refuses is disowned (`disown`: told `Unwanted` if it was told `Wanted`,
   its placeholder closed with `end_stream` and pulled again, so its children's branches end and they ask their other
   parents), and a pulled key the claim takes is pulled no more (`end_stream` without `repull`, `unfeed`) and crossed,
-  so it is told `Wanted` while wanted. A key open here is left to the application. Before, the claim was asked only
+  so it is told `Wanted` while wanted. So is a key with demand here (`StreamHub::demanded`) and no stream, whose
+  followers the hub holds parked with nothing to pull from: disowned, or closed while the claim refused it, on a node
+  without `relay`. A key open here is left to the application. Before, the claim was asked only
   when no stream of the key was here, so a membership change that moved a key left the old owner's placeholder and
   the new owner's pull in place, and nothing told the new owner.
 - `StreamNode`: `StreamNodeConfig::on_demand(namespace, linger)`, `StreamNodeConfig::claim(namespace, fn)` (refused
@@ -351,7 +353,8 @@ were wanted; it had to open them all or guess.
   another parent; a pulled key its claim takes at a reclaim is dropped upstream and told `Wanted`; a key closed once its
   claim gives it up is not told `Wanted` again; on a node that pulls the keys it does not open, a key closed is pulled
   from a parent only once its claim gives it up, and a waiting key its claim gives up is pulled from a parent for its
-  followers; a child's `First` start on a waiting key replays from the open's history; a change undone before it is
+  followers; on a node that pulls nothing, a key its claim takes back at a reclaim, after it was let go or closed, is
+  told `Wanted` for its waiting follower; a child's `First` start on a waiting key replays from the open's history; a change undone before it is
   taken is not told; a refused want for a key not open leaves no placeholder.
 - `crates/axon-stream/src/node/tests.rs`: a compacted key opened from disk gives waiting followers, local and on a
   child, the kept state; a start waiting behind an open from disk replays from the disk, local and on a child; one

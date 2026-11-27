@@ -1884,6 +1884,37 @@ fn a_waiting_key_its_claim_gives_up_is_pulled_from_a_parent_for_its_followers() 
     assert_eq!(batches(&mut node, follower), vec!["1 1..1"]);
 }
 
+/// On a node that pulls nothing, a key that moves away and back, let go while it waited or closed while the claim
+/// refused it, is told `Wanted` again at the reclaim that takes it back, and its local follower goes on at the open.
+/// Before, its follower waited with no stream, and nothing told the application.
+#[test]
+fn a_key_its_claim_takes_back_at_a_reclaim_is_told_wanted_for_its_waiting_follower() {
+    let now = Instant::now();
+    let mine = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let mut origin = on_demand(&PeerId::new("o", 1));
+    origin.set_claim("jobs", claim_while(&mine));
+    let follower = origin.subscribe(&job(0), SubscribeOptions::default()).expect("waits");
+    assert_eq!(told(&mut origin, now), vec![Demand::Wanted(job(0))]);
+    mine.store(false, std::sync::atomic::Ordering::Relaxed);
+    origin.reclaim();
+    assert_eq!(told(&mut origin, now), vec![Demand::Unwanted(job(0))]);
+    mine.store(true, std::sync::atomic::Ordering::Relaxed);
+    origin.reclaim();
+    assert_eq!(told(&mut origin, now), vec![Demand::Wanted(job(0))], "the waiting follower's key is told again");
+    origin.open_stream(&job(0), 1, DeliveryPolicy::ReplayRequired).expect("opens");
+    origin.publish(&job(0), vec![Bytes::from_static(b"x")]).expect("publishes");
+    // Closed while the claim refuses it, then taken back.
+    mine.store(false, std::sync::atomic::Ordering::Relaxed);
+    origin.close_stream(&job(0)).expect("closes");
+    assert_eq!(told(&mut origin, now), vec![]);
+    mine.store(true, std::sync::atomic::Ordering::Relaxed);
+    origin.reclaim();
+    assert_eq!(told(&mut origin, now), vec![Demand::Wanted(job(0))], "the closed key is told again");
+    origin.open_stream(&job(0), 2, DeliveryPolicy::ReplayRequired).expect("opens again");
+    origin.publish(&job(0), vec![Bytes::from_static(b"x")]).expect("publishes");
+    assert_eq!(batches(&mut origin, follower), vec!["1 1..1", "2 1..1"]);
+}
+
 /// A child's `First` start on a key not open waits for the open and, where the open is after a position, replays
 /// from the open's history, from record 1. Before, it was taken live and missed the records before the open.
 #[test]
