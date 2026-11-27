@@ -1227,7 +1227,7 @@ impl<A: Authorizer> StreamHub<A> {
             };
             let replay = self.behind(sub, from, Some(cursor), source.as_ref());
             let sub = self.subs.get_mut(&id).expect("looked up above");
-            // One waiting for the state replays what follows it from the open's history, not the one it was admitted with.
+            // One waiting for the state replays what follows it from the open's history, not the one it came in with.
             if let (Phase::Snapshot(held), Some(source)) = (&mut sub.phase, &source) {
                 *held = Some(source.clone());
             }

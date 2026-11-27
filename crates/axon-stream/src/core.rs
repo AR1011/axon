@@ -981,9 +981,9 @@ impl<A: Authorizer> RelayCore<A> {
         self.history.insert(namespace.into(), source);
     }
 
-    /// Which keys of an on-demand namespace are this node's: asked when a key not open here is wanted, before it is told
-    /// [`Demand::Wanted`], and again for the keys waiting here or pulled at [`reclaim`](Self::reclaim). Without one,
-    /// every key of the namespace is.
+    /// Which keys of an on-demand namespace are this node's: asked when a key not open here is wanted, before it is
+    /// told [`Demand::Wanted`], and again for the keys waiting here or pulled at [`reclaim`](Self::reclaim). Without
+    /// one, every key of the namespace is.
     pub fn set_claim(&mut self, namespace: impl Into<String>, claim: Claim) {
         self.claims.insert(namespace.into(), claim);
     }
@@ -1514,8 +1514,8 @@ impl<A: Authorizer> RelayCore<A> {
 
     // ---- demand of the on-demand namespaces ----
 
-    /// Tells the keys whose demand started, and those whose demand ended a linger ago, and lets go of the parked ones
-    /// among those.
+    /// Tells the keys whose demand started, and those whose demand ended a linger ago, and lets go of a parked key
+    /// as soon as nothing wants it.
     fn settle_demand(&mut self, now: Instant) {
         self.crossed.extend(self.hub.take_crossed());
         while self.lingers.first().is_some_and(|(at, _)| *at <= now) {

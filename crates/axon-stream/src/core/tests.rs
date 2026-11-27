@@ -1580,6 +1580,7 @@ fn a_key_the_claim_refuses_is_an_unknown_stream() {
     assert_eq!(origin.subscribe(&job(1), SubscribeOptions::default()), Err(StreamError::UnknownStream));
     assert_eq!(told(&mut origin, now), vec![Demand::Wanted(job(0))]);
     assert_eq!(origin.stats().hub.streams, 1, "only the claimed key waits");
+    assert_eq!(origin.streams(16, now).1, 0, "a key that waits is not listed: it has no position");
 }
 
 /// A key that waits for its open gives its stream slot back as soon as nothing wants it, while it stays wanted through
@@ -1731,9 +1732,9 @@ fn a_key_closed_while_wanted_is_told_wanted_again_and_its_followers_wait_for_the
 }
 
 /// A key waiting for its open that its claim gives up at a reclaim, as after a membership change, is let go: the
-/// application is told it is unwanted, its placeholder is gone, and the child's branch ends, so the child asks again and
-/// is refused, as it would be by any node that does not own the key. Before, the placeholder stayed while the child
-/// wanted it, and the child, answered `Ok`, never asked another parent.
+/// application is told it is unwanted, its placeholder is gone, and the child's branch ends, so the child asks again
+/// and is refused, as it would be by any node that does not own the key. Before, the placeholder stayed while the
+/// child wanted it, and the child, answered `Ok`, never asked another parent.
 #[test]
 fn a_waiting_key_its_claim_gives_up_at_a_reclaim_sends_its_children_to_another_parent() {
     let now = Instant::now();

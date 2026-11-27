@@ -113,8 +113,8 @@ impl StreamNodeConfig {
     /// the open, however long: it is answered as if the key were open, and the followers under it are told nothing
     /// until the open gives them its position, its state to those that start `SnapshotThenLive`, and every record
     /// after it. [`StreamNode::demand`] says which keys are wanted. A key stays wanted for `linger` after its last
-    /// follower leaves, which must outlast a child that reconnects, and a key wanted and not open is let go then. A
-    /// closed key's followers wait for this node to open it again, not for a parent.
+    /// follower leaves, which must outlast a child that reconnects, and a key not open gives its stream slot back as
+    /// soon as nothing wants it. A closed key's followers wait for this node to open it again, not for a parent.
     pub fn on_demand(mut self, namespace: impl Into<String>, linger: Duration) -> Self {
         self.core.on_demand.insert(namespace.into(), linger);
         self
@@ -900,7 +900,7 @@ impl StreamNode {
 
     /// The keys of an on-demand namespace ([`StreamNodeConfig::on_demand`]) wanted now, those in their linger among
     /// them, and the changes after it: open a key told [`Demand::Wanted`], and close one told [`Demand::Unwanted`] when
-    /// nothing else needs it open. `Unwanted` comes for a key that was never opened too, one whose open failed: its close
+    /// nothing else needs it open. `Unwanted` comes for a key never opened too, one whose open failed: its close
     /// answers `UnknownStream`. A key wanted again after its close is told `Wanted` again. One feed per namespace at a
     /// time: `AlreadyExists` while another is held, `InvalidOptions` for a namespace not on demand.
     pub fn demand(&self, namespace: &str) -> Result<(Vec<StreamKey>, DemandFeed), StreamError> {
