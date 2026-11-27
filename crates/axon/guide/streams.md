@@ -726,7 +726,9 @@ origin of the namespace's keys whether they are open or not:
 - A want for a key not open here, a local `subscribe` or a child's, waits for the open instead of being refused
   `UnknownStream`. A `Live` follower is told `Ready` with no position and `CaughtUp` at record 0, as on a relay that
   has none yet; an `After`, `First` or `SnapshotThenLive` start is told nothing. The wait has no deadline. A key that
-  waits holds a stream slot (`HubLimits::max_streams`) as an open one does, and its followers count in the
+  waits holds a stream slot (`HubLimits::max_streams`, shared with every namespace) while something wants it, not
+  through its linger, so `CoreConfig::max_parked_keys` (1024 by default) caps the keys that wait at once: a want for one
+  more is refused `LimitExceeded`. Its followers count in the
   namespace's [limits](#namespace-limits).
 - `node.demand(namespace)` returns the keys wanted now, those in their linger among them, and a `DemandFeed` (an
   `axon::Stream`) of the changes after: `Demand::Wanted(key)` when something wants a key that nothing did, and

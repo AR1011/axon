@@ -271,6 +271,10 @@ pub struct CoreConfig {
     /// follower: a want for a key not open here waits for the open instead of being refused `UnknownStream`, and
     /// [`take_demand`](RelayCore::take_demand) says which keys to open and which to close.
     pub on_demand: BTreeMap<String, Duration>,
+    /// The most keys of the on-demand namespaces that wait for their open at once; a want for one more is refused
+    /// `LimitExceeded`. Each holds a stream until nothing wants it, one of the hub's `max_streams`, which every
+    /// namespace shares.
+    pub max_parked_keys: usize,
     /// How long a parent that refused a stream is left alone; doubles per refusal, up to 32 times this.
     pub retry_refused: Duration,
     pub retry_failed: Duration,
@@ -321,6 +325,7 @@ impl Default for CoreConfig {
             timings_by_namespace: BTreeMap::new(),
             linger: Duration::from_secs(5),
             on_demand: BTreeMap::new(),
+            max_parked_keys: 1024,
             retry_refused: Duration::from_secs(2),
             retry_failed: Duration::from_millis(500),
             refresh: Duration::from_secs(2),
@@ -1487,6 +1492,9 @@ impl<A: Authorizer> RelayCore<A> {
             return Ok(());
         }
         if self.claimed(key) {
+            if self.parked.len() >= self.cfg.max_parked_keys {
+                return Err(StreamError::LimitExceeded);
+            }
             // No parent: it waits for this node to open it, however long that takes.
             self.hub.open_relay_stream(&self.local, key, DeliveryPolicy::ReplayRequired)?;
             self.parked.insert(key.clone());
@@ -1532,6 +1540,10 @@ impl<A: Authorizer> RelayCore<A> {
                 }
                 continue;
             }
+            // The placeholder goes now, so its stream slot comes back at once: a want within the linger parks it again.
+            if self.parked.remove(&key) {
+                let _ = self.hub.close_stream(&self.local, &key, EndReason::StreamClosed);
+            }
             // Not told: a key parked for a want refused after all.
             if let Some(since) = self.wanted.get_mut(&key) {
                 let since = *since.get_or_insert(now);
@@ -1541,9 +1553,6 @@ impl<A: Authorizer> RelayCore<A> {
                 }
                 self.wanted.remove(&key);
                 self.tell(&key, false);
-            }
-            if self.parked.remove(&key) {
-                let _ = self.hub.close_stream(&self.local, &key, EndReason::StreamClosed);
             }
         }
     }

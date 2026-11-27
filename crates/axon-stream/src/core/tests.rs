@@ -1582,6 +1582,53 @@ fn a_key_the_claim_refuses_is_an_unknown_stream() {
     assert_eq!(origin.streams(16, now).1, 1, "only the claimed key waits");
 }
 
+/// A key that waits for its open gives its stream slot back as soon as nothing wants it, while it stays wanted through
+/// its linger. Before, it held the slot, which every namespace shares, through the linger, so wants that came and went
+/// kept other keys from opening.
+#[test]
+fn a_waiting_key_nothing_wants_gives_its_stream_slot_back_within_its_linger() {
+    let now = Instant::now();
+    let mut cfg = scaled();
+    cfg.hub.max_streams = 1;
+    cfg.on_demand.insert("jobs".into(), LINGER);
+    let mut origin = RelayCore::new(&PeerId::new("o", 1), AllowAll, cfg).expect("a valid config");
+    let id = origin.subscribe(&job(0), SubscribeOptions::default()).expect("follows");
+    assert_eq!(told(&mut origin, now), vec![Demand::Wanted(job(0))]);
+    let other = StreamKey::new("other", "k");
+    assert_eq!(origin.open_stream(&other, 1, DeliveryPolicy::ReplayRequired), Err(StreamError::LimitExceeded));
+    origin.unsubscribe(id);
+    assert_eq!(told(&mut origin, now), vec![]);
+    origin.open_stream(&other, 1, DeliveryPolicy::ReplayRequired).expect("the slot is back");
+    assert_eq!(origin.wanted("jobs").expect("on demand"), vec![job(0)], "wanted until the linger ends");
+    assert_eq!(told(&mut origin, now + LINGER), vec![Demand::Unwanted(job(0))]);
+}
+
+/// Past `max_parked_keys` keys waiting for their open, a want for one more is refused `LimitExceeded`, a local one and
+/// a child's, and an open makes room. Before, wants for as many names as the claim takes each held a stream until the
+/// hub was full.
+#[test]
+fn a_want_past_max_parked_keys_is_refused_limit_exceeded() {
+    let now = Instant::now();
+    let (o, c) = (PeerId::new("o", 1), PeerId::new("c", 1));
+    let mut cfg = CoreConfig { max_parked_keys: 1, ..scaled() };
+    cfg.on_demand.insert("jobs".into(), LINGER);
+    let mut origin = RelayCore::new(&o, AllowAll, cfg).expect("a valid config");
+    origin.subscribe(&job(0), SubscribeOptions::default()).expect("waits");
+    assert_eq!(origin.subscribe(&job(1), SubscribeOptions::default()), Err(StreamError::LimitExceeded));
+    let start = StartPosition::After(Cursor { generation: 1, sequence: 0 });
+    let want = |revision| Interest {
+        revision,
+        wants: vec![Want { key: job(1), epoch: 1, start, snapshot: false }],
+        ..Default::default()
+    };
+    let status = |answers: Result<Vec<Answer>, _>| -> Vec<Status> {
+        answers.expect("answered").into_iter().map(|a| a.status).collect()
+    };
+    assert_eq!(status(origin.handle_interest(&c, want(1), now)), vec![Status::LimitExceeded]);
+    origin.open_stream(&job(0), 1, DeliveryPolicy::ReplayRequired).expect("opens");
+    assert_eq!(status(origin.handle_interest(&c, want(2), now)), vec![Status::Ok]);
+}
+
 /// A child that is lost takes its wants with it: the key is told unwanted a linger after the loss.
 #[test]
 fn a_lost_child_drops_its_demand() {

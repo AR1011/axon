@@ -919,7 +919,7 @@ fault into that feature.
 | disk error | n/a: it writes nothing; an open from disk is the disk store's rows |
 | fd exhaustion | n/a: relay rows |
 | panic | gap |
-| overload | gap |
+| overload | `crates/axon-stream/src/core/tests.rs::a_want_past_max_parked_keys_is_refused_limit_exceeded`, `crates/axon-stream/src/core/tests.rs::a_waiting_key_nothing_wants_gives_its_stream_slot_back_within_its_linger` |
 | hostile input | gap |
 
 ### streams: recovery and cursors

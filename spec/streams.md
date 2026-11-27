@@ -312,7 +312,11 @@ were wanted; it had to open them all or guess.
   the linger cancels it. Changes are coalesced per key, so a change undone before the feed takes it is not told, and
   `Wake::Demand(namespace)` is pushed only when the namespace had nothing pending. `take_demand` hands them over;
   `wanted` lists the keys wanted now, those in their linger among them.
-- A key unwanted and not open is let go: its placeholder is removed. A close of a key the claim takes does not pull
+- A key nothing wants and not open is let go at once: its placeholder is closed when its count reaches zero, so its
+  slot under `HubLimits::max_streams`, which every namespace shares, comes back, and only its `wanted` entry stays
+  through the linger; a want inside the linger parks it again. `CoreConfig::max_parked_keys` caps the placeholders:
+  a want for one more is refused `LimitExceeded` (`ensure_stream`), so wants for many keys the claim takes cannot
+  fill the hub. Before, a placeholder held its slot through the linger and nothing capped them. A close of a key the claim takes does not pull
   it from a parent (`end_stream` without `repull`); one still wanted is told `Wanted` again, so the application can
   open it again, and its followers and its children's wait for that open. A close of a key the claim refuses pulls
   it for its followers, as on a node without the namespace on demand.
@@ -331,7 +335,7 @@ were wanted; it had to open them all or guess.
   and a `DemandFeed` (`axon::Stream` of `Demand`). One feed per namespace: `AlreadyExists` while one is held,
   `InvalidOptions` for a namespace not on demand. The node's lock order is the core, then the feeds.
 
-**Wire.** None: a child's `Want` and the origin's answers are the frames of §1 to §3. **API.** `CoreConfig::on_demand`,
+**Wire.** None: a child's `Want` and the origin's answers are the frames of §1 to §3. **API.** `CoreConfig::{on_demand, max_parked_keys}`,
 `Demand`, `Claim`, `Wake::Demand`, `RelayCore::{set_claim, take_demand, wanted, reclaim}`,
 `StreamNodeConfig::{on_demand, claim}`, `StreamNode::{demand, reclaim}`, `DemandFeed`.
 
@@ -339,7 +343,8 @@ were wanted; it had to open them all or guess.
 
 - `crates/axon-stream/src/core/tests.rs`, under "on-demand origins": a want waits for the open and is told once;
   `Unwanted` a linger after the last want, and a want inside it cancels it; a key the claim refuses is
-  `UnknownStream`; a lost child drops its demand; a restarted origin is told again what its children want; a
+  `UnknownStream`; a waiting key nothing wants gives its stream slot back within its linger; a want past
+  `max_parked_keys` is refused `LimitExceeded`; a lost child drops its demand; a restarted origin is told again what its children want; a
   compacted key gives its waiting followers the state; a key closed while wanted is told `Wanted` again and its
   followers wait for the next open; a waiting key its claim gives up at a reclaim sends its children to another
   parent; a pulled key its claim takes at a reclaim is dropped upstream and told `Wanted`; a key closed once its
@@ -355,7 +360,7 @@ were wanted; it had to open them all or guess.
   the reconcile that sees the change and opens the key, and when the first comes back the second closes it and its
   follower is pulled from the first.
 
-**Not built.** A cap on parked keys apart from `HubLimits::max_streams`, which they count in. A bounded feed with a
+**Not built.** A bounded feed with a
 resync: changes coalesce per key, so the feed holds at most one change per wanted key. A count of parked keys in
 `RelayStats`; `streams()` lists them.
 
