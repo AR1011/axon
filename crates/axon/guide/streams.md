@@ -754,8 +754,10 @@ origin of the namespace's keys whether they are open or not:
   that waits and that the claim gives up is let go: it is told `Unwanted` if it was told `Wanted`, and its children
   ask their other parents. A pulled key that the claim takes is pulled no more and told `Wanted`, and so is a key
   whose followers here wait with nothing to pull from, after it was let go or closed while the claim refused it. A
-  key open here stays open when it moves away: the application closes it. The claim runs under the node's lock: it
-  decides at once and calls nothing on the node. `start` refuses a claim for a namespace not on demand.
+  key open here stays open when it moves away: the application closes it. So is one that moves away while its open
+  still reads from disk: the open finishes on a node that no longer owns the key, and the `Unwanted` it was told
+  meanwhile waits in the feed, so the application closes it once the open has returned. The claim runs under the
+  node's lock: it decides at once and calls nothing on the node. `start` refuses a claim for a namespace not on demand.
 - The linger must outlast a child that reconnects, after a parent restart or a lost link. A child that comes back
   within it costs nothing; one that does not is let go. An origin that restarts is told `Wanted` again by every child
   that still follows a key, so the application opens what it opened before, in a new generation unless the key is

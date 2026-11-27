@@ -331,7 +331,10 @@ were wanted; it had to open them all or guess.
   parents), and a pulled key the claim takes is pulled no more (`end_stream` without `repull`, `unfeed`) and crossed,
   so it is told `Wanted` while wanted. So is a key with demand here (`StreamHub::demanded`) and no stream, whose
   followers the hub holds parked with nothing to pull from: disowned, or closed while the claim refused it, on a node
-  without `relay`. A key open here is left to the application. Before, the claim was asked only
+  without `relay`. A key open here is left to the application. So is a disown that lands between `disk_read` and
+  `open_read`: `StreamNode`'s open reads the disk without the core's lock, and `open_read` does not ask the claim, so
+  the open finishes on a node that no longer owns the key. It converges: the disown queued `Unwanted`, which the
+  application takes, and closes the key on, once its open returns. Before, the claim was asked only
   when no stream of the key was here, so a membership change that moved a key left the old owner's placeholder and
   the new owner's pull in place, and nothing told the new owner.
 - `StreamNode`: `StreamNodeConfig::on_demand(namespace, linger)`, `StreamNodeConfig::claim(namespace, fn)` (refused
