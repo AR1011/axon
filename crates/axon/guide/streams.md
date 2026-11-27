@@ -739,7 +739,8 @@ origin of the namespace's keys whether they are open or not:
   closes each told `Unwanted`. The open gives every waiting follower `Ready` at its position, the state to a
   `SnapshotThenLive` start on a [compacted](#compacted-streams) stream, the records after its own start where the
   open is past it and its history holds them, then every record after. `Wanted` comes for a key already open too:
-  the application keeps it open.
+  the application keeps it open. `Unwanted` comes for a key never opened too, one whose open failed or that the
+  application chose not to open: its close answers `UnknownStream`, which the application ignores.
 - A key closed while it is wanted is told `Wanted` again while the claim (below) takes it, and its followers wait for
   the next open: the node does not ask a parent for it, so its children and their followers stay where they are. To
   end a key for good, a finished one, have the claim refuse it before the close: it is not told again, a child that

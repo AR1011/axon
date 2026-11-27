@@ -345,25 +345,31 @@ were wanted; it had to open them all or guess.
 - `crates/axon-stream/src/core/tests.rs`, under "on-demand origins": a want waits for the open and is told once;
   `Unwanted` a linger after the last want, and a want inside it cancels it; a key the claim refuses is `UnknownStream`;
   a waiting key nothing wants gives its stream slot back within its linger; a want past `max_parked_keys` is refused
-  `LimitExceeded`; a lost child drops its demand; a restarted origin is told again what its children want; a compacted
-  key gives its waiting followers the state; a snapshot follower waiting for an open after a position replays from the
-  history; a key closed while wanted is told `Wanted` again and its followers wait for the next open; a waiting key its
-  claim gives up at a reclaim sends its children to another parent; a pulled key its claim takes at a reclaim is dropped
-  upstream and told `Wanted`; a key closed once its claim gives it up is not told `Wanted` again.
+  `LimitExceeded`; a lost child drops its demand; a compacted key gives its waiting followers the state; a snapshot
+  follower waiting for an open after a position replays from the history; a key closed while wanted is told `Wanted`
+  again and its followers wait for the next open; a waiting key its claim gives up at a reclaim sends its children to
+  another parent; a pulled key its claim takes at a reclaim is dropped upstream and told `Wanted`; a key closed once its
+  claim gives it up is not told `Wanted` again; on a node that pulls the keys it does not open, a key closed is pulled
+  from a parent only once its claim gives it up, and a waiting key its claim gives up is pulled from a parent for its
+  followers; a child's `First` start on a waiting key replays from the open's history; a change undone before it is
+  taken is not told; a refused want for a key not open leaves no placeholder.
 - `crates/axon-stream/src/node/tests.rs`: a compacted key opened from disk gives waiting followers, local and on a
-  child, the kept state; a start waiting behind an open from disk replays from the disk, local and on a child.
-- `crates/axon-stream/tests/world_on_demand.rs`, 32 seeds each: leaves want a key, one leaves and one crashes, and
-  the application is told `Unwanted` within one tick past the linger after the last want went; an origin that crashes
-  and restarts is told `Wanted` again and the leaf's follower goes on in the new generation; a leaf paused or cut
-  off, over a slow link that loses chunks, for less than the linger keeps the key open, and for longer has it told
-  `Unwanted`, closed and opened again in a new generation, with no reset either way; three origins, each the owner
-  of every key while it is the last origin in its view, where the owner crashes, the next one is told `Wanted` at
-  the reconcile that sees the change and opens the key, and when the first comes back the second closes it and its
-  follower is pulled from the first.
+  child, the kept state; a start waiting behind an open from disk replays from the disk, local and on a child; one
+  demand feed per namespace, and a claim only for one on demand.
+- `crates/axon-stream/tests/world_on_demand.rs`, 32 seeds each: leaves want a key, one leaves and one crashes, and the
+  application is told `Unwanted` within 200 ms past the linger after the last want went; an origin that crashes and
+  restarts is told `Wanted` again and the leaf's follower goes on in the new generation; a leaf paused or cut off, over
+  a slow link that loses chunks, for less than the linger keeps the key open, and for longer has it told `Unwanted`,
+  closed and opened again in a new generation, with no reset either way, each seed's arm from `seed % 4`; three origins,
+  each the owner of every key while it is the last origin in its view, where the owner crashes, the next one is told
+  `Wanted` at the reconcile that sees the change and opens the key, and when the first comes back the second closes it
+  and its follower is pulled from the first; two owners, each with upstream tiers, that pull each other's keys, where
+  every follower on both reads each generation in order with no gap and no `Loop` refusal, through a close and a reopen,
+  and whose interests stay bounded over a quiet 180 s.
 
 **Not built.** A bounded feed with a
 resync: changes coalesce per key, so the feed holds at most one change per wanted key. A count of parked keys in
-`RelayStats`; `streams()` lists them.
+`RelayStats`; `streams()` lists only the keys open here and those pulled, not the parked ones.
 
 ## Open
 

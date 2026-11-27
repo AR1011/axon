@@ -2869,7 +2869,7 @@ impl<A: Authorizer> RelayCore<A> {
     /// The first `limit` streams in key order, and how many there are.
     pub fn streams(&self, limit: usize, now: Instant) -> (Vec<StreamInfo>, usize) {
         #[expect(clippy::disallowed_methods, reason = "the hash order never shows: sorted on the next line")]
-        let mut keys: Vec<&StreamKey> = self.originated.iter().chain(self.feeds.keys()).chain(&self.parked).collect();
+        let mut keys: Vec<&StreamKey> = self.originated.iter().chain(self.feeds.keys()).collect();
         keys.sort();
         let list = keys.iter().take(limit).map(|key| {
             let (cursor, feed) = (self.cursor(key), self.feeds.get(*key));

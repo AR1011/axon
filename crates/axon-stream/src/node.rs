@@ -900,8 +900,9 @@ impl StreamNode {
 
     /// The keys of an on-demand namespace ([`StreamNodeConfig::on_demand`]) wanted now, those in their linger among
     /// them, and the changes after it: open a key told [`Demand::Wanted`], and close one told [`Demand::Unwanted`] when
-    /// nothing else needs it open. A key wanted again after its close is told `Wanted` again. One feed per namespace at
-    /// a time: `AlreadyExists` while another is held, `InvalidOptions` for a namespace not on demand.
+    /// nothing else needs it open. `Unwanted` comes for a key that was never opened too, one whose open failed: its close
+    /// answers `UnknownStream`. A key wanted again after its close is told `Wanted` again. One feed per namespace at a
+    /// time: `AlreadyExists` while another is held, `InvalidOptions` for a namespace not on demand.
     pub fn demand(&self, namespace: &str) -> Result<(Vec<StreamKey>, DemandFeed), StreamError> {
         let wanted = self.0.with(|core| {
             let mut feeds = self.0.demand.lock();

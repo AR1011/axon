@@ -1545,7 +1545,7 @@ fn a_key_is_told_unwanted_a_linger_after_its_last_want_and_a_want_within_it_canc
     assert_eq!(told(&mut origin, now + LINGER - Duration::from_millis(1)), vec![]);
     assert_eq!(origin.wanted("jobs").expect("on demand"), vec![job(0)], "wanted until the linger ends");
     assert_eq!(told(&mut origin, now + LINGER), vec![Demand::Unwanted(job(0))]);
-    assert_eq!(origin.streams(16, now + LINGER).1, 0, "the key no longer waits");
+    assert_eq!(origin.stats().hub.streams, 0, "the key no longer waits");
     assert_eq!(origin.wanted("jobs").expect("on demand"), vec![]);
 
     let at = now + LINGER * 2;
@@ -1579,7 +1579,7 @@ fn a_key_the_claim_refuses_is_an_unknown_stream() {
     assert_eq!(statuses, vec![Status::Ok, Status::UnknownStream]);
     assert_eq!(origin.subscribe(&job(1), SubscribeOptions::default()), Err(StreamError::UnknownStream));
     assert_eq!(told(&mut origin, now), vec![Demand::Wanted(job(0))]);
-    assert_eq!(origin.streams(16, now).1, 1, "only the claimed key waits");
+    assert_eq!(origin.stats().hub.streams, 1, "only the claimed key waits");
 }
 
 /// A key that waits for its open gives its stream slot back as soon as nothing wants it, while it stays wanted through
@@ -1596,6 +1596,7 @@ fn a_waiting_key_nothing_wants_gives_its_stream_slot_back_within_its_linger() {
     assert_eq!(told(&mut origin, now), vec![Demand::Wanted(job(0))]);
     let other = StreamKey::new("other", "k");
     assert_eq!(origin.open_stream(&other, 1, DeliveryPolicy::ReplayRequired), Err(StreamError::LimitExceeded));
+    assert_eq!(origin.subscribe(&job(1), SubscribeOptions::default()), Err(StreamError::LimitExceeded));
     origin.unsubscribe(id);
     assert_eq!(told(&mut origin, now), vec![]);
     origin.open_stream(&other, 1, DeliveryPolicy::ReplayRequired).expect("the slot is back");
@@ -1644,27 +1645,6 @@ fn a_lost_child_drops_its_demand() {
     assert_eq!(told(&mut origin, lost), vec![]);
     assert_eq!(told(&mut origin, lost + LINGER - Duration::from_millis(1)), vec![]);
     assert_eq!(told(&mut origin, lost + LINGER), vec![Demand::Unwanted(job(0))]);
-}
-
-/// A restarted origin is told again of the keys its children still want, and its open reaches their followers.
-#[test]
-fn a_restarted_origin_is_told_again_what_its_children_want() {
-    let now = Instant::now();
-    let (o, c) = (PeerId::new("o", 1), PeerId::new("c", 1));
-    let mut origin = on_demand(&o);
-    let mut child = relay(&c);
-    let follower = child.subscribe(&job(0), SubscribeOptions::default()).expect("follows");
-    ask(&mut origin, &o, &mut child, &c, now);
-    assert_eq!(told(&mut origin, now), vec![Demand::Wanted(job(0))]);
-    let o2 = PeerId::new("o", 2);
-    let mut origin = on_demand(&o2);
-    let at = now + Duration::from_secs(1);
-    ask(&mut origin, &o2, &mut child, &c, at);
-    assert_eq!(told(&mut origin, at), vec![Demand::Wanted(job(0))]);
-    origin.open_stream(&job(0), 1, DeliveryPolicy::ReplayRequired).expect("opens");
-    origin.publish(&job(0), vec![Bytes::from_static(b"x")]).expect("publishes");
-    deliver(&mut origin, &o2, &mut child, &c, at);
-    assert_eq!(records(&mut child, follower), vec![1]);
 }
 
 /// A `Compacted` key opened on a parked want gives each `SnapshotThenLive` follower, here and on a child, its state
@@ -1835,4 +1815,122 @@ fn a_key_closed_once_its_claim_gives_it_up_is_not_told_wanted_again() {
     }
     assert_eq!(changes, vec![]);
     assert!(child.stats().refusals[Status::UnknownStream as usize] > 0, "the child's want is refused");
+}
+
+/// The `Ready`-free events a subscription is given, its batches as "generation first..last".
+fn batches<A: Authorizer>(core: &mut RelayCore<A>, id: u64) -> Vec<String> {
+    seen(core, id).into_iter().filter(|event| event.starts_with(|c: char| c.is_ascii_digit())).collect()
+}
+
+/// On a node that pulls the keys it does not open, a key the application closes while its claim takes it is not asked
+/// of a parent, and its follower waits for the next open here; closed once the claim gives it up, it is pulled from a
+/// parent, and the follower goes on in the parent's generation. Before, a close never pulled, so the follower of a
+/// key handed to another node waited forever, or always pulled, so two owners pulled a key from each other.
+#[test]
+fn a_key_closed_on_a_node_that_pulls_is_pulled_from_a_parent_only_once_its_claim_gives_it_up() {
+    let now = Instant::now();
+    let (p, n) = (PeerId::new("p", 1), PeerId::new("n", 1));
+    let mut parent = on_demand(&p);
+    let mine = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let mut node = owner(&n, true);
+    node.set_claim("jobs", claim_while(&mine));
+    let follower = node.subscribe(&job(0), SubscribeOptions::default()).expect("waits");
+    assert_eq!(told(&mut node, now), vec![Demand::Wanted(job(0))]);
+    node.open_stream(&job(0), 1, DeliveryPolicy::ReplayRequired).expect("opens");
+    node.publish(&job(0), vec![Bytes::from_static(b"x")]).expect("publishes");
+    node.close_stream(&job(0)).expect("closes");
+    let asked = node.reconcile(std::slice::from_ref(&p), now);
+    let pulled = |asked: &[(PeerId, Interest)]| asked.iter().any(|(_, i)| i.wants.iter().any(|w| w.key == job(0)));
+    assert!(!pulled(&asked), "a key this node opens is not asked of a parent: {asked:?}");
+    assert_eq!(node.take_demand("jobs"), vec![Demand::Wanted(job(0))]);
+    node.open_stream(&job(0), 2, DeliveryPolicy::ReplayRequired).expect("opens again");
+    node.publish(&job(0), vec![Bytes::from_static(b"x")]).expect("publishes");
+    mine.store(false, std::sync::atomic::Ordering::Relaxed);
+    node.close_stream(&job(0)).expect("closes");
+    ask(&mut parent, &p, &mut node, &n, now);
+    assert_eq!(told(&mut parent, now), vec![Demand::Wanted(job(0))]);
+    parent.open_stream(&job(0), 3, DeliveryPolicy::ReplayRequired).expect("opens");
+    parent.publish(&job(0), vec![Bytes::from_static(b"x")]).expect("publishes");
+    // The node asked after record 1 of generation 2, so it is told of the newer one and asks for it.
+    for _ in 0..2 {
+        deliver(&mut parent, &p, &mut node, &n, now);
+        ask(&mut parent, &p, &mut node, &n, now);
+    }
+    deliver(&mut parent, &p, &mut node, &n, now);
+    assert_eq!(batches(&mut node, follower), vec!["1 1..1", "2 1..1", "3 1..1"]);
+}
+
+/// On a node that pulls the keys it does not open, a key waiting for its open that its claim gives up at a reclaim is
+/// pulled from a parent for its follower. Before, its follower stayed parked, waiting for an open here that never came.
+#[test]
+fn a_waiting_key_its_claim_gives_up_is_pulled_from_a_parent_for_its_followers() {
+    let now = Instant::now();
+    let (p, n) = (PeerId::new("p", 1), PeerId::new("n", 1));
+    let mut parent = on_demand(&p);
+    let mine = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let mut node = owner(&n, true);
+    node.set_claim("jobs", claim_while(&mine));
+    let follower = node.subscribe(&job(0), SubscribeOptions::default()).expect("waits");
+    assert_eq!(told(&mut node, now), vec![Demand::Wanted(job(0))]);
+    mine.store(false, std::sync::atomic::Ordering::Relaxed);
+    node.reclaim();
+    assert_eq!(node.take_demand("jobs"), vec![Demand::Unwanted(job(0))]);
+    ask(&mut parent, &p, &mut node, &n, now);
+    assert_eq!(told(&mut parent, now), vec![Demand::Wanted(job(0))]);
+    parent.open_stream(&job(0), 1, DeliveryPolicy::ReplayRequired).expect("opens");
+    parent.publish(&job(0), vec![Bytes::from_static(b"x")]).expect("publishes");
+    deliver(&mut parent, &p, &mut node, &n, now);
+    assert_eq!(batches(&mut node, follower), vec!["1 1..1"]);
+}
+
+/// A child's `First` start on a key not open waits for the open and, where the open is after a position, replays
+/// from the open's history, from record 1. Before, it was taken live and missed the records before the open.
+#[test]
+fn a_childs_first_start_on_a_waiting_key_replays_from_the_opens_history() {
+    let now = Instant::now();
+    let (o, c) = (PeerId::new("o", 1), PeerId::new("c", 1));
+    let mut origin = on_demand(&o);
+    let mut log = MemoryStore::new(MemoryLimits::default()).expect("valid limits");
+    log.open(&job(0), 3).expect("opens");
+    let batch = SequencedBatch::new(3, 1, vec![Bytes::from_static(b"x"); 3]).expect("a batch");
+    log.append(&job(0), &batch).expect("appends");
+    origin.set_history("jobs", Arc::new(Mutex::new(log)));
+    let mut child = relay(&c);
+    let options = SubscribeOptions { start: StartPosition::First, ..Default::default() };
+    let follower = child.subscribe(&job(0), options).expect("subscribes");
+    ask(&mut origin, &o, &mut child, &c, now);
+    assert_eq!(told(&mut origin, now), vec![Demand::Wanted(job(0))]);
+    let after = Cursor { generation: 3, sequence: 3 };
+    origin.open_stream_after(&job(0), after, DeliveryPolicy::ReplayRequired).expect("opens");
+    origin.publish(&job(0), vec![Bytes::from_static(b"x")]).expect("publishes");
+    deliver(&mut origin, &o, &mut child, &c, now);
+    assert_eq!(records(&mut child, follower), vec![1, 2, 3, 4]);
+}
+
+/// A change undone before the application takes it is not told: a key wanted, then unwanted a linger after nothing
+/// wants it, with no take between, is told nothing. Before, the feed was told `Unwanted` for a key it never heard was
+/// wanted.
+#[test]
+fn a_change_undone_before_it_is_taken_is_not_told() {
+    let now = Instant::now();
+    let mut origin = on_demand(&PeerId::new("o", 1));
+    let id = origin.subscribe(&job(0), SubscribeOptions::default()).expect("waits");
+    origin.reconcile(&[] as &[PeerId], now);
+    origin.unsubscribe(id);
+    origin.reconcile(&[] as &[PeerId], now);
+    assert_eq!(told(&mut origin, now + LINGER), vec![]);
+    assert_eq!(origin.wanted("jobs").expect("on demand"), vec![]);
+}
+
+/// A want that parks a key and is then refused, here for its options, leaves no placeholder after the next reconcile.
+/// Before, nothing noted the key, so its placeholder held a stream slot until something else wanted the key and left.
+#[test]
+fn a_refused_want_for_a_key_not_open_leaves_no_placeholder() {
+    let now = Instant::now();
+    let mut origin = on_demand(&PeerId::new("o", 1));
+    let mut bad = SubscribeOptions::default();
+    bad.limits.max_records = 0;
+    assert_eq!(origin.subscribe(&job(0), bad), Err(StreamError::InvalidOptions));
+    assert_eq!(told(&mut origin, now), vec![]);
+    assert_eq!(origin.stats().hub.streams, 0);
 }

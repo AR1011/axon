@@ -1325,3 +1325,28 @@ fn a_start_waiting_behind_an_open_from_disk_replays_from_the_disk() {
     let expected: Vec<_> = (2..=4).map(|n| (n, record(n))).collect();
     assert_eq!((there, under), (expected.clone(), expected));
 }
+
+/// One demand feed per on-demand namespace: a second while one is held is `AlreadyExists`, one for a namespace not on
+/// demand `InvalidOptions`, and one taken after the first is dropped is told the changes. A claim for a namespace not
+/// on demand is refused at `start`. Before, a dropped feed kept its namespace, so no feed could be taken again.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_demand_feed_per_namespace_and_a_claim_only_for_one_on_demand() {
+    let (system, cluster) = start_cluster("a", &MemoryDiscovery::new()).await;
+    let claimed = StreamNode::start(&cluster, StreamNodeConfig::new(vec![]).claim("jobs", |_| true)).await;
+    assert!(matches!(claimed, Err(ClusterError::Config(_))));
+    let cfg = StreamNodeConfig::new(vec![]).on_demand("jobs", Duration::from_secs(5));
+    let node = StreamNode::start(&cluster, cfg).await.unwrap();
+    assert!(matches!(node.demand("other"), Err(StreamError::InvalidOptions)));
+    let (_, first) = node.demand("jobs").unwrap();
+    assert!(matches!(node.demand("jobs"), Err(StreamError::AlreadyExists)));
+    drop(first);
+    let (wanted, mut feed) = node.demand("jobs").unwrap();
+    assert_eq!(wanted, vec![]);
+    let key = StreamKey::new("jobs", "j0");
+    let _follower = node.subscribe(&key, SubscribeOptions::default()).unwrap();
+    let told = tokio::time::timeout(Duration::from_secs(5), feed.next()).await.unwrap();
+    assert_eq!(told, Some(Demand::Wanted(key)));
+    drop((feed, node));
+    drop(cluster);
+    system.shutdown().await.unwrap();
+}

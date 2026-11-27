@@ -96,7 +96,11 @@ fn application(w: &mut World<Node>, on: &str, told: &Told, opens: &Rc<Cell<u64>>
             told.borrow_mut().push((n.boot, demand.clone()));
             match demand {
                 Demand::Wanted(key) => open(key).await,
-                Demand::Unwanted(key) => n.stream.close_stream(&key).unwrap(),
+                // A key whose open failed is told `Unwanted` too: nothing to close.
+                Demand::Unwanted(key) => match n.stream.close_stream(&key) {
+                    Ok(()) | Err(StreamError::UnknownStream) => {}
+                    Err(error) => panic!("closing {key:?}: {error:?}"),
+                },
             }
         }
     }));
@@ -232,9 +236,10 @@ fn a_leaf_gone_for_less_than_the_linger_keeps_its_key_open_and_one_gone_longer_h
         w.run_until("the leaf reads the record", Duration::from_secs(10), |_| read(&seen, one));
         // Short: within `downstream_expiry` (2 s), so the origin may drop the leaf only just before the heal, and the
         // leaf asks again well inside the linger. Long: past `downstream_expiry` and the linger with room to spare.
-        let long = w.pick(0..2) == 1;
+        // Each seed's arms from the seed, so the first four seeds run all four.
+        let (long, paused) = (seed % 2 == 1, seed % 4 < 2);
         let gone = Duration::from_millis(if long { w.pick(8_000..12_000) } else { w.pick(200..1_500) });
-        if w.pick(0..2) == 0 {
+        if paused {
             w.pause("leaf", gone);
             w.run_for(gone);
         } else {
