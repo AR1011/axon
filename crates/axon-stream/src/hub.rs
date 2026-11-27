@@ -100,8 +100,9 @@ impl Default for HubLimits {
     }
 }
 
-/// One namespace's limits. Subscriptions and ring bytes hold on each node, exactly; the rates and open streams hold
-/// across the cluster, through the cluster's quotas at each stream's origin. `None` is no limit.
+/// One namespace's limits. Subscriptions, ring bytes and parked keys hold on each node, exactly; the rates and open
+/// streams hold across the cluster, through the cluster's quotas at each stream's origin. `None` is no limit, except
+/// for `parked_keys`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct NamespaceLimits {
     /// Subscriptions to the namespace on this node, until their end is read. A downstream node's branch is not one:
@@ -114,6 +115,10 @@ pub struct NamespaceLimits {
     pub records_per_sec: Option<u64>,
     pub bytes_per_sec: Option<u64>,
     pub open_streams: Option<u64>,
+    /// Keys of an on-demand namespace (`CoreConfig::on_demand`) that wait on this node for their open at once; a want
+    /// for one more is refused `LimitExceeded`. Each holds one of the hub's `max_streams`, which every namespace
+    /// shares, until nothing wants it. `None` is 1024.
+    pub parked_keys: Option<usize>,
 }
 
 /// The names of [`NamespaceLimit`], in its order.

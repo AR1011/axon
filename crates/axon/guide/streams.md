@@ -727,9 +727,9 @@ origin of the namespace's keys whether they are open or not:
   `UnknownStream`. A `Live` follower is told `Ready` with no position and `CaughtUp` at record 0, as on a relay that
   has none yet; an `After`, `First` or `SnapshotThenLive` start is told nothing. The wait has no deadline. A key that
   waits holds a stream slot (`HubLimits::max_streams`, shared with every namespace) while something wants it, not
-  through its linger, so `CoreConfig::max_parked_keys` (1024 by default) caps the keys that wait at once: a want for one
-  more is refused `LimitExceeded`. Its followers count in the
-  namespace's [limits](#namespace-limits).
+  through its linger, so the namespace's `parked_keys` [limit](#namespace-limits) (1024 by default) caps its keys
+  that wait at once on each node: a want for one more is refused `LimitExceeded`. Its followers count in the
+  namespace's limits.
 - `node.demand(namespace)` returns the keys wanted now, those in their linger among them, and a `DemandFeed` (an
   `axon::Stream`) of the changes after: `Demand::Wanted(key)` when something wants a key that nothing did, and
   `Demand::Unwanted(key)` once nothing has wanted it for `linger`. A want inside the linger cancels it, so the
@@ -753,8 +753,8 @@ origin of the namespace's keys whether they are open or not:
   that waits and that the claim gives up is let go: it is told `Unwanted` if it was told `Wanted`, and its children
   ask their other parents. A pulled key that the claim takes is pulled no more and told `Wanted`, and so is a key
   whose followers here wait with nothing to pull from, after it was let go or closed while the claim refused it. A
-  key open here stays open when it moves away: the application closes it. The claim runs under the node's lock: it decides at once
-  and calls nothing on the node. `start` refuses a claim for a namespace not on demand.
+  key open here stays open when it moves away: the application closes it. The claim runs under the node's lock: it
+  decides at once and calls nothing on the node. `start` refuses a claim for a namespace not on demand.
 - The linger must outlast a child that reconnects, after a parent restart or a lost link. A child that comes back
   within it costs nothing; one that does not is let go. An origin that restarts is told `Wanted` again by every child
   that still follows a key, so the application opens what it opened before, in a new generation unless the key is
@@ -863,9 +863,10 @@ while the rings still hold it.
 ## Namespace limits
 
 A namespace shared by tenants, or by one noisy producer and everyone else, gets limits of its own:
-`StreamNodeConfig::limit(namespace, NamespaceLimits { .. })`, with the same limits on every node. Subscriptions and
-ring bytes hold on each node, exactly. The publish rates and the open streams hold across the cluster, through the
-[`Quotas`](cluster.md#quotas) passed as `StreamNodeConfig::quotas`; `start` refuses such a limit without it.
+`StreamNodeConfig::limit(namespace, NamespaceLimits { .. })`, with the same limits on every node. Subscriptions, ring
+bytes and the parked keys of a namespace [on demand](#origins-on-demand) hold on each node, exactly. The publish
+rates and the open streams hold across the cluster, through the [`Quotas`](cluster.md#quotas) passed as
+`StreamNodeConfig::quotas`; `start` refuses such a limit without it.
 
 ```rust
 use axon::ActorSystem;
@@ -925,7 +926,8 @@ async fn main() {
 ```
 
 - **A refusal names its limit.** `open_stream`, `publish` and `subscribe` at a limit return
-  `StreamError::QuotaExceeded { namespace, limit, retry_after }`; a refused publish returns its records, as every
+  `StreamError::QuotaExceeded { namespace, limit, retry_after }`, except a want past `parked_keys`, which is
+  `LimitExceeded` as a full hub is; a refused publish returns its records, as every
   refusal does. `retry_after` is Quotas' answer for a rate or open streams, and `None` for a node's own limits, which
   clear only as something closes. Each refusal is counted in `HubStats::quota_refused` by limit, a publish in
   `publish_rejected` too, and in telemetry as `stream.quota_refused` by `reason`.

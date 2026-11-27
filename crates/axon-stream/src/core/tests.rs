@@ -1605,18 +1605,23 @@ fn a_waiting_key_nothing_wants_gives_its_stream_slot_back_within_its_linger() {
     assert_eq!(told(&mut origin, now + LINGER), vec![Demand::Unwanted(job(0))]);
 }
 
-/// Past `max_parked_keys` keys waiting for their open, a want for one more is refused `LimitExceeded`, a local one and
-/// a child's, and an open makes room. Before, wants for as many names as the claim takes each held a stream until the
-/// hub was full.
+/// Past its namespace's `parked_keys` keys waiting for their open, a want for one more is refused `LimitExceeded`, a
+/// local one and a child's, and an open makes room. Another namespace's waiting keys do not count. Before, wants for
+/// as many names as the claim takes each held a stream until the hub was full, and then one namespace's could fill a
+/// node-wide cap for all.
 #[test]
-fn a_want_past_max_parked_keys_is_refused_limit_exceeded() {
+fn a_want_past_a_namespaces_parked_keys_is_refused_limit_exceeded() {
     let now = Instant::now();
     let (o, c) = (PeerId::new("o", 1), PeerId::new("c", 1));
-    let mut cfg = CoreConfig { max_parked_keys: 1, ..scaled() };
+    let mut cfg = scaled();
     cfg.on_demand.insert("jobs".into(), LINGER);
+    cfg.on_demand.insert("tasks".into(), LINGER);
+    cfg.namespaces.insert("jobs".into(), NamespaceLimits { parked_keys: Some(1), ..NamespaceLimits::default() });
     let mut origin = RelayCore::new(&o, AllowAll, cfg).expect("a valid config");
-    origin.subscribe(&job(0), SubscribeOptions::default()).expect("waits");
+    origin.subscribe(&StreamKey::new("tasks", "t0"), SubscribeOptions::default()).expect("waits");
+    origin.subscribe(&job(0), SubscribeOptions::default()).expect("waits: the other namespace's key does not count");
     assert_eq!(origin.subscribe(&job(1), SubscribeOptions::default()), Err(StreamError::LimitExceeded));
+    origin.subscribe(&StreamKey::new("tasks", "t1"), SubscribeOptions::default()).expect("waits: its own cap");
     let start = StartPosition::After(Cursor { generation: 1, sequence: 0 });
     let want = |revision| Interest {
         revision,

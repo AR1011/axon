@@ -46,6 +46,7 @@ const LIM: NamespaceLimits = NamespaceLimits {
     records_per_sec: Some(200),
     bytes_per_sec: None,
     open_streams: Some(6),
+    parked_keys: None,
 };
 /// A rate's bucket, window/8: admissions are counted on this grid.
 const BUCKET_MS: u64 = 125;

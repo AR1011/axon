@@ -315,9 +315,10 @@ were wanted; it had to open them all or guess.
   `wanted` lists the keys wanted now, those in their linger among them.
 - A key nothing wants and not open is let go at once: its placeholder is closed when its count reaches zero, so its
   slot under `HubLimits::max_streams`, which every namespace shares, comes back, and only its `wanted` entry stays
-  through the linger; a want inside the linger parks it again. `CoreConfig::max_parked_keys` caps the placeholders:
-  a want for one more is refused `LimitExceeded` (`ensure_stream`), so wants for many keys the claim takes cannot
-  fill the hub. Before, a placeholder held its slot through the linger and nothing capped them. A close of a key the claim takes does not pull
+  through the linger; a want inside the linger parks it again. `NamespaceLimits::parked_keys` (1024 when `None`) caps
+  each namespace's placeholders on the node, counted with a range over `parked`: a want for one more is refused
+  `LimitExceeded` (`ensure_stream`), so wants for many keys the claim takes cannot fill the hub, nor one namespace's
+  the cap of another. Before, a placeholder held its slot through the linger and nothing capped them. A close of a key the claim takes does not pull
   it from a parent (`end_stream` without `repull`); one still wanted is told `Wanted` again, so the application can
   open it again, and its followers and its children's wait for that open. A close of a key the claim refuses pulls
   it for its followers, as on a node without the namespace on demand.
@@ -338,7 +339,7 @@ were wanted; it had to open them all or guess.
   and a `DemandFeed` (`axon::Stream` of `Demand`). One feed per namespace: `AlreadyExists` while one is held,
   `InvalidOptions` for a namespace not on demand. The node's lock order is the core, then the feeds.
 
-**Wire.** None: a child's `Want` and the origin's answers are the frames of §1 to §3. **API.** `CoreConfig::{on_demand, max_parked_keys}`,
+**Wire.** None: a child's `Want` and the origin's answers are the frames of §1 to §3. **API.** `CoreConfig::on_demand`, `NamespaceLimits::parked_keys`,
 `Demand`, `Claim`, `Wake::Demand`, `RelayCore::{set_claim, take_demand, wanted, reclaim}`,
 `StreamNodeConfig::{on_demand, claim}`, `StreamNode::{demand, reclaim}`, `DemandFeed`.
 
@@ -346,16 +347,17 @@ were wanted; it had to open them all or guess.
 
 - `crates/axon-stream/src/core/tests.rs`, under "on-demand origins": a want waits for the open and is told once;
   `Unwanted` a linger after the last want, and a want inside it cancels it; a key the claim refuses is `UnknownStream`;
-  a waiting key nothing wants gives its stream slot back within its linger; a want past `max_parked_keys` is refused
-  `LimitExceeded`; a lost child drops its demand; a compacted key gives its waiting followers the state; a snapshot
-  follower waiting for an open after a position replays from the history; a key closed while wanted is told `Wanted`
-  again and its followers wait for the next open; a waiting key its claim gives up at a reclaim sends its children to
-  another parent; a pulled key its claim takes at a reclaim is dropped upstream and told `Wanted`; a key closed once its
-  claim gives it up is not told `Wanted` again; on a node that pulls the keys it does not open, a key closed is pulled
-  from a parent only once its claim gives it up, and a waiting key its claim gives up is pulled from a parent for its
-  followers; on a node that pulls nothing, a key its claim takes back at a reclaim, after it was let go or closed, is
-  told `Wanted` for its waiting follower; a child's `First` start on a waiting key replays from the open's history; a change undone before it is
-  taken is not told; a refused want for a key not open leaves no placeholder.
+  a waiting key nothing wants gives its stream slot back within its linger; a want past its namespace's `parked_keys` is
+  refused `LimitExceeded`, and another namespace's waiting keys do not count; a lost child drops its demand; a
+  compacted key gives its waiting followers the state; a snapshot follower waiting for an open after a position
+  replays from the history; a key closed while wanted is told `Wanted` again and its followers wait for the next open;
+  a waiting key its claim gives up at a reclaim sends its children to another parent; a pulled key its claim takes at
+  a reclaim is dropped upstream and told `Wanted`; a key closed once its claim gives it up is not told `Wanted` again;
+  on a node that pulls the keys it does not open, a key closed is pulled from a parent only once its claim gives it
+  up, and a waiting key its claim gives up is pulled from a parent for its followers; on a node that pulls nothing, a
+  key its claim takes back at a reclaim, after it was let go or closed, is told `Wanted` for its waiting follower; a
+  child's `First` start on a waiting key replays from the open's history; a change undone before it is taken is not
+  told; a refused want for a key not open leaves no placeholder.
 - `crates/axon-stream/src/node/tests.rs`: a compacted key opened from disk gives waiting followers, local and on a
   child, the kept state; a start waiting behind an open from disk replays from the disk, local and on a child; one
   demand feed per namespace, and a claim only for one on demand.

@@ -204,6 +204,9 @@ const MAX_RETIRED: usize = 4;
 /// Delivery-rate samples one channel keeps.
 const MAX_RATES: usize = 64;
 
+/// The keys of one on-demand namespace that wait for their open at once, where its `NamespaceLimits` name none.
+const PARKED_KEYS: usize = 1024;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Wake {
     Local(u64),
@@ -270,11 +273,8 @@ pub struct CoreConfig {
     /// Namespaces whose keys this node opens when they are wanted, each with how long a key stays wanted after its last
     /// follower: a want for a key not open here waits for the open instead of being refused `UnknownStream`, and
     /// [`take_demand`](RelayCore::take_demand) says which keys to open and which to close.
+    /// `NamespaceLimits::parked_keys` caps the keys of each that wait at once.
     pub on_demand: BTreeMap<String, Duration>,
-    /// The most keys of the on-demand namespaces that wait for their open at once; a want for one more is refused
-    /// `LimitExceeded`. Each holds a stream until nothing wants it, one of the hub's `max_streams`, which every
-    /// namespace shares.
-    pub max_parked_keys: usize,
     /// How long a parent that refused a stream is left alone; doubles per refusal, up to 32 times this.
     pub retry_refused: Duration,
     pub retry_failed: Duration,
@@ -325,7 +325,6 @@ impl Default for CoreConfig {
             timings_by_namespace: BTreeMap::new(),
             linger: Duration::from_secs(5),
             on_demand: BTreeMap::new(),
-            max_parked_keys: 1024,
             retry_refused: Duration::from_secs(2),
             retry_failed: Duration::from_millis(500),
             refresh: Duration::from_secs(2),
@@ -1492,7 +1491,9 @@ impl<A: Authorizer> RelayCore<A> {
             return Ok(());
         }
         if self.claimed(key) {
-            if self.parked.len() >= self.cfg.max_parked_keys {
+            let (ns, max) = (key.namespace(), self.limits(key).and_then(|l| l.parked_keys).unwrap_or(PARKED_KEYS));
+            let parked = self.parked.range(StreamKey::new(ns, "")..).take_while(|k| k.namespace() == ns);
+            if parked.take(max).count() >= max {
                 return Err(StreamError::LimitExceeded);
             }
             // No parent: it waits for this node to open it, however long that takes.
