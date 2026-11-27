@@ -2767,15 +2767,16 @@ impl<A: Authorizer> RelayCore<A> {
         out
     }
 
-    /// The membership changed, which may have mended a parent's refusal for a lost upstream or an unknown key: such a
-    /// parent is asked again at the next `reconcile`, its backoff started over, and so is one that refuses so within
-    /// `retry_refused`. It may have moved keys to or from this node too: the claims are asked again.
+    /// The membership changed, which may have mended a parent's refusal for a lost upstream, an unknown key or a loop:
+    /// such a parent is asked again at the next `reconcile`, its backoff started over, and so is one that refuses for a
+    /// lost upstream or an unknown key within `retry_refused`. It may have moved keys to or from this node too: the
+    /// claims are asked again.
     #[cfg(feature = "cluster")]
     pub(crate) fn membership_changed(&mut self, now: Instant) {
         for (key, feed) in &mut self.feeds {
             feed.view_changed = Some(now);
             let before = feed.refused.len();
-            feed.refused.retain(|_, r| !matches!(r.status, Status::Unavailable | Status::UnknownStream));
+            feed.refused.retain(|_, r| !matches!(r.status, Status::Unavailable | Status::UnknownStream | Status::Loop));
             if feed.refused.len() != before {
                 self.dirty.insert(key.clone());
             }

@@ -93,8 +93,9 @@ async fn main() {
   shows as a new `Ready { start }` (`None` until a relay learns the position), never as a terminal event; between a
   close and the next open it receives nothing and keeps the node pulling the key; a relay notices the new stream when it
   next asks its parents, at the refusal backoff (2 s doubling to 64 s per tier; a membership change, such as the
-  origin's node coming back, asks again at once a parent that had lost its own upstream or lacked the key, and one
-  that first refuses so within 2 s of it, from a view that has not caught up yet), and the generation it then shows
+  origin's node coming back, asks again at once a parent that had lost its own upstream, lacked the key or answered a
+  loop, and one that first refuses for either of the first two within 2 s of it, from a view that has not caught up
+  yet), and the generation it then shows
   may be lower than the last one when the parent is itself behind. Every node takes a new
   generation from its record 1 while its parent's ring still holds it, so a follower anywhere sees the whole of it, as
   one on the origin's node does; otherwise, or when the node may not replay from its parent, it takes the live edge, and

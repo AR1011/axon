@@ -924,6 +924,28 @@ fn a_change_in_the_view_does_not_start_the_wait_to_give_a_position_up_over() {
     assert_eq!(leaf.stats().local_resets, 1);
 }
 
+/// A parent that refused a key as a loop is asked again at the next reconcile after a membership change, not at the
+/// end of its backoff: the change may have moved the node that pulled from this one. Before, only `Unavailable` and
+/// `UnknownStream` refusals were dropped, so the key waited out the backoff with no parent.
+#[cfg(feature = "cluster")]
+#[test]
+fn a_parent_refused_as_a_loop_is_asked_again_after_a_membership_change() {
+    let now = Instant::now();
+    let (p, l) = (PeerId::new("p", 1), PeerId::new("l", 1));
+    let mut leaf = RelayCore::new(&l, AllowAll, CoreConfig { relay: true, ..scaled() }).expect("a valid config");
+    leaf.subscribe(&key(0), SubscribeOptions::default()).expect("follows");
+    let asks = |leaf: &mut RelayCore, at| {
+        let asked = leaf.reconcile(std::slice::from_ref(&p), at);
+        asked.into_iter().find(|(_, i)| i.wants.iter().any(|w| w.key == key(0))).map(|(_, i)| i.revision)
+    };
+    let revision = asks(&mut leaf, now).expect("asks its parent");
+    leaf.interest_result(&p, revision, Some(vec![Status::Loop.into()]), now);
+    let at = now + Duration::from_millis(100);
+    assert_eq!(asks(&mut leaf, at), None, "within the backoff");
+    leaf.membership_changed(at);
+    assert!(asks(&mut leaf, at).is_some(), "the change mends the refusal at once");
+}
+
 /// Each round, `leaf` asks its `parents` and the one fed by `origin` is answered by it, the others by their `statuses`;
 /// then `origin` delivers what it has. 500 ms a round.
 fn rounds(
