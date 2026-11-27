@@ -1835,13 +1835,15 @@ fn a_key_closed_on_a_node_that_pulls_is_pulled_from_a_parent_only_once_its_claim
     let mine = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let mut node = owner(&n, true);
     node.set_claim("jobs", claim_while(&mine));
+    let pulled = |asked: &[(PeerId, Interest)]| asked.iter().any(|(_, i)| i.wants.iter().any(|w| w.key == job(0)));
     let follower = node.subscribe(&job(0), SubscribeOptions::default()).expect("waits");
+    let asked = node.reconcile(std::slice::from_ref(&p), now);
+    assert!(!pulled(&asked), "a key this node owns waits for its open, not a parent: {asked:?}");
     assert_eq!(told(&mut node, now), vec![Demand::Wanted(job(0))]);
     node.open_stream(&job(0), 1, DeliveryPolicy::ReplayRequired).expect("opens");
     node.publish(&job(0), vec![Bytes::from_static(b"x")]).expect("publishes");
     node.close_stream(&job(0)).expect("closes");
     let asked = node.reconcile(std::slice::from_ref(&p), now);
-    let pulled = |asked: &[(PeerId, Interest)]| asked.iter().any(|(_, i)| i.wants.iter().any(|w| w.key == job(0)));
     assert!(!pulled(&asked), "a key this node opens is not asked of a parent: {asked:?}");
     assert_eq!(node.take_demand("jobs"), vec![Demand::Wanted(job(0))]);
     node.open_stream(&job(0), 2, DeliveryPolicy::ReplayRequired).expect("opens again");
