@@ -1227,6 +1227,10 @@ impl<A: Authorizer> StreamHub<A> {
             };
             let replay = self.behind(sub, from, Some(cursor), source.as_ref());
             let sub = self.subs.get_mut(&id).expect("looked up above");
+            // One waiting for the state replays what follows it from the open's history, not the one it was admitted with.
+            if let (Phase::Snapshot(held), Some(source)) = (&mut sub.phase, &source) {
+                *held = Some(source.clone());
+            }
             if sub.policy == SlowConsumerPolicy::CoalesceLatest && policy != DeliveryPolicy::ReplaceableState {
                 self.terminate(id, StreamEvent::End(EndReason::Unsubscribed));
             } else if let Some((at, cut, source)) = replay {

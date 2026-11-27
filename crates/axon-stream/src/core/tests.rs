@@ -1692,6 +1692,28 @@ fn a_compacted_key_opened_for_its_waiting_followers_gives_them_the_state() {
     }
 }
 
+/// A `SnapshotThenLive` follower that waits for a key opened after a position replays the records before it from the
+/// namespace's history, as a subscribe just after the open does. Before, it kept the store it was admitted with, which
+/// holds nothing before the open, and was reset `HistoryUnavailable`.
+#[test]
+fn a_snapshot_follower_waiting_for_an_open_after_a_position_replays_from_the_history() {
+    let mut origin = on_demand(&PeerId::new("o", 1));
+    let mut log = MemoryStore::new(MemoryLimits::default()).expect("valid limits");
+    log.open(&job(0), 3).expect("opens");
+    let batch = SequencedBatch::new(3, 1, vec![Bytes::from_static(b"x"); 3]).expect("a batch");
+    log.append(&job(0), &batch).expect("appends");
+    origin.set_history("jobs", Arc::new(Mutex::new(log)));
+    let options = SubscribeOptions { start: StartPosition::SnapshotThenLive, ..Default::default() };
+    let waiting = origin.subscribe(&job(0), options).expect("waits");
+    let after = Cursor { generation: 3, sequence: 3 };
+    origin.open_stream_after(&job(0), after, DeliveryPolicy::ReplayRequired).expect("opens");
+    let later = origin.subscribe(&job(0), options).expect("subscribes");
+    origin.publish(&job(0), vec![Bytes::from_static(b"x")]).expect("publishes");
+    for id in [waiting, later] {
+        assert_eq!(records(&mut origin, id), vec![1, 2, 3, 4]);
+    }
+}
+
 /// A key the application closes while a child still wants it is told wanted again, and the child's follower waits for
 /// the next open, not for a parent: past the upstream timeout it is neither reset nor told the origin is lost, and it
 /// goes on in the generation opened next.

@@ -305,7 +305,8 @@ were wanted; it had to open them all or guess.
 - The open (`open_stream`, `open_read`) of a parked key converts it in place (`StreamHub::adopt_origin`): it takes the
   open's position, cursor, policy, kept state and history source, a follower or a start behind the open in its
   generation replays the rest from the history, a start at or past it waits to reach it, a `SnapshotThenLive` start
-  gets the state (`accept_snapshot`), and the key is woken so children are pushed at once.
+  gets the state (`accept_snapshot`) and replays what follows it from the open's history, not from the store it was
+  admitted with, and the key is woken so children are pushed at once.
 - Demand: the hub counts, per key, local subscriptions plus session interests, and notes each key whose count
   crosses zero (`hub::Demand`). `RelayCore::settle_demand`, at the start of every `reconcile`, turns those crossings
   into `Demand::Wanted` at once and `Demand::Unwanted` once the count has stayed at zero for the linger. A want inside
@@ -342,13 +343,13 @@ were wanted; it had to open them all or guess.
 **Tests.**
 
 - `crates/axon-stream/src/core/tests.rs`, under "on-demand origins": a want waits for the open and is told once;
-  `Unwanted` a linger after the last want, and a want inside it cancels it; a key the claim refuses is
-  `UnknownStream`; a waiting key nothing wants gives its stream slot back within its linger; a want past
-  `max_parked_keys` is refused `LimitExceeded`; a lost child drops its demand; a restarted origin is told again what its children want; a
-  compacted key gives its waiting followers the state; a key closed while wanted is told `Wanted` again and its
-  followers wait for the next open; a waiting key its claim gives up at a reclaim sends its children to another
-  parent; a pulled key its claim takes at a reclaim is dropped upstream and told `Wanted`; a key closed once its
-  claim gives it up is not told `Wanted` again.
+  `Unwanted` a linger after the last want, and a want inside it cancels it; a key the claim refuses is `UnknownStream`;
+  a waiting key nothing wants gives its stream slot back within its linger; a want past `max_parked_keys` is refused
+  `LimitExceeded`; a lost child drops its demand; a restarted origin is told again what its children want; a compacted
+  key gives its waiting followers the state; a snapshot follower waiting for an open after a position replays from the
+  history; a key closed while wanted is told `Wanted` again and its followers wait for the next open; a waiting key its
+  claim gives up at a reclaim sends its children to another parent; a pulled key its claim takes at a reclaim is dropped
+  upstream and told `Wanted`; a key closed once its claim gives it up is not told `Wanted` again.
 - `crates/axon-stream/src/node/tests.rs`: a compacted key opened from disk gives waiting followers, local and on a
   child, the kept state; a start waiting behind an open from disk replays from the disk, local and on a child.
 - `crates/axon-stream/tests/world_on_demand.rs`, 32 seeds each: leaves want a key, one leaves and one crashes, and
