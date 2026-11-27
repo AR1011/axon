@@ -22,8 +22,8 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use crate::core::{
-    CoreConfig, Item, Parents, Push, PushAnswer, PushId, RelayCore, RelayEvent, RelayStats, RelayTimings, Reply,
-    StreamInfo, Wake,
+    Claim, CoreConfig, Demand, Item, Parents, Push, PushAnswer, PushId, RelayCore, RelayEvent, RelayStats,
+    RelayTimings, Reply, StreamInfo, Wake,
 };
 use crate::disk::{self, DiskConfig, DiskStore, RETAIN_EVERY, RETRY_WRITE};
 use crate::hub::{
@@ -87,6 +87,8 @@ pub struct StreamNodeConfig {
     pub disk: Option<DiskConfig>,
     /// The history the application keeps of some namespaces: see [`history`](Self::history).
     pub history: BTreeMap<String, Arc<dyn RecoverySource>>,
+    /// Which keys of some on-demand namespaces are this node's: see [`claim`](Self::claim).
+    pub claims: BTreeMap<String, Claim>,
     /// Holds the namespaces' rates and open streams across the cluster; `start` refuses such a limit without it.
     pub quotas: Option<Quotas>,
 }
@@ -102,8 +104,34 @@ impl StreamNodeConfig {
             downstream_expiry: Duration::from_secs(10),
             disk: None,
             history: BTreeMap::new(),
+            claims: BTreeMap::new(),
             quotas: None,
         }
+    }
+
+    /// This node opens the keys of `namespace` when something wants them. A want for a key not open here waits for
+    /// the open, however long: it is answered as if the key were open, and the followers under it are told nothing
+    /// until the open gives them its position, its state to those that start `SnapshotThenLive`, and every record
+    /// after it. [`StreamNode::demand`] says which keys are wanted. A key stays wanted for `linger` after its last
+    /// follower leaves, which must outlast a child that reconnects, and a key wanted and not open is let go then. A
+    /// closed key's followers wait for this node to open it again, not for a parent.
+    pub fn on_demand(mut self, namespace: impl Into<String>, linger: Duration) -> Self {
+        self.core.on_demand.insert(namespace.into(), linger);
+        self
+    }
+
+    /// Of an on-demand namespace's keys, the ones this node opens: asked once for a key wanted while it is neither
+    /// open nor waited for here. A key it is not is refused `UnknownStream`, so the child asks its other parents, or,
+    /// with upstream tiers, pulled from a parent as any key this node does not originate. It runs under the node's
+    /// lock: it decides at once, from what it holds, and calls nothing on the node. `start` refuses a claim for a
+    /// namespace not on demand.
+    pub fn claim(
+        mut self,
+        namespace: impl Into<String>,
+        claim: impl Fn(&StreamKey) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.claims.insert(namespace.into(), Arc::new(claim));
+        self
     }
 
     /// A subscription that starts behind the ring of a stream in `namespace` this node originates replays from
@@ -163,6 +191,8 @@ struct Inner {
     ranked: Mutex<Ranked>,
     endpoints: Mutex<Vec<u64>>,
     locals: Mutex<HashMap<u64, Arc<Mutex<Inbox>>, IdHash>>,
+    /// The on-demand namespaces a `DemandFeed` takes, each with the waker of its next poll. Locked after `core`.
+    demand: Mutex<BTreeMap<String, Option<Waker>>>,
     pumps: Mutex<Pumps>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
     /// Only with a namespace limited across the cluster.
@@ -327,6 +357,11 @@ impl Inner {
         for wake in wakes {
             match wake {
                 Wake::Reconcile => self.kick.notify_one(),
+                Wake::Demand(namespace) => {
+                    if let Some(waker) = self.demand.lock().get_mut(&namespace).and_then(Option::take) {
+                        waker.wake();
+                    }
+                }
                 Wake::Local(_) => {}
                 Wake::Peer(node, lane) => self.pump(node, lane),
             }
@@ -572,12 +607,18 @@ impl StreamNode {
             return Err(ClusterError::Config("a namespace's rates and open streams need StreamNodeConfig::quotas"));
         }
         let quotas = cfg.quotas.filter(|_| cluster_wide);
+        if cfg.claims.keys().any(|ns| !cfg.core.on_demand.contains_key(ns)) {
+            return Err(ClusterError::Config("a claim is for a namespace on demand"));
+        }
         let mut core = cfg.core;
         core.relay = !cfg.upstream.is_empty() || !cfg.upstream_by_namespace.is_empty();
         // Interests go on Control.
         core.max_interest_bytes = core.max_interest_bytes.min(cluster.max_frame(Lane::Control));
         let mut core = RelayCore::new(&me, cfg.authorizer, core).map_err(|_| ClusterError::Config("stream limits"))?;
         core.history = cfg.history;
+        for (namespace, claim) in cfg.claims {
+            core.set_claim(namespace, claim);
+        }
         let writer = cfg.disk.is_some();
         if let Some(disk) = cfg.disk {
             let error = |e| ClusterError::Control(format!("the stream disk could not be read: {e}"));
@@ -597,6 +638,7 @@ impl StreamNode {
             ranked: Mutex::default(),
             endpoints: Mutex::default(),
             locals: Mutex::default(),
+            demand: Mutex::default(),
             pumps: Mutex::default(),
             tasks: Mutex::default(),
             quotas,
@@ -855,6 +897,23 @@ impl StreamNode {
         Ok(Subscription { node: self.0.clone(), id, inbox })
     }
 
+    /// The keys of an on-demand namespace ([`StreamNodeConfig::on_demand`]) wanted now, those in their linger among
+    /// them, and the changes after it: open a key told [`Demand::Wanted`], and close one told [`Demand::Unwanted`] when
+    /// nothing else needs it open. A key wanted again after its close is told `Wanted` again. One feed per namespace at
+    /// a time: `AlreadyExists` while another is held, `InvalidOptions` for a namespace not on demand.
+    pub fn demand(&self, namespace: &str) -> Result<(Vec<StreamKey>, DemandFeed), StreamError> {
+        let wanted = self.0.with(|core| {
+            let mut feeds = self.0.demand.lock();
+            if feeds.contains_key(namespace) {
+                return Err(StreamError::AlreadyExists);
+            }
+            let wanted = core.wanted(namespace)?;
+            feeds.insert(namespace.to_owned(), None);
+            Ok(wanted)
+        })?;
+        Ok((wanted, DemandFeed { node: self.0.clone(), namespace: namespace.to_owned(), taken: VecDeque::new() }))
+    }
+
     pub fn parent_of(&self, key: &StreamKey) -> Option<String> {
         self.0.core.lock().parent_of(key).map(|p| p.node.to_string())
     }
@@ -975,6 +1034,48 @@ impl Drop for Subscription {
     fn drop(&mut self) {
         self.node.locals.lock().remove(&self.id);
         self.node.with(|core| core.unsubscribe(self.id));
+    }
+}
+
+/// The changes to what an on-demand namespace's followers want, from [`StreamNode::demand`]. What it has not taken is
+/// held at most once per key, and a change undone before it is taken is not told, so a slow reader falls behind by
+/// keys, not by changes. An `axon::Stream`, for `cx.attach`; it never ends, and holds the node, as a subscription does.
+/// Dropping it lets `demand` give another.
+pub struct DemandFeed {
+    node: Arc<Handle>,
+    namespace: String,
+    taken: VecDeque<Demand>,
+}
+
+impl DemandFeed {
+    pub async fn next(&mut self) -> Option<Demand> {
+        std::future::poll_fn(|cx| Pin::new(&mut *self).poll_next(cx)).await
+    }
+}
+
+impl Stream for DemandFeed {
+    type Item = Demand;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Demand>> {
+        let this = self.get_mut();
+        if this.taken.is_empty() {
+            // The waker is set under the lock a change is told under, so none slips in unseen.
+            let mut core = this.node.core.lock();
+            this.taken.extend(core.take_demand(&this.namespace));
+            if this.taken.is_empty() {
+                if let Some(waker) = this.node.demand.lock().get_mut(&this.namespace) {
+                    *waker = Some(cx.waker().clone());
+                }
+                return Poll::Pending;
+            }
+        }
+        Poll::Ready(this.taken.pop_front())
+    }
+}
+
+impl Drop for DemandFeed {
+    fn drop(&mut self) {
+        self.node.demand.lock().remove(&self.namespace);
     }
 }
 

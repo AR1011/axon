@@ -899,6 +899,29 @@ fault into that feature.
 | overload | `crates/axon-stream/tests/interests.rs::a_branch_with_a_record_is_pushed_however_many_drained_branches_are_ahead_of_it` |
 | hostile input | `fuzz/fuzz_targets/stream_wire.rs::fuzz_target` |
 
+### streams: on-demand origin
+
+| Fault | Covered by |
+|---|---|
+| crash | `crates/axon-stream/tests/world_on_demand.rs::a_key_is_opened_when_leaves_want_it_and_closed_a_linger_after_they_are_gone`, `crates/axon-stream/tests/world_on_demand.rs::a_restarted_origin_is_told_again_of_the_keys_leaves_want` |
+| restart | `crates/axon-stream/tests/world_on_demand.rs::a_restarted_origin_is_told_again_of_the_keys_leaves_want`, `crates/axon-stream/src/core/tests.rs::a_restarted_origin_is_told_again_what_its_children_want` |
+| pause | `crates/axon-stream/tests/world_on_demand.rs::a_leaf_gone_for_less_than_the_linger_keeps_its_key_open_and_one_gone_longer_has_it_opened_again` |
+| partition | `crates/axon-stream/tests/world_on_demand.rs::a_leaf_gone_for_less_than_the_linger_keeps_its_key_open_and_one_gone_longer_has_it_opened_again` |
+| one-way cut | gap |
+| loss | `crates/axon-stream/src/core/tests.rs::a_lost_child_drops_its_demand`, `crates/axon-stream/tests/world_on_demand.rs::a_leaf_gone_for_less_than_the_linger_keeps_its_key_open_and_one_gone_longer_has_it_opened_again` |
+| duplication | gap |
+| reordering | gap |
+| latency | `crates/axon-stream/tests/world_on_demand.rs::a_leaf_gone_for_less_than_the_linger_keeps_its_key_open_and_one_gone_longer_has_it_opened_again` |
+| clock skew or step | gap |
+| CPU starvation | gap |
+| memory limit | gap |
+| disk full | n/a: it writes nothing; an open from disk is the disk store's rows |
+| disk error | n/a: it writes nothing; an open from disk is the disk store's rows |
+| fd exhaustion | n/a: relay rows |
+| panic | gap |
+| overload | gap |
+| hostile input | gap |
+
 ### streams: recovery and cursors
 
 | Fault | Covered by |

@@ -1191,3 +1191,137 @@ async fn a_host_below_the_push_window_records_one_event_at_start() {
 fn the_stream_protocol_is_labelled_axon_stream() {
     assert_eq!(axon_cluster::protocol_label(PROTOCOL, ""), "axon.stream");
 }
+
+/// A `Compacted` key an earlier boot kept on its disk, opened from it for followers that wait for it on an on-demand
+/// origin: each `SnapshotThenLive` follower, there and on a child, gets the state the disk kept, then the records after
+/// it.
+#[test]
+fn a_compacted_key_opened_from_disk_for_its_waiting_followers_gives_them_the_kept_state() {
+    use crate::core::tests::{ask, deliver};
+    use crate::recovery::{CompactLimits, keyed};
+    let key = StreamKey::new("jobs", "j0");
+    let policy = DeliveryPolicy::Compacted(CompactLimits { max_keys: 8, max_bytes: 1 << 10 });
+    let (o, c) = (PeerId::new("o", 1), PeerId::new("c", 1));
+    let files: Arc<dyn Files> = Arc::new(MemoryFiles::new());
+    let retention = Retention { namespace: "jobs".into(), max_bytes: u64::MAX, max_age: Duration::from_secs(3600) };
+    let disk = || match now(DiskStore::open(DiskConfig::new(files.clone(), vec![retention.clone()]))) {
+        Poll::Ready(disk) => disk.unwrap(),
+        Poll::Pending => panic!("files in memory waited"),
+    };
+    // Records reach followers once written.
+    let write = |origin: &mut RelayCore| {
+        let (written, ops) = origin.take_disk_writes(0).unwrap();
+        assert!(matches!(now(written.apply(ops)), Poll::Ready(Ok(()))));
+        origin.disk_written(Ok(()));
+    };
+    let mut cfg = CoreConfig { relay: false, ..CoreConfig::default() };
+    cfg.on_demand.insert("jobs".into(), Duration::from_secs(5));
+    // An earlier boot of o kept the key's state on its disk.
+    let mut origin = RelayCore::new(&o, crate::AllowAll, cfg.clone()).unwrap();
+    origin.disk = Some(disk());
+    origin.open_stream(&key, 1, policy).unwrap();
+    origin.publish(&key, vec![keyed(b"a", b"1"), keyed(b"b", b"1")]).unwrap();
+    origin.publish(&key, vec![keyed(b"a", b"2")]).unwrap();
+    write(&mut origin);
+
+    let o = PeerId::new("o", 2);
+    let mut origin = RelayCore::new(&o, crate::AllowAll, cfg).unwrap();
+    origin.disk = Some(disk());
+    let mut child = RelayCore::new(&c, crate::AllowAll, CoreConfig::default()).unwrap();
+    let options = SubscribeOptions { start: StartPosition::SnapshotThenLive, ..Default::default() };
+    let here = origin.subscribe(&key, options).expect("waits for the open");
+    let below = child.subscribe(&key, options).expect("waits for the open");
+    let at = Instant::now().into_std();
+    ask(&mut origin, &o, &mut child, &c, at);
+    let read = origin.disk_read(&key, 1, policy).unwrap().expect("the disk holds the key");
+    let Poll::Ready(read) = now(read.read()) else { panic!("files in memory waited") };
+    origin.open_read(&key, 1, policy, Some(read)).unwrap();
+    origin.publish(&key, vec![keyed(b"c", b"1")]).unwrap();
+    write(&mut origin);
+    deliver(&mut origin, &o, &mut child, &c, at);
+    let through = Cursor { generation: 1, sequence: 3 };
+    for (core, id, name) in [(&mut origin, here, "origin"), (&mut child, below, "child")] {
+        let (mut state, mut live) = (None, Vec::new());
+        while let Some(event) = core.poll(id) {
+            match event {
+                StreamEvent::Snapshot(s) => state = Some((s.through(), s.records().to_vec())),
+                StreamEvent::Batch(b) => live.extend((b.first()..).zip(b.records().iter().cloned())),
+                StreamEvent::Ready { .. } | StreamEvent::CaughtUp { .. } => {}
+                other => panic!("{other:?}"),
+            }
+        }
+        let (at, mut records) = state.expect("the state");
+        records.sort();
+        assert_eq!((at, records), (through, vec![keyed(b"a", b"2"), keyed(b"b", b"1")]), "{name}");
+        assert_eq!(live, vec![(4, keyed(b"c", b"1"))], "{name}");
+    }
+}
+
+/// A start after a position, here and on a child, that waits on an on-demand origin for a key an earlier boot kept on
+/// its disk: the open from the disk is past it, so it replays the records between from the disk, then goes on live.
+/// Before, it was reset as if they were lost.
+#[test]
+fn a_start_waiting_behind_an_open_from_disk_replays_from_the_disk() {
+    use crate::core::tests::{ask, deliver};
+    let key = StreamKey::new("jobs", "j0");
+    let replay = DeliveryPolicy::ReplayRequired;
+    let (o, c) = (PeerId::new("o", 1), PeerId::new("c", 1));
+    let record = |n: u64| Bytes::copy_from_slice(&n.to_be_bytes());
+    let files: Arc<dyn Files> = Arc::new(MemoryFiles::new());
+    let retention = Retention { namespace: "jobs".into(), max_bytes: u64::MAX, max_age: Duration::from_secs(3600) };
+    let disk = || match now(DiskStore::open(DiskConfig::new(files.clone(), vec![retention.clone()]))) {
+        Poll::Ready(disk) => disk.unwrap(),
+        Poll::Pending => panic!("files in memory waited"),
+    };
+    // Records reach followers once written.
+    let write = |origin: &mut RelayCore| {
+        let (written, ops) = origin.take_disk_writes(0).unwrap();
+        assert!(matches!(now(written.apply(ops)), Poll::Ready(Ok(()))));
+        origin.disk_written(Ok(()));
+    };
+    let mut cfg = CoreConfig { relay: false, ..CoreConfig::default() };
+    cfg.on_demand.insert("jobs".into(), Duration::from_secs(5));
+    // An earlier boot of o kept records 1 to 3 on its disk.
+    let mut origin = RelayCore::new(&o, crate::AllowAll, cfg.clone()).unwrap();
+    origin.disk = Some(disk());
+    origin.open_stream(&key, 1, replay).unwrap();
+    origin.publish(&key, (1..=3).map(record).collect()).unwrap();
+    write(&mut origin);
+
+    let o = PeerId::new("o", 2);
+    let mut origin = RelayCore::new(&o, crate::AllowAll, cfg).unwrap();
+    origin.disk = Some(disk());
+    let mut child = RelayCore::new(&c, crate::AllowAll, CoreConfig::default()).unwrap();
+    let options =
+        SubscribeOptions { start: StartPosition::After(Cursor { generation: 1, sequence: 1 }), ..Default::default() };
+    let here = origin.subscribe(&key, options).expect("waits for the open");
+    let below = child.subscribe(&key, options).expect("waits for the open");
+    let at = Instant::now().into_std();
+    ask(&mut origin, &o, &mut child, &c, at);
+    let read = origin.disk_read(&key, 1, replay).unwrap().expect("the disk holds the key");
+    let Poll::Ready(read) = now(read.read()) else { panic!("files in memory waited") };
+    origin.open_read(&key, 1, replay, Some(read)).unwrap();
+    origin.publish(&key, vec![record(4)]).unwrap();
+    write(&mut origin);
+    let (mut there, mut under) = (Vec::new(), Vec::new());
+    for _ in 0..8 {
+        while let Some((files, asked)) = origin.take_disk_reads(at) {
+            let Poll::Ready(read) = now(disk::read_asked(files, asked)) else { panic!("files in memory waited") };
+            origin.disk_read_in(read, at);
+        }
+        deliver(&mut origin, &o, &mut child, &c, at);
+        for (core, id, seen, name) in
+            [(&mut origin, here, &mut there, "origin"), (&mut child, below, &mut under, "child")]
+        {
+            while let Some(event) = core.poll(id) {
+                match event {
+                    StreamEvent::Batch(b) => seen.extend((b.first()..).zip(b.records().iter().cloned())),
+                    StreamEvent::Ready { .. } | StreamEvent::CaughtUp { .. } => {}
+                    other => panic!("{name}: {other:?}"),
+                }
+            }
+        }
+    }
+    let expected: Vec<_> = (2..=4).map(|n| (n, record(n))).collect();
+    assert_eq!((there, under), (expected.clone(), expected));
+}

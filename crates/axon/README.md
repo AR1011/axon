@@ -192,6 +192,9 @@ axon-stream (feature cluster)
     a start behind the origin's ring replays from the files, waiting while the writer task reads the segment ; one older than the oldest segment is HistoryUnavailable
     node.stored(&key) -> Option<Cursor>   the generation and last record the disk holds of a key not opened yet ; start and open_stream await their reads (in an actor, hand open_stream's future to cx.submit_future), and an open holds the node's other streams up only to install what it read
     Err(Disk(DiskError::Full | Failed)) while the last write failed, Err(Disk(Behind)) past max_unwritten_bytes ; node.stats().disk -> Option<DiskStats> { failing, refused, truncated, .. } ; axon::files::Files for another store
+  cfg.on_demand(namespace, linger)   this node opens the namespace's keys when wanted: a want for a key not open waits for the open, not UnknownStream ; the open gives each waiting follower Ready, the state, the history after its start, then live
+    let (wanted, mut feed) = node.demand(namespace)?   the keys wanted now and a DemandFeed (an axon::Stream) of Demand::Wanted(key) | Demand::Unwanted(key), the latter a linger after the last want, cancelled by a want inside it ; open on Wanted, close on Unwanted ; a key closed while wanted is told Wanted again ; one feed per namespace (AlreadyExists), InvalidOptions where not on demand
+    .claim(namespace, |key| bool)   the keys this node opens ; false answers UnknownStream as without on_demand ; runs under the node's lock ; start refuses it for a namespace not on demand
 
 axon-testkit   (dev-dependency; virtual time, same seed = same trace)
   Simulator::new(SimConfig { seed, jitter, drop_every, duplicate_every, ordered, .. }) ; net.add_node(name)?

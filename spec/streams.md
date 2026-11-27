@@ -1,10 +1,11 @@
 # Design — stream continuity
 
-Status: §3, §1 and §2 built. Three gaps in what a stream promises a subscriber that holds a cursor: replay stops at
+Status: §3, §1, §2 and §5 built. Three gaps in what a stream promises a subscriber that holds a cursor: replay stops at
 the in-memory ring (§1), a moved origin starts a new generation and ends every cursor (§2), and a `Live` follower has
 no position of its own, so a relay that forgets its position moves the follower past records or back over them (§3).
 The order to build them is §3, §1, §2: §3 guards the others, and §2 rests on both. All ship in wire v8
-([rolling-upgrades.md](rolling-upgrades.md)), which none of them needs: no stream frame changes here.
+([rolling-upgrades.md](rolling-upgrades.md)), which none of them needs: no stream frame changes here. §5 adds origins
+that open keys when something wants them, on the same wire.
 
 Words used here:
 
@@ -286,6 +287,63 @@ position first in each seed is not pinned by reading; the fix below does not dep
   and a new § "History the application keeps".
 - [faults.md](faults.md) streams rows (recovery and cursors, disk store) cite the World tests above under crash, pause
   and latency, once they exist (`scripts/check.sh faults` refuses a row whose test is missing).
+
+## 5. Origins on demand
+
+**Problem.** An application with many keys, each cheap to start, opens a key only while something follows it. Before
+this, a want for a key not open at its origin was refused `UnknownStream` (`RelayCore::ensure_stream`), so the child
+retried its parents on `retry_refused` and a local `subscribe` failed. The application had no way to learn which keys
+were wanted; it had to open them all or guess.
+
+**Design.**
+
+- `CoreConfig::on_demand` maps a namespace to its linger. For such a namespace a want for a key not open here, a local
+  `subscribe` or a child's `Want`, parks the key instead of refusing it: a relay stream with no position and no
+  parent feed (`RelayCore::parked`). It is never pulled. A `Live` follower is told `Ready` with no position and
+  `CaughtUp` at record 0, as on any relay with no position; `After`, `First` and `SnapshotThenLive` starts wait,
+  a child's included (the `open_branch` arm for a parked key).
+- The open (`open_stream`, `open_read`) of a parked key converts it in place (`StreamHub::adopt_origin`): it takes the
+  open's position, cursor, policy, kept state and history source, a follower or a start behind the open in its
+  generation replays the rest from the history, a start at or past it waits to reach it, a `SnapshotThenLive` start
+  gets the state (`accept_snapshot`), and the key is woken so children are pushed at once.
+- Demand: the hub counts, per key, local subscriptions plus session interests, and notes each key whose count
+  crosses zero (`hub::Demand`). `RelayCore::settle_demand`, at the start of every `reconcile`, turns those crossings
+  into `Demand::Wanted` at once and `Demand::Unwanted` once the count has stayed at zero for the linger. A want inside
+  the linger cancels it. Changes are coalesced per key, so a change undone before the feed takes it is not told, and
+  `Wake::Demand(namespace)` is pushed only when the namespace had nothing pending. `take_demand` hands them over;
+  `wanted` lists the keys wanted now, those in their linger among them.
+- A key unwanted and not open is let go: its placeholder is removed. A close of a key of the namespace does not pull
+  it from a parent (`end_stream` without `repull`); one still wanted is told `Wanted` again, so the application can
+  open it again, and its followers and its children's wait for that open.
+- `Claim`: an optional function per namespace, asked when a key would be parked. `false` answers the want
+  `UnknownStream`, as before this section, and with upstream tiers the key is pulled as any other.
+- `StreamNode`: `StreamNodeConfig::on_demand(namespace, linger)`, `StreamNodeConfig::claim(namespace, fn)` (refused
+  at `start` for a namespace not on demand), and `StreamNode::demand(namespace)`, which returns the keys wanted now
+  and a `DemandFeed` (`axon::Stream` of `Demand`). One feed per namespace: `AlreadyExists` while one is held,
+  `InvalidOptions` for a namespace not on demand. The node's lock order is the core, then the feeds.
+
+**Wire.** None: a child's `Want` and the origin's answers are the frames of §1 to §3. **API.** `CoreConfig::on_demand`,
+`Demand`, `Claim`, `Wake::Demand`, `RelayCore::{set_claim, take_demand, wanted}`, `StreamNodeConfig::{on_demand,
+claim}`, `StreamNode::demand`, `DemandFeed`.
+
+**Tests.**
+
+- `crates/axon-stream/src/core/tests.rs`, under "on-demand origins": a want waits for the open and is told once;
+  `Unwanted` a linger after the last want, and a want inside it cancels it; a key the claim refuses is
+  `UnknownStream`; a lost child drops its demand; a restarted origin is told again what its children want; a
+  compacted key gives its waiting followers the state; a key closed while wanted is told `Wanted` again and its
+  followers wait for the next open.
+- `crates/axon-stream/src/node/tests.rs`: a compacted key opened from disk gives waiting followers, local and on a
+  child, the kept state; a start waiting behind an open from disk replays from the disk, local and on a child.
+- `crates/axon-stream/tests/world_on_demand.rs`, 32 seeds each: leaves want a key, one leaves and one crashes, and
+  the application is told `Unwanted` within one tick past the linger after the last want went; an origin that crashes
+  and restarts is told `Wanted` again and the leaf's follower goes on in the new generation; a leaf paused or cut
+  off, over a slow link that loses chunks, for less than the linger keeps the key open, and for longer has it told
+  `Unwanted`, closed and opened again in a new generation, with no reset either way.
+
+**Not built.** A cap on parked keys apart from `HubLimits::max_streams`, which they count in. A bounded feed with a
+resync: changes coalesce per key, so the feed holds at most one change per wanted key. A count of parked keys in
+`RelayStats`; `streams()` lists them.
 
 ## Open
 

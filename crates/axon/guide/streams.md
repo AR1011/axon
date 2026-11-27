@@ -717,6 +717,102 @@ async fn main() {
 }
 ```
 
+## Origins on demand
+
+An application with more keys than it should keep open, each cheap to start, opens a key when something follows it
+and closes it when nothing has for a while. `StreamNodeConfig::on_demand(namespace, linger)` makes the node the
+origin of the namespace's keys whether they are open or not:
+
+- A want for a key not open here, a local `subscribe` or a child's, waits for the open instead of being refused
+  `UnknownStream`. A `Live` follower is told `Ready` with no position and `CaughtUp` at record 0, as on a relay that
+  has none yet; an `After`, `First` or `SnapshotThenLive` start is told nothing. The wait has no deadline. A key that
+  waits holds a stream slot (`HubLimits::max_streams`) as an open one does, and its followers count in the
+  namespace's [limits](#namespace-limits).
+- `node.demand(namespace)` returns the keys wanted now, those in their linger among them, and a `DemandFeed` (an
+  `axon::Stream`) of the changes after: `Demand::Wanted(key)` when something wants a key that nothing did, and
+  `Demand::Unwanted(key)` once nothing has wanted it for `linger`. A want inside the linger cancels it, so the
+  application is told nothing. For one key the two alternate, from `Wanted`, except after a close (below). One feed
+  per namespace at a time: `AlreadyExists` while another is held, `InvalidOptions` for a namespace not on demand.
+- The application opens each key told `Wanted` (`open_stream`, or `open_read` from [disk](#history-on-disk)) and
+  closes each told `Unwanted`. The open gives every waiting follower `Ready` at its position, the state to a
+  `SnapshotThenLive` start on a [compacted](#compacted-streams) stream, the records after its own start where the
+  open is past it and its history holds them, then every record after. `Wanted` comes for a key already open too:
+  the application keeps it open.
+- A key closed while it is wanted is told `Wanted` again, and its followers wait for the next open. The node never
+  asks a parent for it, so its children and their followers stay where they are.
+- `StreamNodeConfig::claim(namespace, fn)` decides which keys of the namespace this node opens. A key the claim
+  refuses is answered `UnknownStream`, as a node without the namespace on demand answers, and with upstream tiers it
+  is pulled from a parent as any key. The claim runs under the node's lock: it decides at once and calls nothing on
+  the node. `start` refuses a claim for a namespace not on demand.
+- The linger must outlast a child that reconnects, after a parent restart or a lost link. A child that comes back
+  within it costs nothing; one that does not is let go. An origin that restarts is told `Wanted` again by every child
+  that still follows a key, so the application opens what it opened before, in a new generation unless the key is
+  kept on disk.
+
+Only the origin is configured: relays and leaves follow the key as any other. `tests/world_on_demand.rs` runs it with
+leaves that leave, crash, pause and are cut off, and an origin that restarts.
+
+```rust
+use std::time::Duration;
+
+use axon::ActorSystem;
+use axon_cluster::{Cluster, ClusterConfig, MemoryDiscovery};
+use axon_net::SharedSecret;
+use axon_stream::{
+    Demand, DeliveryPolicy, StreamError, StreamEvent, StreamKey, StreamNode, StreamNodeConfig, SubscribeOptions,
+};
+use bytes::Bytes;
+
+#[tokio::main]
+async fn main() {
+    let mut transport = axon_net::Config::new("a", SharedSecret::new("at-least-16-bytes-long").unwrap());
+    transport.allow_plaintext = true;
+    let system = ActorSystem::builder().build().unwrap();
+    let cfg = ClusterConfig::new("127.0.0.1:0".parse().unwrap(), transport, MemoryDiscovery::new());
+    let cluster = Cluster::start(&system, cfg).await.unwrap();
+
+    let linger = Duration::from_millis(200);
+    let cfg = StreamNodeConfig::new(vec![])
+        .on_demand("jobs", linger)
+        .claim("jobs", |key| key.name().starts_with("job-"));
+    let node = StreamNode::start(&cluster, cfg).await.unwrap();
+    let (wanted, mut feed) = node.demand("jobs").unwrap();
+    assert!(wanted.is_empty());
+
+    // A follower of a key nobody opened: it waits.
+    let key = StreamKey::new("jobs", "job-1");
+    let mut follower = node.subscribe(&key, SubscribeOptions::default()).unwrap();
+    // A key the claim refuses is not this node's.
+    let other = node.subscribe(&StreamKey::new("jobs", "other"), SubscribeOptions::default());
+    assert!(matches!(other, Err(StreamError::UnknownStream)));
+
+    // The application opens what is wanted.
+    assert_eq!(feed.next().await, Some(Demand::Wanted(key.clone())));
+    node.open_stream(&key, 1, DeliveryPolicy::ReplayRequired).await.unwrap();
+    node.publish(&key, vec![Bytes::from_static(b"started")]).unwrap();
+    loop {
+        match follower.next().await.expect("subscription open") {
+            StreamEvent::Batch(batch) => {
+                assert_eq!(&batch.records()[0][..], b"started");
+                break;
+            }
+            terminal if terminal.is_terminal() => panic!("stream ended: {terminal:?}"),
+            _ => {} // Ready with no position and CaughtUp, then Ready at the open
+        }
+    }
+
+    // The follower leaves: a linger later the application is told, and closes the key.
+    drop(follower);
+    let left = std::time::Instant::now();
+    assert_eq!(feed.next().await, Some(Demand::Unwanted(key.clone())));
+    assert!(left.elapsed() >= linger);
+    node.close_stream(&key).unwrap();
+    drop(feed);
+    drop(node);
+    system.shutdown().await.unwrap();
+}
+```
+
 ## Standby
 
 ### Moving an origin

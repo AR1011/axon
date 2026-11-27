@@ -776,20 +776,39 @@ impl Sub {
     }
 }
 
-fn add_demand(demand: &mut BTreeMap<StreamKey, usize>, key: &StreamKey) {
-    match demand.get_mut(key) {
-        Some(count) => *count += 1,
-        None => {
-            demand.insert(key.clone(), 1);
-        }
-    }
+/// Local subscriptions plus session interests per key. The keys of the `watched` namespaces whose demand starts or ends
+/// are noted in `crossed` until taken.
+#[derive(Default)]
+struct Demand {
+    counts: BTreeMap<StreamKey, usize>,
+    watched: BTreeSet<String>,
+    crossed: BTreeSet<StreamKey>,
 }
 
-fn release_demand(demand: &mut BTreeMap<StreamKey, usize>, key: &StreamKey) {
-    if let Some(count) = demand.get_mut(key) {
-        *count -= 1;
-        if *count == 0 {
-            demand.remove(key);
+impl Demand {
+    fn add(&mut self, key: &StreamKey) {
+        match self.counts.get_mut(key) {
+            Some(count) => *count += 1,
+            None => {
+                self.counts.insert(key.clone(), 1);
+                self.cross(key);
+            }
+        }
+    }
+
+    fn release(&mut self, key: &StreamKey) {
+        if let Some(count) = self.counts.get_mut(key) {
+            *count -= 1;
+            if *count == 0 {
+                self.counts.remove(key);
+                self.cross(key);
+            }
+        }
+    }
+
+    fn cross(&mut self, key: &StreamKey) {
+        if self.watched.contains(key.namespace()) {
+            self.crossed.insert(key.clone());
         }
     }
 }
@@ -822,7 +841,7 @@ fn deliver(
     total: &mut QueueUsage,
     limits: &HubLimits,
     stats: &mut HubStats,
-    demand: &mut BTreeMap<StreamKey, usize>,
+    demand: &mut Demand,
     key: &StreamKey,
     batch: &SequencedBatch,
 ) {
@@ -835,7 +854,7 @@ fn deliver(
         let Err(terminal) = sub.offer(batch, total, limits, &mut stats.coalesced) else { return true };
         stats.count(&terminal);
         sub.end(terminal, total);
-        release_demand(demand, key);
+        demand.release(key);
         false
     });
 }
@@ -847,7 +866,7 @@ pub struct StreamHub<A = AllowAll> {
     sessions: BTreeMap<Arc<str>, Session>,
     streams: HashMap<StreamKey, Stream, IdHash>,
     subs: HashMap<u64, Sub, IdHash>,
-    demand: BTreeMap<StreamKey, usize>,
+    demand: Demand,
     /// Followers of a closed key, waiting for it to be opened again.
     parked: BTreeMap<StreamKey, Vec<u64>>,
     /// Per limited namespace: its most subscriptions, and those `counted`'s session holds.
@@ -882,7 +901,7 @@ impl<A: Authorizer> StreamHub<A> {
             sessions: BTreeMap::new(),
             streams: HashMap::default(),
             subs: HashMap::default(),
-            demand: BTreeMap::new(),
+            demand: Demand::default(),
             parked: BTreeMap::new(),
             namespace_subs: BTreeMap::new(),
             counted: "".into(),
@@ -897,6 +916,17 @@ impl<A: Authorizer> StreamHub<A> {
         self.namespace_subs = limits.iter().filter_map(|(ns, l)| Some((ns.clone(), (l.subscriptions?, 0)))).collect();
         self.counted = local.node.clone();
         self
+    }
+
+    /// Notes the keys of `namespaces` whose demand starts or ends, for [`take_crossed`](Self::take_crossed).
+    pub(crate) fn watching<'n>(mut self, namespaces: impl IntoIterator<Item = &'n String>) -> Self {
+        self.demand.watched.extend(namespaces.into_iter().cloned());
+        self
+    }
+
+    /// The keys of the watched namespaces whose demand started or ended since the last call.
+    pub(crate) fn take_crossed(&mut self) -> BTreeSet<StreamKey> {
+        std::mem::take(&mut self.demand.crossed)
     }
 
     /// Counts a refusal at the namespace's `limit`, and returns it.
@@ -926,7 +956,7 @@ impl<A: Authorizer> StreamHub<A> {
         };
         self.stats.count(&terminal);
         sub.end(terminal, &mut self.total);
-        release_demand(&mut self.demand, &sub.key);
+        self.demand.release(&sub.key);
         if let Some(stream) = self.streams.get_mut(&sub.key) {
             stream.subscribers.retain(|s| *s != id);
         } else if let Some(parked) = self.parked.get_mut(&sub.key) {
@@ -977,7 +1007,7 @@ impl<A: Authorizer> StreamHub<A> {
         let Some(session) = self.sessions.remove(peer) else { return };
         self.terminate_where(StreamEvent::End(reason), |s| *s.peer.node == *peer);
         for key in &session.interests {
-            release_demand(&mut self.demand, key);
+            self.demand.release(key);
         }
     }
 
@@ -1028,7 +1058,7 @@ impl<A: Authorizer> StreamHub<A> {
             session.interests.retain(|key| {
                 let keep = authorizer.authorize(&peer, key, Access::Subscribe);
                 if !keep {
-                    release_demand(demand, key);
+                    demand.release(key);
                 }
                 keep
             });
@@ -1075,16 +1105,17 @@ impl<A: Authorizer> StreamHub<A> {
         self.insert_stream(publisher, key, None, policy, None)
     }
 
-    /// The replay of a follower behind its key's open at `cut`, in its generation, that may replay: from its own
-    /// position, when the source holds the records between. A standby opens after the records its log holds, past what
-    /// reached it as a relay.
+    /// The replay of a follower behind its key's open at `cut`, in its generation, that may replay: from `at`, when the
+    /// source holds the records between. A standby opens after the records its log holds, past what reached it as a
+    /// relay.
     fn behind(
         &self,
         sub: &Sub,
+        at: Option<Cursor>,
         cut: Option<Cursor>,
         source: Option<&Arc<dyn RecoverySource>>,
     ) -> Option<(Cursor, Cursor, Arc<dyn RecoverySource>)> {
-        let (at, cut, source) = (sub.at?, cut?, source?);
+        let (at, cut, source) = (at?, cut?, source?);
         let held = at.generation == cut.generation
             && at.sequence < cut.sequence
             && self.authorizer.authorize(&sub.peer, &sub.key, Access::Replay)
@@ -1116,7 +1147,7 @@ impl<A: Authorizer> StreamHub<A> {
         let parked = self.parked.remove(key).unwrap_or_default();
         let mut subscribers = Vec::with_capacity(parked.len());
         for id in parked {
-            let replay = self.subs.get(&id).and_then(|sub| self.behind(sub, cursor, source.as_ref()));
+            let replay = self.subs.get(&id).and_then(|sub| self.behind(sub, sub.at, cursor, source.as_ref()));
             let Some(sub) = self.subs.get_mut(&id) else { continue };
             if sub.policy == SlowConsumerPolicy::CoalesceLatest && policy != DeliveryPolicy::ReplaceableState {
                 self.terminate(id, StreamEvent::End(EndReason::Unsubscribed));
@@ -1164,6 +1195,53 @@ impl<A: Authorizer> StreamHub<A> {
         Ok(true)
     }
 
+    /// Makes a relay stream that never had a position this publisher's own stream at `cursor`, with `latest` as a
+    /// compacted stream's state: an open of a key its subscribers waited for. Each goes on as from a subscribe just
+    /// after the open: a follower or a start behind `cursor` in its generation replays the rest from `source`, a start
+    /// at or past it waits to reach it, one waiting for the state gets it, and every other is told the position.
+    pub(crate) fn adopt_origin(
+        &mut self,
+        publisher: &PeerId,
+        key: &StreamKey,
+        cursor: Cursor,
+        policy: DeliveryPolicy,
+        latest: &[Payload],
+        source: Option<Arc<dyn RecoverySource>>,
+    ) -> Result<(), StreamError> {
+        self.allowed(publisher, key, Access::Publish)?;
+        let stream =
+            self.streams.get_mut(key).filter(|s| s.relay && s.cursor.is_none()).ok_or(StreamError::AlreadyExists)?;
+        let mut state = compacted(policy).map(MemoryState::new);
+        if let Some(state) = &mut state {
+            // Rebuilt under the same limits, so it fits.
+            let _ = state.apply(latest, &mut |_| Ok(()));
+        }
+        (stream.cursor, stream.policy, stream.relay, stream.state) = (Some(cursor), policy, false, state);
+        for id in stream.subscribers.clone() {
+            let Some(sub) = self.subs.get(&id) else { continue };
+            // A start waiting for a position replays from its own, as a subscribe after the open would.
+            let (from, waiting) = match sub.phase {
+                Phase::Live => (sub.at, false),
+                Phase::Waiting(after) => (Some(after.unwrap_or(Cursor { sequence: 0, ..cursor })), true),
+                _ => (None, false),
+            };
+            let replay = self.behind(sub, from, Some(cursor), source.as_ref());
+            let sub = self.subs.get_mut(&id).expect("looked up above");
+            if sub.policy == SlowConsumerPolicy::CoalesceLatest && policy != DeliveryPolicy::ReplaceableState {
+                self.terminate(id, StreamEvent::End(EndReason::Unsubscribed));
+            } else if let Some((at, cut, source)) = replay {
+                if waiting {
+                    sub.begin(Some(at), None, Some((at.sequence, cut, source)), &mut self.total);
+                } else {
+                    sub.catch_up(at, cut, source);
+                }
+            }
+        }
+        self.position(key, cursor, true);
+        let snapshot = self.streams.get(key).and_then(Stream::snapshot).expect("positioned above");
+        self.accept_snapshot(publisher, key, snapshot)
+    }
+
     /// A relay stream took its first position: each start waiting on it goes live or is reset, and, when `announced`,
     /// each other subscription is told it, or reset where it would move past records it never had.
     fn position(&mut self, key: &StreamKey, at: Cursor, announced: bool) {
@@ -1186,7 +1264,8 @@ impl<A: Authorizer> StreamHub<A> {
                         return true;
                     }
                 }
-                Phase::Snapshot(_) => return true,
+                // Waits for the state, or was told its position as its replay began.
+                Phase::Snapshot(_) | Phase::Recovering { .. } => return true,
                 _ if !announced => return true,
                 _ => match sub.announce(at) {
                     Ok(()) => return true,
@@ -1440,7 +1519,7 @@ impl<A: Authorizer> StreamHub<A> {
             return Err(StreamError::InvalidOptions);
         }
         if self.subs.len() >= self.limits.max_subscriptions
-            || (!self.demand.contains_key(key) && self.demand.len() >= self.limits.max_interest_keys)
+            || (!self.demand.counts.contains_key(key) && self.demand.counts.len() >= self.limits.max_interest_keys)
         {
             return Err(StreamError::LimitExceeded);
         }
@@ -1525,7 +1604,7 @@ impl<A: Authorizer> StreamHub<A> {
         } else {
             sub.begin(start, snapshot, recovering, &mut self.total);
         }
-        add_demand(&mut self.demand, key);
+        self.demand.add(key);
         self.streams.get_mut(key).expect("looked up above").subscribers.push(id);
         self.subs.insert(id, sub);
         if let Some((_, held)) = self.namespace_subs.get_mut(key.namespace()).filter(|_| counted) {
@@ -1919,19 +1998,20 @@ impl<A: Authorizer> StreamHub<A> {
                 return Err(StreamError::Forbidden);
             }
         }
-        let freed = session.interests.iter().filter(|k| !keys.contains(*k) && self.demand.get(*k) == Some(&1)).count();
-        let added = keys.iter().filter(|k| !self.demand.contains_key(*k)).count();
-        if self.demand.len() - freed + added > self.limits.max_interest_keys {
+        let counts = &self.demand.counts;
+        let freed = session.interests.iter().filter(|k| !keys.contains(*k) && counts.get(*k) == Some(&1)).count();
+        let added = keys.iter().filter(|k| !counts.contains_key(*k)).count();
+        if counts.len() - freed + added > self.limits.max_interest_keys {
             return Err(StreamError::LimitExceeded);
         }
         let Self { sessions, demand, .. } = self;
         let session = sessions.get_mut(&peer.node).expect("checked above");
         let changed = session.interests != keys;
         for key in keys.difference(&session.interests) {
-            add_demand(demand, key);
+            demand.add(key);
         }
         for key in session.interests.difference(&keys) {
-            release_demand(demand, key);
+            demand.release(key);
         }
         (session.revision, session.interests) = (revision, keys);
         Ok(InterestAck { revision, changed })
@@ -1939,11 +2019,11 @@ impl<A: Authorizer> StreamHub<A> {
 
     /// Local subscriptions plus session interests for the key.
     pub fn demand_count(&self, key: &StreamKey) -> usize {
-        self.demand.get(key).copied().unwrap_or(0)
+        self.demand.counts.get(key).copied().unwrap_or(0)
     }
 
     pub fn demanded(&self) -> impl Iterator<Item = &StreamKey> {
-        self.demand.keys()
+        self.demand.counts.keys()
     }
 
     pub fn queue_usage(&self, id: u64) -> Option<QueueUsage> {
@@ -1974,7 +2054,7 @@ impl<A: Authorizer> StreamHub<A> {
             sessions: self.sessions.len(),
             subscriptions: self.subs.len(),
             recovering,
-            demand_keys: self.demand.len(),
+            demand_keys: self.demand.counts.len(),
             queued_bytes: self.total.bytes,
             queued_records: self.total.records,
             ..self.stats.clone()

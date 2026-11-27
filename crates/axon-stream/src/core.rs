@@ -210,7 +210,25 @@ pub enum Wake {
     /// The downstream node has events to push on the lane.
     Peer(Arc<str>, Lane),
     Reconcile,
+    /// The namespace's [`Demand`] changes wait to be taken, where none did.
+    Demand(String),
 }
+
+/// A change in whether anything wants a key of an on-demand namespace ([`CoreConfig::on_demand`]): its followers on this
+/// node and under it. For one key they alternate, from `Wanted`, except that a key closed while it is wanted is told
+/// `Wanted` again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Demand {
+    /// Something wants the key, where nothing did.
+    Wanted(StreamKey),
+    /// Nothing has wanted the key for its namespace's linger.
+    Unwanted(StreamKey),
+}
+
+/// Whether a key of an on-demand namespace is this node's to open: `false` answers a want for it `UnknownStream` while
+/// it is not open here, as a node without the namespace on demand would. It runs under the node's lock, so it decides
+/// at once and calls nothing on the node.
+pub type Claim = Arc<dyn Fn(&StreamKey) -> bool + Send + Sync>;
 
 /// How long a pulled key waits on its parents. Per key, so per namespace: a namespace whose origins are far away waits
 /// longer than one beside them.
@@ -248,6 +266,10 @@ pub struct CoreConfig {
     pub timings_by_namespace: BTreeMap<String, RelayTimings>,
     /// How long an upstream interest outlives its last listener.
     pub linger: Duration,
+    /// Namespaces whose keys this node opens when they are wanted, each with how long a key stays wanted after its last
+    /// follower: a want for a key not open here waits for the open instead of being refused `UnknownStream`, and
+    /// [`take_demand`](RelayCore::take_demand) says which keys to open and which to close.
+    pub on_demand: BTreeMap<String, Duration>,
     /// How long a parent that refused a stream is left alone; doubles per refusal, up to 32 times this.
     pub retry_refused: Duration,
     pub retry_failed: Duration,
@@ -297,6 +319,7 @@ impl Default for CoreConfig {
             timings: RelayTimings::default(),
             timings_by_namespace: BTreeMap::new(),
             linger: Duration::from_secs(5),
+            on_demand: BTreeMap::new(),
             retry_refused: Duration::from_secs(2),
             retry_failed: Duration::from_millis(500),
             refresh: Duration::from_secs(2),
@@ -716,7 +739,19 @@ pub struct RelayCore<A: Authorizer = AllowAll> {
     pub(crate) disk: Option<DiskStore>,
     /// The history each namespace's application keeps, behind the ring of the streams this node originates.
     pub(crate) history: BTreeMap<String, Arc<dyn RecoverySource>>,
+    /// Of the on-demand namespaces, those whose keys are not all this node's.
+    claims: BTreeMap<String, Claim>,
     originated: HashSet<StreamKey, IdHash>,
+    /// Keys of on-demand namespaces wanted here and not open: each a relay stream with no parent and no position, which
+    /// the open makes this node's own.
+    parked: BTreeSet<StreamKey>,
+    /// The keys of on-demand namespaces last told wanted, each with since when nothing has wanted it.
+    wanted: BTreeMap<StreamKey, Option<Instant>>,
+    /// Keys whose demand may have started or ended, and when a key's linger is up.
+    crossed: BTreeSet<StreamKey>,
+    lingers: BTreeSet<(Instant, StreamKey)>,
+    /// The demand changes not taken yet, `true` for `Wanted`: one undoes its opposite.
+    told: BTreeMap<StreamKey, bool>,
     // Ordered maps keep a run reproducible from its inputs.
     feeds: BTreeMap<StreamKey, Feed>,
     parents: BTreeMap<PeerId, Parent>,
@@ -772,7 +807,9 @@ impl<A: Authorizer> RelayCore<A> {
             return Err(StreamError::InvalidOptions);
         }
         let local = PeerId::new(&format!("local:{}", me.node), me.incarnation);
-        let mut hub = StreamHub::new(authorizer, cfg.hub)?.with_namespaces(&local, &cfg.namespaces);
+        let mut hub = StreamHub::new(authorizer, cfg.hub)?
+            .with_namespaces(&local, &cfg.namespaces)
+            .watching(cfg.on_demand.keys());
         hub.open_session(&local)?;
         let store = MemoryStore::new(cfg.store)
             .map_err(|_| StreamError::InvalidOptions)?
@@ -786,7 +823,13 @@ impl<A: Authorizer> RelayCore<A> {
             store: Arc::new(Mutex::new(store)),
             disk: None,
             history: BTreeMap::new(),
+            claims: BTreeMap::new(),
             originated: HashSet::default(),
+            parked: BTreeSet::new(),
+            wanted: BTreeMap::new(),
+            crossed: BTreeSet::new(),
+            lingers: BTreeSet::new(),
+            told: BTreeMap::new(),
             feeds: BTreeMap::new(),
             parents: BTreeMap::new(),
             downstream: BTreeMap::new(),
@@ -810,6 +853,11 @@ impl<A: Authorizer> RelayCore<A> {
     }
 
     pub fn take_wakes(&mut self) -> Vec<Wake> {
+        let crossed = self.hub.take_crossed();
+        if !crossed.is_empty() {
+            self.crossed.extend(crossed);
+            self.wakes.push(Wake::Reconcile);
+        }
         std::mem::take(&mut self.wakes)
     }
 
@@ -927,6 +975,12 @@ impl<A: Authorizer> RelayCore<A> {
         self.history.insert(namespace.into(), source);
     }
 
+    /// Which keys of an on-demand namespace are this node's: asked once for a key wanted while no stream of it is here.
+    /// Without one, every key of the namespace is.
+    pub fn set_claim(&mut self, namespace: impl Into<String>, claim: Claim) {
+        self.claims.insert(namespace.into(), claim);
+    }
+
     /// What an open of the key reads from disk first, without the core: `None` when it reads nothing. An open the
     /// node refuses reads nothing.
     pub(crate) fn disk_read(
@@ -1021,7 +1075,8 @@ impl<A: Authorizer> RelayCore<A> {
         read: Option<Result<Resume, ReadError>>,
         after: Option<Cursor>,
     ) -> Result<(), StreamError> {
-        if self.hub.has_stream(key) {
+        let parked = self.parked.contains(key);
+        if self.hub.has_stream(key) && !parked {
             return Err(StreamError::AlreadyExists);
         }
         // The disk holds what it held when `read` was asked for until an open takes it.
@@ -1050,13 +1105,22 @@ impl<A: Authorizer> RelayCore<A> {
         }
         drop(store);
         // Followers hear of the open last, so a refusal shows them nothing.
+        // A parked key's followers, its children's branches among them, go on from the open where they wait.
+        let local = &self.local;
         let opened = match &resume {
-            Some(r) => self.hub.resume_stream(&self.local, key, r.through, policy, &r.latest, self.origin_history(key)),
-            None => self.hub.open_stream(&self.local, key, generation, policy),
+            Some(r) if parked => {
+                self.hub.adopt_origin(local, key, r.through, policy, &r.latest, Some(self.origin_history(key)))
+            }
+            None if parked => self.hub.adopt_origin(local, key, Cursor { generation, sequence: 0 }, policy, &[], None),
+            Some(r) => self.hub.resume_stream(local, key, r.through, policy, &r.latest, self.origin_history(key)),
+            None => self.hub.open_stream(local, key, generation, policy),
         };
         if let Err(error) = opened {
             lock(&self.store).remove(key);
             return Err(error);
+        }
+        if self.parked.remove(key) {
+            self.wake_key(key);
         }
         if let Some(disk) = self.disk.as_mut().filter(|d| d.holds(key)) {
             disk.open_stream(key, generation, policy, resume.as_ref().map_or(&[], |r| &r.latest));
@@ -1148,20 +1212,32 @@ impl<A: Authorizer> RelayCore<A> {
         if !self.originated.remove(key) {
             return Err(StreamError::UnknownStream);
         }
-        self.end_stream(key)?;
+        // A key of an on-demand namespace is this node's to open again: its followers wait for that, not a parent.
+        let on_demand = self.cfg.on_demand.contains_key(key.namespace());
+        self.end_stream(key, !on_demand)?;
+        if on_demand {
+            // Told afresh: a key still wanted is told `Wanted` again, for the application to open it again.
+            self.wanted.remove(key);
+            self.told.remove(key);
+            self.crossed.insert(key.clone());
+            self.wakes.push(Wake::Reconcile);
+        }
         if let Some(disk) = &mut self.disk {
             disk.close(key);
         }
         Ok(())
     }
 
-    /// Closes the key's stream here, whether this node originated or pulled it.
-    fn end_stream(&mut self, key: &StreamKey) -> Result<(), StreamError> {
+    /// Closes the key's stream here, whether this node originated or pulled it, and pulls it again for the followers
+    /// that wait when `pull`.
+    fn end_stream(&mut self, key: &StreamKey, pull: bool) -> Result<(), StreamError> {
         self.wake_key(key);
         let last = self.cursor(key);
         self.hub.close_stream(&self.local, key, EndReason::StreamClosed)?;
         lock(&self.store).remove(key);
-        self.repull(key, last);
+        if pull {
+            self.repull(key, last);
+        }
         Ok(())
     }
 
@@ -1408,6 +1484,16 @@ impl<A: Authorizer> RelayCore<A> {
             self.touch(key);
             return Ok(());
         }
+        let ns = key.namespace();
+        if self.cfg.on_demand.contains_key(ns) && self.claims.get(ns).is_none_or(|claim| claim(key)) {
+            // No parent: it waits for this node to open it, however long that takes.
+            self.hub.open_relay_stream(&self.local, key, DeliveryPolicy::ReplayRequired)?;
+            self.parked.insert(key.clone());
+            // Let go at the next reconcile should no want hold it.
+            self.crossed.insert(key.clone());
+            self.wakes.push(Wake::Reconcile);
+            return Ok(());
+        }
         if !self.cfg.relay {
             return Err(StreamError::UnknownStream);
         }
@@ -1415,6 +1501,75 @@ impl<A: Authorizer> RelayCore<A> {
         self.feeds.insert(key.clone(), Feed::default());
         self.touch(key);
         Ok(())
+    }
+
+    // ---- demand of the on-demand namespaces ----
+
+    /// Tells the keys whose demand started, and those whose demand ended a linger ago, and lets go of the parked ones
+    /// among those.
+    fn settle_demand(&mut self, now: Instant) {
+        self.crossed.extend(self.hub.take_crossed());
+        while self.lingers.first().is_some_and(|(at, _)| *at <= now) {
+            self.crossed.extend(self.lingers.pop_first().map(|(_, key)| key));
+        }
+        for key in std::mem::take(&mut self.crossed) {
+            // A key pulled from a parent is another node's.
+            let Some(&linger) = self.cfg.on_demand.get(key.namespace()).filter(|_| !self.feeds.contains_key(&key))
+            else {
+                continue;
+            };
+            if self.hub.demand_count(&key) > 0 {
+                if self.wanted.insert(key.clone(), None).is_none() {
+                    self.tell(&key, true);
+                }
+                continue;
+            }
+            // Not told: a key parked for a want refused after all.
+            if let Some(since) = self.wanted.get_mut(&key) {
+                let since = *since.get_or_insert(now);
+                if now < since + linger {
+                    self.lingers.insert((since + linger, key));
+                    continue;
+                }
+                self.wanted.remove(&key);
+                self.tell(&key, false);
+            }
+            if self.parked.remove(&key) {
+                let _ = self.hub.close_stream(&self.local, &key, EndReason::StreamClosed);
+            }
+        }
+    }
+
+    fn tell(&mut self, key: &StreamKey, wanted: bool) {
+        let ns = key.namespace();
+        if self.told.range(StreamKey::new(ns, "")..).next().is_none_or(|(k, _)| k.namespace() != ns) {
+            self.wakes.push(Wake::Demand(ns.into()));
+        }
+        if self.told.remove(key).is_none() {
+            self.told.insert(key.clone(), wanted);
+        }
+    }
+
+    /// The keys of an on-demand namespace told wanted, those that wait out their linger among them, in key order. Then
+    /// [`take_demand`](Self::take_demand) gives the changes after it. `InvalidOptions` for a namespace not on demand.
+    pub fn wanted(&mut self, namespace: &str) -> Result<Vec<StreamKey>, StreamError> {
+        if !self.cfg.on_demand.contains_key(namespace) {
+            return Err(StreamError::InvalidOptions);
+        }
+        self.take_demand(namespace);
+        let from = StreamKey::new(namespace, "");
+        Ok(self.wanted.range(from..).map(|(k, _)| k).take_while(|k| k.namespace() == namespace).cloned().collect())
+    }
+
+    /// The changes to an on-demand namespace's demand since the last call, or since [`wanted`](Self::wanted), in key
+    /// order and at most one per key: a change undone before it is taken is not told.
+    pub fn take_demand(&mut self, namespace: &str) -> Vec<Demand> {
+        let from = StreamKey::new(namespace, "");
+        let keys: Vec<StreamKey> =
+            self.told.range(from..).map(|(k, _)| k).take_while(|k| k.namespace() == namespace).cloned().collect();
+        let told = keys.into_iter().map(|key| (self.told.remove(&key), key));
+        told.map(|(wanted, key)| if wanted == Some(true) { Demand::Wanted(key) } else { Demand::Unwanted(key) })
+            .collect()
     }
 
     // ---- downstream: this node as a parent ----
@@ -1581,6 +1736,8 @@ impl<A: Authorizer> RelayCore<A> {
                 want.start
             }
             (StartPosition::First, Some(_)) => want.start,
+            // Waits for this node to open the key, and replays from the open's history if the open is past it.
+            (StartPosition::After(_) | StartPosition::First, None) if self.parked.contains(&want.key) => want.start,
             _ => StartPosition::Live,
         };
         let options = SubscribeOptions { start, slow_consumer: SlowConsumerPolicy::Reset, limits: self.cfg.branch };
@@ -2186,7 +2343,7 @@ impl<A: Authorizer> RelayCore<A> {
                 }
                 Item::Reset(_) => self.rebranch(&key, &link),
                 Item::End(EndReason::StreamClosed) if current => {
-                    let _ = self.end_stream(&key);
+                    let _ = self.end_stream(&key, true);
                 }
                 Item::Path(path) => self.learn_path(&key, from, epoch, path, now),
                 Item::Snapshot(snapshot) => {
@@ -2258,6 +2415,7 @@ impl<A: Authorizer> RelayCore<A> {
     /// only at the streams something happened to, or all of them when the parents changed.
     /// `upstream` are the reachable parents, most preferred first, never this node.
     pub fn reconcile<'a>(&mut self, upstream: impl Into<Parents<'a>>, now: Instant) -> Vec<(PeerId, Interest)> {
+        self.settle_demand(now);
         let upstream = upstream.into();
         let all = upstream.all();
         if self.candidates != all || self.by_namespace != *upstream.by_namespace {
@@ -2640,7 +2798,7 @@ impl<A: Authorizer> RelayCore<A> {
     /// The first `limit` streams in key order, and how many there are.
     pub fn streams(&self, limit: usize, now: Instant) -> (Vec<StreamInfo>, usize) {
         #[expect(clippy::disallowed_methods, reason = "the hash order never shows: sorted on the next line")]
-        let mut keys: Vec<&StreamKey> = self.originated.iter().chain(self.feeds.keys()).collect();
+        let mut keys: Vec<&StreamKey> = self.originated.iter().chain(self.feeds.keys()).chain(&self.parked).collect();
         keys.sort();
         let list = keys.iter().take(limit).map(|key| {
             let (cursor, feed) = (self.cursor(key), self.feeds.get(*key));

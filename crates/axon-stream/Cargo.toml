@@ -62,6 +62,10 @@ name = "world_relay"
 required-features = ["cluster"]
 
 [[test]]
+name = "world_on_demand"
+required-features = ["cluster"]
+
+[[test]]
 name = "world_lanes"
 required-features = ["cluster"]
 
