@@ -401,7 +401,7 @@ fn two_owners_that_pull_each_others_keys_reach_each_owner_with_no_loop() {
         w.run_for(quiet);
         round(&mut w);
         w.run_for(Duration::from_secs(1));
-        // Each pulls two keys: the whole set once per resync (60 s) at most, and one more for the edges of the window.
+        // Each pulls two keys: the whole set once per resync (60 s) at most, plus one resync that falls at the start.
         let most = 2 * (quiet.as_secs() / 60 + 1);
         for (on, (now, then)) in ["a", "b"].iter().zip(sent(&w).into_iter().zip(settled)) {
             assert!(now - then <= most, "seed {seed}: {on} sent {} wants and drops once settled", now - then);
